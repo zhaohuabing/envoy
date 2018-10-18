@@ -334,6 +334,10 @@ public:
   COUNTER  (lb_zone_routing_all_directly)                                                          \
   COUNTER  (lb_zone_routing_sampled)                                                               \
   COUNTER  (lb_zone_routing_cross_zone)                                                            \
+  COUNTER  (lb_new_zone_hhpl_too_small)                                                            \
+  COUNTER  (lb_new_zone_choosing_all)                                                              \
+  COUNTER  (lb_new_zone_choosing_all_healthy)                                                      \
+  COUNTER  (lb_new_zone_choosing_all_healthy_local)                                                \
   GAUGE    (lb_subsets_active)                                                                     \
   COUNTER  (lb_subsets_created)                                                                    \
   COUNTER  (lb_subsets_removed)                                                                    \

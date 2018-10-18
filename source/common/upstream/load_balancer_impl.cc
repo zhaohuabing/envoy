@@ -227,6 +227,7 @@ void ZoneAwareLoadBalancerBase::regenerateLocalityRoutingStructures() {
   // Do not perform any calculations if we cannot perform locality routing based on non runtime
   // params.
   if (earlyExitNonLocalityRouting()) {
+    ENVOY_LOG(warn, "LB ZONE: Early exit");
     state.locality_routing_state_ = LocalityRoutingState::NoLocalityRouting;
     return;
   }
@@ -252,6 +253,7 @@ void ZoneAwareLoadBalancerBase::regenerateLocalityRoutingStructures() {
   // If we have lower percent of hosts in the local cluster in the same locality,
   // we can push all of the requests directly to upstream cluster in the same locality.
   if (upstream_percentage[0] >= local_percentage[0]) {
+    ENVOY_LOG(warn, "LB ZONE: upstream percentage greater than local percentage");
     state.locality_routing_state_ = LocalityRoutingState::LocalityDirect;
     return;
   }
@@ -308,6 +310,7 @@ bool ZoneAwareLoadBalancerBase::earlyExitNonLocalityRouting() {
   // We only do locality routing for P=0.
   HostSet& host_set = *priority_set_.hostSetsPerPriority()[0];
   if (host_set.healthyHostsPerLocality().get().size() < 2) {
+    stats_.lb_new_zone_hhpl_too_small_.inc();
     return true;
   }
 
@@ -449,6 +452,7 @@ ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context) {
   // If we're doing locality weighted balancing, pick locality.
   const absl::optional<uint32_t> locality = host_set.chooseLocality();
   if (locality.has_value()) {
+    ENVOY_LOG(warn, "LB ZONE: has locality is true");
     hosts_source.source_type_ = HostsSource::SourceType::LocalityHealthyHosts;
     hosts_source.locality_index_ = locality.value();
     return hosts_source;
@@ -458,12 +462,14 @@ ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context) {
   // host set.
   if (per_priority_state_[host_set.priority()]->locality_routing_state_ ==
       LocalityRoutingState::NoLocalityRouting) {
+    ENVOY_LOG(warn, "LB ZONE: latched, we can't do priority routing");
     hosts_source.source_type_ = HostsSource::SourceType::HealthyHosts;
     return hosts_source;
   }
 
   // Determine if the load balancer should do zone based routing for this pick.
   if (!runtime_.snapshot().featureEnabled(RuntimeZoneEnabled, routing_enabled_)) {
+    ENVOY_LOG(warn, "LB ZONE: zone aware routing is runtime disabled");
     hosts_source.source_type_ = HostsSource::SourceType::HealthyHosts;
     return hosts_source;
   }
@@ -476,6 +482,7 @@ ZoneAwareLoadBalancerBase::hostSourceToUse(LoadBalancerContext* context) {
     return hosts_source;
   }
 
+  ENVOY_LOG(warn, "LB ZONE: calling tryChooseLocalLocalityHosts");
   hosts_source.source_type_ = HostsSource::SourceType::LocalityHealthyHosts;
   hosts_source.locality_index_ = tryChooseLocalLocalityHosts(host_set);
   return hosts_source;
@@ -485,10 +492,16 @@ const HostVector& ZoneAwareLoadBalancerBase::hostSourceToHosts(HostsSource hosts
   const HostSet& host_set = *priority_set_.hostSetsPerPriority()[hosts_source.priority_];
   switch (hosts_source.source_type_) {
   case HostsSource::SourceType::AllHosts:
+    ENVOY_LOG(warn, "LB ZONE: choosing all hosts");
+    stats_.lb_new_zone_choosing_all_.inc(); 
     return host_set.hosts();
   case HostsSource::SourceType::HealthyHosts:
+    ENVOY_LOG(warn, "LB ZONE: choosing all healthy hosts");
+    stats_.lb_new_zone_choosing_all_healthy_.inc(); 
     return host_set.healthyHosts();
   case HostsSource::SourceType::LocalityHealthyHosts:
+    ENVOY_LOG(warn, "LB ZONE: choosing all healthy local hosts");
+    stats_.lb_new_zone_choosing_all_healthy_local_.inc(); 
     return host_set.healthyHostsPerLocality().get()[hosts_source.locality_index_];
   default:
     NOT_REACHED_GCOVR_EXCL_LINE;
