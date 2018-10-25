@@ -6,6 +6,13 @@
 #include "common/config/utility.h"
 #include "common/protobuf/protobuf.h"
 
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+
 namespace Envoy {
 namespace Config {
 
@@ -57,6 +64,19 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
     return;
   }
 
+  /////////////////////////
+	envoy::api::v2::core::Node tmp_node = local_info_.node();
+	auto metadata = tmp_node.mutable_metadata();
+	::std::string key = ::std::string("IPAddresses");
+	ProtobufWkt::Value val;
+	val.set_string_value(GetAllIPAddress());
+	::google::protobuf::Map< ::std::string, ::google::protobuf::Value > *pMap = metadata->::google::protobuf::Struct::mutable_fields();
+	(*pMap)[key] = val;
+  /////////////////////////////////////////////
+	api_state_[type_url].request_.mutable_node()->MergeFrom(tmp_node);
+	//	api_state_[type_url].request_.mutable_node()->MergeFrom(local_info_.node());
+  	printf("Add additional ipaddr info into node.metadata.\n");
+
   ApiState& api_state = api_state_[type_url];
   if (api_state.paused_) {
     ENVOY_LOG(trace, "API {} paused during sendDiscoveryRequest(), setting pending.", type_url);
@@ -81,6 +101,7 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
       }
     }
   }
+  printf("sendDiscoveryRequest [%s].\n",request.DebugString().c_str());
 
   ENVOY_LOG(trace, "Sending DiscoveryRequest for {}: {}", type_url, request.DebugString());
   stream_->sendMessage(request, false);
@@ -89,6 +110,56 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
   if (api_state_[type_url].request_.has_error_detail()) {
     api_state_[type_url].request_.clear_error_detail();
   }
+}
+
+::std::string GrpcMuxImpl::GetAllIPAddress()
+{
+    static ::std::string ipaddrs = ::std::string("");
+    if(ipaddrs.length() > 0)
+    {
+        printf("Already cached, just return [%s].\n",ipaddrs.c_str());
+        return ipaddrs;
+    }
+
+    int sockfd;
+    struct ifconf ifconf;
+    struct ifreq *ifreq;
+    char buf[512];//NetInterface Config Buf
+    char IPAddress[128] = {0};
+    //Initialize ifconf
+    ifconf.ifc_len =512;
+    ifconf.ifc_buf = buf;
+    if ((sockfd =socket(AF_INET,SOCK_DGRAM,0))<0)
+    {
+        printf("Get sockfd failed.\n");
+        return ::std::string("Get sockfd failed.");
+    }
+    ioctl(sockfd, SIOCGIFCONF, &ifconf); //Get All Interface info
+
+    //For each interface , get ipaddress
+    ifreq = (struct ifreq*)ifconf.ifc_buf;
+
+    for (int i=(ifconf.ifc_len/sizeof (struct ifreq)); i>0; i--)
+    {
+    	memset(IPAddress,0x00,128);
+        if(ifreq->ifr_flags == AF_INET)
+		{ //for ipv4
+			sprintf(IPAddress,"%s",inet_ntoa((reinterpret_cast<struct sockaddr_in*>(&(ifreq->ifr_addr)))->sin_addr));
+    		if(ipaddrs.length() == 0)
+		    {
+			    ipaddrs = ::std::string(IPAddress);
+				printf("[1]find one ipaddress[%s], now addresses=[%s].\n",IPAddress,ipaddrs.c_str());
+		    }
+		    else
+		    {
+			    ipaddrs += ::std::string(";")+::std::string(IPAddress);
+				printf("[2]find one ipaddress[%s], now addresses=[%s].\n",IPAddress,ipaddrs.c_str());
+		    }
+	    	ifreq++;
+        }
+    }
+	printf("First time call GetAllIPAddress, return [%s].\n",ipaddrs.c_str());
+	return ipaddrs;
 }
 
 void GrpcMuxImpl::handleFailure() {
@@ -167,8 +238,7 @@ void GrpcMuxImpl::onReceiveMessage(std::unique_ptr<envoy::api::v2::DiscoveryResp
   const std::string& type_url = message->type_url();
   ENVOY_LOG(debug, "Received gRPC message for {} at version {}", type_url, message->version_info());
   if (api_state_.count(type_url) == 0) {
-    ENVOY_LOG(warn, "Ignoring the message for type URL {} as it has no current subscribers.",
-              type_url);
+    ENVOY_LOG(warn, "Ignoring unknown type URL {}", type_url);
     // TODO(yuval-k): This should never happen. consider dropping the stream as this is a protocol
     // violation
     return;
@@ -224,6 +294,7 @@ void GrpcMuxImpl::onReceiveMessage(std::unique_ptr<envoy::api::v2::DiscoveryResp
     // that tracking here.
     api_state_[type_url].request_.set_version_info(message->version_info());
   } catch (const EnvoyException& e) {
+    ENVOY_LOG(warn, "gRPC config for {} update rejected: {}", message->type_url(), e.what());
     for (auto watch : api_state_[type_url].watches_) {
       watch->callbacks_.onConfigUpdateFailed(&e);
     }
