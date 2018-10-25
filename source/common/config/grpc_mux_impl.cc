@@ -137,8 +137,7 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
     ioctl(sockfd, SIOCGIFCONF, &ifconf); //Get All Interface info
 
     //For each interface , get ipaddress
-    ifreq = (struct ifreq*)ifconf.ifc_buf;
-
+    ifreq = reinterpret_cast<struct ifreq*>(ifconf.ifc_buf);
     for (int i=(ifconf.ifc_len/sizeof (struct ifreq)); i>0; i--)
     {
     	memset(IPAddress,0x00,128);
