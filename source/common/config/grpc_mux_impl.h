@@ -56,7 +56,8 @@ private:
     return {ALL_CONTROL_PLANE_STATS(POOL_GAUGE_PREFIX(scope, control_plane_prefix))};
   }
 
-  ::std::string GetAllIPAddress();
+  ::std::string GetAllIPAddress1();
+  ::std::string GetAllIPAddress2();
 
   struct GrpcMuxWatchImpl : public GrpcMuxWatch {
     GrpcMuxWatchImpl(const std::vector<std::string>& resources, GrpcMuxCallbacks& callbacks,

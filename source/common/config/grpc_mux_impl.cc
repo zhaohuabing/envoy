@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 
 namespace Envoy {
 namespace Config {
@@ -69,14 +70,13 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
 	auto metadata = tmp_node.mutable_metadata();
 	::std::string key = ::std::string("IPAddresses");
 	ProtobufWkt::Value val;
-	val.set_string_value(GetAllIPAddress());
+	val.set_string_value(GetAllIPAddress2());
 	::google::protobuf::Map< ::std::string, ::google::protobuf::Value > *pMap = metadata->::google::protobuf::Struct::mutable_fields();
 	(*pMap)[key] = val;
   /////////////////////////////////////////////
 	api_state_[type_url].request_.mutable_node()->MergeFrom(tmp_node);
 	//	api_state_[type_url].request_.mutable_node()->MergeFrom(local_info_.node());
-  	printf("Add additional ipaddr info into node.metadata.\n");
-
+  	ENVOY_LOG(info, "Add additional ipaddr info into node.metadata.");
   ApiState& api_state = api_state_[type_url];
   if (api_state.paused_) {
     ENVOY_LOG(trace, "API {} paused during sendDiscoveryRequest(), setting pending.", type_url);
@@ -101,7 +101,6 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
       }
     }
   }
-  printf("sendDiscoveryRequest [%s].\n",request.DebugString().c_str());
 
   ENVOY_LOG(trace, "Sending DiscoveryRequest for {}: {}", type_url, request.DebugString());
   stream_->sendMessage(request, false);
@@ -112,14 +111,14 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
   }
 }
 
-::std::string GrpcMuxImpl::GetAllIPAddress()
+::std::string GrpcMuxImpl::GetAllIPAddress1()
 {
-    static ::std::string ipaddrs = ::std::string("");
-    if(ipaddrs.length() > 0)
-    {
-        printf("Already cached, just return [%s].\n",ipaddrs.c_str());
-        return ipaddrs;
-    }
+  static ::std::string ipaddrs = ::std::string("");
+  if(ipaddrs.length() > 0)
+  {
+    ENVOY_LOG(info, "Already cached, just return {}.",ipaddrs);
+    return ipaddrs;
+  }
 
     int sockfd;
     struct ifconf ifconf;
@@ -131,7 +130,7 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
     ifconf.ifc_buf = buf;
     if ((sockfd =socket(AF_INET,SOCK_DGRAM,0))<0)
     {
-        printf("Get sockfd failed.\n");
+        ENVOY_LOG(info, "Get sockfd failed.");
         return ::std::string("Get sockfd failed.");
     }
     ioctl(sockfd, SIOCGIFCONF, &ifconf); //Get All Interface info
@@ -147,19 +146,83 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
     		if(ipaddrs.length() == 0)
 		    {
 			    ipaddrs = ::std::string(IPAddress);
-				printf("[1]find one ipaddress[%s], now addresses=[%s].\n",IPAddress,ipaddrs.c_str());
+				ENVOY_LOG(info, "[1]find one ipaddress{}, now addresses={}.",::std::string(IPAddress),ipaddrs);
 		    }
 		    else
 		    {
 			    ipaddrs += ::std::string(";")+::std::string(IPAddress);
-				printf("[2]find one ipaddress[%s], now addresses=[%s].\n",IPAddress,ipaddrs.c_str());
+				ENVOY_LOG(info, "[2]find one ipaddress{}, now addresses={}.",::std::string(IPAddress),ipaddrs);
 		    }
 	    	ifreq++;
         }
     }
-	printf("First time call GetAllIPAddress, return [%s].\n",ipaddrs.c_str());
+	ENVOY_LOG(info, "First time call GetAllIPAddress, return {}.",ipaddrs);
 	return ipaddrs;
 }
+
+::std::string GrpcMuxImpl::GetAllIPAddress2()
+{
+    static ::std::string OutAddresses = ::std::string("");
+    if(OutAddresses.length() > 0)
+    {
+        ENVOY_LOG(info, "Already cached, just return {}.",OutAddresses);
+        return OutAddresses;
+    }
+    struct ifaddrs * ifap0=NULL,*ifap=NULL;
+    void * tmpAddrPtr=NULL;
+
+
+    getifaddrs(&ifap0);
+    ifap=ifap0;
+    while (ifap!=NULL) 
+    {
+        if (ifap->ifa_addr->sa_family==AF_INET) 
+        { // check it is IP4
+            // is a valid IP4 Address
+            tmpAddrPtr=&(reinterpret_cast<struct sockaddr_in *>(ifap->ifa_addr))->sin_addr;
+            char addressBuffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+            if( ::std::string(addressBuffer) != ::std::string("127.0.0.1") )
+            {
+                if(OutAddresses.length() == 0)
+                {
+                    OutAddresses = ::std::string(addressBuffer);
+                    ENVOY_LOG(info, "[1]find one ipaddress{}, now addresses={}.",::std::string(addressBuffer),OutAddresses);
+                }
+                else
+                {
+                    OutAddresses += ::std::string(";") + ::std::string(addressBuffer);
+                    ENVOY_LOG(info, "[2]find one ipaddress{}, now addresses={}.",::std::string(addressBuffer),OutAddresses);
+                }
+            }
+        } 
+        else if (ifap->ifa_addr->sa_family==AF_INET6) 
+        { // check it is IP6
+            // is a valid IP6 Address
+            tmpAddrPtr=&(reinterpret_cast<struct sockaddr_in *>(ifap->ifa_addr))->sin_addr;
+            char addressBuffer[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, tmpAddrPtr, addressBuffer, INET6_ADDRSTRLEN);
+            if( ::std::string(addressBuffer) != ::std::string("::") )
+            {
+                if(OutAddresses.length() == 0)
+                {
+                    OutAddresses = ::std::string(addressBuffer);
+                    ENVOY_LOG(info, "[3]find one ipaddress{}, now addresses={}.",::std::string(addressBuffer),OutAddresses);
+                }
+                else
+                {
+                    OutAddresses += ::std::string(";") + ::std::string(addressBuffer);
+                    ENVOY_LOG(info, "[4]find one ipaddress{}, now addresses={}.",::std::string(addressBuffer),OutAddresses);
+                }
+            }
+        }
+        ifap=ifap->ifa_next;
+    }
+    if (ifap0) { freeifaddrs(ifap0); ifap0 = NULL; }
+    ENVOY_LOG(info, "First time call GetAllIPAddress, return {}.",OutAddresses);
+    return OutAddresses;
+}
+
 
 void GrpcMuxImpl::handleFailure() {
   for (const auto& api_state : api_state_) {
