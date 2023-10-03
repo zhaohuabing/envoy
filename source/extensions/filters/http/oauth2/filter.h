@@ -128,7 +128,7 @@ struct CookieNames {
  * This class encapsulates all data needed for the filter to operate so that we don't pass around
  * raw protobufs and other arbitrary data.
  */
-class FilterConfig {
+class FilterConfig : public ::Envoy::Router::RouteSpecificFilterConfig {{
 public:
   FilterConfig(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
                Upstream::ClusterManager& cluster_manager,
