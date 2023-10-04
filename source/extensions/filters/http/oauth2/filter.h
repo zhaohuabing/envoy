@@ -183,10 +183,10 @@ public:
   const std::string& encodedResourceQueryParams() const { return oauth2_config_->encoded_resource_query_params_; }
   const CookieNames& cookieNames() const { return oauth2_config_->cookie_names_; }
   const AuthType& authType() const { return oauth2_config_->auth_type_; }
+  void setOAuth2Config(OAuth2ConfigSharedPtr oauth2_config){oauth2_config_ = oauth2_config;};
 
 private:
   static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
-  void setOAuth2Config(OAuth2ConfigSharedPtr oauth2_config){oauth2_config_ = oauth2_config;};
 
   OAuth2ConfigSharedPtr oauth2_config_;
   std::shared_ptr<SecretReader> secret_reader_;

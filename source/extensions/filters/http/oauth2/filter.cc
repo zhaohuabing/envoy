@@ -240,7 +240,8 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const auto* oauth2_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
   if (oauth2_config) {
-    config_->setOAuth2Config(oauth2_config);
+    OAuth2ConfigSharedPtr oauth2_config_shared(*oauth2_config);
+    config_->setOAuth2Config(oauth2_config_shared);
   }
 
   //todo create oauth_client per route and secret reader per route
