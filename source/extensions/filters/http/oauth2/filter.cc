@@ -361,7 +361,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const auto redirect_uri = formatter.format(
       headers, *Http::ResponseHeaderMapImpl::create(), *Http::ResponseTrailerMapImpl::create(),
       decoder_callbacks_->streamInfo(), "", AccessLog::AccessLogType::NotSet);
-  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), config_.clientSecret(),
+  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), config_->clientSecret(),
                                      redirect_uri, config.authType());
 
   // pause while we await the next step from the OAuth server
@@ -573,7 +573,7 @@ void OAuth2Filter::sendUnauthorizedResponse() {
 const OAuth2Config& OAuth2Filter::getConfig() const {
   const auto* per_route_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
-  if (config) {
+  if (per_route_config) {
     return *per_route_config;
   }
   return *global_config_;
