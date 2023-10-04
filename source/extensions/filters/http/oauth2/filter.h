@@ -183,7 +183,6 @@ public:
   const std::string& encodedResourceQueryParams() const { return oauth2_config_->encoded_resource_query_params_; }
   const CookieNames& cookieNames() const { return oauth2_config_->cookie_names_; }
   const AuthType& authType() const { return oauth2_config_->auth_type_; }
-  void setOAuth2Config(OAuth2ConfigSharedPtr oauth2_config){oauth2_config_ = oauth2_config;};
 
 private:
   static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
@@ -296,6 +295,7 @@ private:
   std::string getEncodedToken() const;
   void addResponseCookies(Http::ResponseHeaderMap& headers, const std::string& encoded_token) const;
   const std::string& bearerPrefix() const;
+  const OAuth2Config& getConfig() const;
 };
 
 } // namespace Oauth2

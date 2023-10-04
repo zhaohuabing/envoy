@@ -237,12 +237,6 @@ OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr g
  */
 Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   // Get the per-route config
-  const auto* oauth2_config =
-      Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
-  if (oauth2_config) {
-    std::shared_ptr<OAuth2Config> oauth2_config_shared(oauth2_config);
-    config_->setOAuth2Config(oauth2_config_shared);
-  }
 
   //todo create oauth_client per route and secret reader per route
 
@@ -574,6 +568,15 @@ void OAuth2Filter::sendUnauthorizedResponse() {
   config_->stats().oauth_failure_.inc();
   decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, UnauthorizedBodyMessage, nullptr,
                                      absl::nullopt, EMPTY_STRING);
+}
+
+const OAuth2Config& OAuth2Filter::getConfig() const {
+  const auto* config =
+      Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
+  if (config) {
+    return *config;
+  }
+  return *global_config_;
 }
 
 } // namespace Oauth2
