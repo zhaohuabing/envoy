@@ -37,7 +37,7 @@ secretsProvider(const envoy::extensions::transport_sockets::tls::v3::SdsSecretCo
 }
 } // namespace
 
-Http::FilterFactoryCb OAuth2Config::createFilterFactoryFromProtoTyped(
+Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
     const std::string& stats_prefix, Server::Configuration::FactoryContext& context) {
   if (!proto.has_config()) {
@@ -80,7 +80,7 @@ Http::FilterFactoryCb OAuth2Config::createFilterFactoryFromProtoTyped(
       };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+Router::RouteSpecificFilterConfigConstSharedPtr FilterFactory::createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
       Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&){
   if (!proto.has_config()) {
@@ -92,7 +92,7 @@ Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigT
 /*
  * Static registration for the OAuth2 filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(OAuth2Config, Server::Configuration::NamedHttpFilterConfigFactory);
+REGISTER_FACTORY(FilterFactory, Server::Configuration::NamedHttpFilterConfigFactory);
 
 } // namespace Oauth2
 } // namespace HttpFilters

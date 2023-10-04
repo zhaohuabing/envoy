@@ -12,10 +12,10 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Oauth2 {
 
-class OAuth2Config
+class FilterFactory
     : public Common::FactoryBase<envoy::extensions::filters::http::oauth2::v3::OAuth2> {
 public:
-  OAuth2Config() : FactoryBase("envoy.filters.http.oauth2") {}
+  FilterFactory() : FactoryBase("envoy.filters.http.oauth2") {}
 
 private:
   Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
