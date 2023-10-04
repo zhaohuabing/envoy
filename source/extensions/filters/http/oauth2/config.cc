@@ -82,7 +82,7 @@ Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
 
 Router::RouteSpecificFilterConfigConstSharedPtr FilterFactory::createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
-      Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&){
+      Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&){
   if (!proto.has_config()) {
     throw EnvoyException("config must be present for per route config");
   }
