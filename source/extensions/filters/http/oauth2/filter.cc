@@ -237,7 +237,7 @@ OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr g
  */
 Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   // Get the per-route config
-  auto config = getConfig();
+  const auto config = getConfig();
   //todo create oauth_client per route and secret reader per route
 
   // Skip Filter and continue chain if a Passthrough header is matching
