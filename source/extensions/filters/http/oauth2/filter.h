@@ -157,7 +157,6 @@ using OAuth2ConfigSharedPtr = std::shared_ptr<OAuth2Config>;
 class FilterConfig {
 public:
   FilterConfig(OAuth2ConfigSharedPtr oauth2_config,
-               Upstream::ClusterManager& cluster_manager,
                std::shared_ptr<SecretReader> secret_reader, Stats::Scope& scope,
                const std::string& stats_prefix);
   const std::string& clusterName() const { return oauth2_config_->oauth_token_endpoint_.cluster(); }

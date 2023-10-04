@@ -67,8 +67,8 @@ Http::FilterFactoryCb OAuth2Config::createFilterFactoryFromProtoTyped(
   auto secret_reader = std::make_shared<SDSSecretReader>(
       secret_provider_token_secret, secret_provider_hmac_secret, context.api());
 
-  auto oauth2_config = std::make_shared<OAuth2Config>(proto_config);
-  auto filter_config = std::make_shared<FilterConfig>(oauth2_config, cluster_manager, secret_reader,
+  auto oauth2_config = std::make_shared<OAuth2Config>(proto_config, cluster_manager);
+  auto filter_config = std::make_shared<FilterConfig>(oauth2_config, secret_reader,
                                                context.scope(), stats_prefix);
 
   return

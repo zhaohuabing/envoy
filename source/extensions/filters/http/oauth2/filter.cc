@@ -139,7 +139,8 @@ Http::Utility::QueryParams buildAutorizationQueryParams(
 } // namespace
 
 OAuth2Config::OAuth2Config(
-  const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config)
+  const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
+  Upstream::ClusterManager& cluster_manager)
   : oauth_token_endpoint_(proto_config.token_endpoint()),
     authorization_endpoint_(proto_config.authorization_endpoint()),
     authorization_query_params_(buildAutorizationQueryParams(proto_config)),
@@ -167,9 +168,10 @@ OAuth2Config::OAuth2Config(
 
 FilterConfig::FilterConfig(
     OAuth2ConfigSharedPtr oauth2_config,
-    Upstream::ClusterManager& cluster_manager, std::shared_ptr<SecretReader> secret_reader,
+    std::shared_ptr<SecretReader> secret_reader,
     Stats::Scope& scope, const std::string& stats_prefix)
-    : secret_reader_(secret_reader),
+    : oauth2_config_(oauth2_config),
+      secret_reader_(secret_reader),
       stats_(FilterConfig::generateStats(stats_prefix, scope)) {}
 
 FilterStats FilterConfig::generateStats(const std::string& prefix, Stats::Scope& scope) {
@@ -234,6 +236,8 @@ OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config,
  * 5) user is unauthorized
  */
 Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
+  oauth_client_ = std::make_unique<OAuth2ClientImpl>(cluster_manager, filter_config_->oauthTokenEndpoint()); 
+
   // Skip Filter and continue chain if a Passthrough header is matching
   // Must be done before the sanitation of the authorization header,
   // otherwise the authorization header might be altered or removed
