@@ -148,6 +148,12 @@ public:
   const std::string& encodedResourceQueryParams() const { return encoded_resource_query_params_; }
   const CookieNames& cookieNames() const { return cookie_names_; }
   const AuthType& authType() const { return auth_type_; }
+  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& tokenSecret() const {
+    return token_secret_;
+  }
+  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& hmacSecret() const {
+    return hmac_secret_;
+  }
 
 private:
   friend class FilterConfig;
@@ -167,6 +173,8 @@ private:
   const std::vector<Http::HeaderUtility::HeaderData> pass_through_header_matchers_;
   const CookieNames cookie_names_;
   const AuthType auth_type_;
+  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& token_secret_;
+  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& hmac_secret_;
 };
 
 using OAuth2ConfigSharedPtr = std::shared_ptr<OAuth2Config>;
