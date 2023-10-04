@@ -186,6 +186,7 @@ public:
 
 private:
   static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
+  setOAuth2Config(OAuth2ConfigSharedPtr oauth2_config){oauth2_config_ = oauth2_config;};
 
   OAuth2ConfigSharedPtr oauth2_config_;
   std::shared_ptr<SecretReader> secret_reader_;
