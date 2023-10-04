@@ -126,7 +126,8 @@ struct CookieNames {
 
 class OAuth2Config : public ::Envoy::Router::RouteSpecificFilterConfig {
 public:
-  OAuth2Config(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config);
+  OAuth2Config(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
+               Upstream::ClusterManager& cluster_manager);
 
 private:
   friend class FilterConfig;
