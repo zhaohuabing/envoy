@@ -218,10 +218,10 @@ bool OAuth2CookieValidator::timestampIsValid() const {
 
 bool OAuth2CookieValidator::isValid() const { return hmacIsValid() && timestampIsValid(); }
 
-OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config,
+OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr global_config
                            std::unique_ptr<OAuth2Client>&& oauth_client, TimeSource& time_source)
     : validator_(std::make_shared<OAuth2CookieValidator>(time_source, config->cookieNames())),
-      oauth_client_(std::move(oauth_client)), config_(std::move(config)),
+      oauth_client_(std::move(oauth_client)), config_(std::move(config)), global_config_(std::move(global_config)),
       time_source_(time_source) {
 
   oauth_client_->setCallbacks(*this);
@@ -240,7 +240,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const auto* oauth2_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
   if (oauth2_config) {
-    OAuth2ConfigSharedPtr oauth2_config_shared(oauth2_config);
+    std::shared_ptr<OAuth2Config> oauth2_config_shared(oauth2_config);
     config_->setOAuth2Config(oauth2_config_shared);
   }
 

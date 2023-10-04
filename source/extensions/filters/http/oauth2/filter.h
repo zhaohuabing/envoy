@@ -247,8 +247,8 @@ private:
  */
 class OAuth2Filter : public Http::PassThroughDecoderFilter, public FilterCallbacks {
 public:
-  OAuth2Filter(FilterConfigSharedPtr config, std::unique_ptr<OAuth2Client>&& oauth_client,
-               TimeSource& time_source);
+  OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr global_config,
+               std::unique_ptr<OAuth2Client>&& oauth_client, TimeSource& time_source);
 
   // Http::PassThroughDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers, bool) override;
@@ -281,6 +281,7 @@ private:
 
   std::unique_ptr<OAuth2Client> oauth_client_;
   FilterConfigSharedPtr config_;
+  OAuth2ConfigSharedPtr global_config_;
   TimeSource& time_source_;
 
   // Determines whether or not the current request can skip the entire OAuth flow (HMAC is valid,
