@@ -12,15 +12,21 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Oauth2 {
 
-class OAuth2Config : public Extensions::HttpFilters::Common::FactoryBase<
-                         envoy::extensions::filters::http::oauth2::v3::OAuth2> {
+class OAuth2Config
+    : public Common::FactoryBase<envoy::extensions::filters::http::oauth2::v3::OAuth2> {
 public:
   OAuth2Config() : FactoryBase("envoy.filters.http.oauth2") {}
 
-  Http::FilterFactoryCb
-  createFilterFactoryFromProtoTyped(const envoy::extensions::filters::http::oauth2::v3::OAuth2&,
-                                    const std::string&,
-                                    Server::Configuration::FactoryContext&) override;
+private:
+  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
+    const std::string& stats_prefix,
+    Server::Configuration::FactoryContext& context) override;
+
+  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+    const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
+    Server::Configuration::ServerFactoryContext&,
+    ProtobufMessage::ValidationVisitor&) override;
 };
 
 } // namespace Oauth2

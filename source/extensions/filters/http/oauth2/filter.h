@@ -124,42 +124,12 @@ struct CookieNames {
   static constexpr absl::string_view RefreshToken = "RefreshToken";
 };
 
-/**
- * This class encapsulates all data needed for the filter to operate so that we don't pass around
- * raw protobufs and other arbitrary data.
- */
-class FilterConfig : public ::Envoy::Router::RouteSpecificFilterConfig {{
+class OAuth2Config : public ::Envoy::Router::RouteSpecificFilterConfig {
 public:
-  FilterConfig(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
-               Upstream::ClusterManager& cluster_manager,
-               std::shared_ptr<SecretReader> secret_reader, Stats::Scope& scope,
-               const std::string& stats_prefix);
-  const std::string& clusterName() const { return oauth_token_endpoint_.cluster(); }
-  const std::string& clientId() const { return client_id_; }
-  bool forwardBearerToken() const { return forward_bearer_token_; }
-  const std::vector<Http::HeaderUtility::HeaderData>& passThroughMatchers() const {
-    return pass_through_header_matchers_;
-  }
-
-  const envoy::config::core::v3::HttpUri& oauthTokenEndpoint() const {
-    return oauth_token_endpoint_;
-  }
-  const Http::Utility::Url& authorizationEndpointUrl() const { return authorization_endpoint_url_; }
-  const Http::Utility::QueryParams& authorizationQueryParams() const {
-    return authorization_query_params_;
-  }
-  const std::string& redirectUri() const { return redirect_uri_; }
-  const Matchers::PathMatcher& redirectPathMatcher() const { return redirect_matcher_; }
-  const Matchers::PathMatcher& signoutPath() const { return signout_path_; }
-  std::string clientSecret() const { return secret_reader_->clientSecret(); }
-  std::string tokenSecret() const { return secret_reader_->tokenSecret(); }
-  FilterStats& stats() { return stats_; }
-  const std::string& encodedResourceQueryParams() const { return encoded_resource_query_params_; }
-  const CookieNames& cookieNames() const { return cookie_names_; }
-  const AuthType& authType() const { return auth_type_; }
+  OAuth2Config(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config);
 
 private:
-  static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
+  friend class FilterConfig;
 
   const envoy::config::core::v3::HttpUri oauth_token_endpoint_;
   // Owns the data exposed by authorization_endpoint_url_.
@@ -170,14 +140,56 @@ private:
   const std::string redirect_uri_;
   const Matchers::PathMatcher redirect_matcher_;
   const Matchers::PathMatcher signout_path_;
-  std::shared_ptr<SecretReader> secret_reader_;
-  FilterStats stats_;
   const std::string encoded_auth_scopes_;
   const std::string encoded_resource_query_params_;
   const bool forward_bearer_token_ : 1;
   const std::vector<Http::HeaderUtility::HeaderData> pass_through_header_matchers_;
   const CookieNames cookie_names_;
   const AuthType auth_type_;
+}
+
+using OAuth2ConfigSharedPtr = std::shared_ptr<OAuth2Config>;
+
+/**
+ * This class encapsulates all data needed for the filter to operate so that we don't pass around
+ * raw protobufs and other arbitrary data.
+ */
+class FilterConfig {
+public:
+  FilterConfig(OAuth2ConfigSharedPtr oauth2_config,
+               Upstream::ClusterManager& cluster_manager,
+               std::shared_ptr<SecretReader> secret_reader, Stats::Scope& scope,
+               const std::string& stats_prefix);
+  const std::string& clusterName() const { return oauth2_config_->oauth_token_endpoint_.cluster(); }
+  const std::string& clientId() const { return oauth2_config_->client_id_; }
+  bool forwardBearerToken() const { return oauth2_config_->forward_bearer_token_; }
+  const std::vector<Http::HeaderUtility::HeaderData>& passThroughMatchers() const {
+    return oauth2_config_->pass_through_header_matchers_;
+  }
+
+  const envoy::config::core::v3::HttpUri& oauthTokenEndpoint() const {
+    return oauth2_config_->oauth_token_endpoint_;
+  }
+  const Http::Utility::Url& authorizationEndpointUrl() const { return oauth2_config_->uthorization_endpoint_url_; }
+  const Http::Utility::QueryParams& authorizationQueryParams() const {
+    return oauth2_config_->authorization_query_params_;
+  }
+  const std::string& redirectUri() const { return oauth2_config_->redirect_uri_; }
+  const Matchers::PathMatcher& redirectPathMatcher() const { return oauth2_config_->redirect_matcher_; }
+  const Matchers::PathMatcher& signoutPath() const { return oauth2_config_->signout_path_; }
+  std::string clientSecret() const { return secret_reader_->clientSecret(); }
+  std::string tokenSecret() const { return secret_reader_->tokenSecret(); }
+  FilterStats& stats() { return stats_; }
+  const std::string& encodedResourceQueryParams() const { return oauth2_config_->encoded_resource_query_params_; }
+  const CookieNames& cookieNames() const { return oauth2_config_->cookie_names_; }
+  const AuthType& authType() const { return oauth2_config_->auth_type_; }
+
+private:
+  static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
+
+  OAuth2ConfigSharedPtr oauth2_config_;
+  std::shared_ptr<SecretReader> secret_reader_;
+  FilterStats stats_;
 };
 
 using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;

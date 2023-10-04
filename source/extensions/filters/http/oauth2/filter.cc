@@ -138,23 +138,20 @@ Http::Utility::QueryParams buildAutorizationQueryParams(
 }
 } // namespace
 
-FilterConfig::FilterConfig(
-    const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
-    Upstream::ClusterManager& cluster_manager, std::shared_ptr<SecretReader> secret_reader,
-    Stats::Scope& scope, const std::string& stats_prefix)
-    : oauth_token_endpoint_(proto_config.token_endpoint()),
-      authorization_endpoint_(proto_config.authorization_endpoint()),
-      authorization_query_params_(buildAutorizationQueryParams(proto_config)),
-      client_id_(proto_config.credentials().client_id()),
-      redirect_uri_(proto_config.redirect_uri()),
-      redirect_matcher_(proto_config.redirect_path_matcher()),
-      signout_path_(proto_config.signout_path()), secret_reader_(secret_reader),
-      stats_(FilterConfig::generateStats(stats_prefix, scope)),
-      encoded_resource_query_params_(encodeResourceList(proto_config.resources())),
-      forward_bearer_token_(proto_config.forward_bearer_token()),
-      pass_through_header_matchers_(headerMatchers(proto_config.pass_through_matcher())),
-      cookie_names_(proto_config.credentials().cookie_names()),
-      auth_type_(getAuthType(proto_config.auth_type())) {
+OAuth2Config::OAuth2Config(
+  const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config)
+  : oauth_token_endpoint_(proto_config.token_endpoint()),
+    authorization_endpoint_(proto_config.authorization_endpoint()),
+    authorization_query_params_(buildAutorizationQueryParams(proto_config)),
+    client_id_(proto_config.credentials().client_id()),
+    redirect_uri_(proto_config.redirect_uri()),
+    redirect_matcher_(proto_config.redirect_path_matcher()),
+    signout_path_(proto_config.signout_path()),
+    encoded_resource_query_params_(encodeResourceList(proto_config.resources())),
+    forward_bearer_token_(proto_config.forward_bearer_token()),
+    pass_through_header_matchers_(headerMatchers(proto_config.pass_through_matcher())),
+    cookie_names_(proto_config.credentials().cookie_names()),
+    auth_type_(getAuthType(proto_config.auth_type())) {
   if (!cluster_manager.clusters().hasCluster(oauth_token_endpoint_.cluster())) {
     throw EnvoyException(fmt::format("OAuth2 filter: unknown cluster '{}' in config. Please "
                                      "specify which cluster to direct OAuth requests to.",
@@ -167,6 +164,13 @@ FilterConfig::FilterConfig(
                     authorization_endpoint_));
   }
 }
+
+FilterConfig::FilterConfig(
+    OAuth2ConfigSharedPtr oauth2_config,
+    Upstream::ClusterManager& cluster_manager, std::shared_ptr<SecretReader> secret_reader,
+    Stats::Scope& scope, const std::string& stats_prefix)
+    : secret_reader_(secret_reader),
+      stats_(FilterConfig::generateStats(stats_prefix, scope)) {}
 
 FilterStats FilterConfig::generateStats(const std::string& prefix, Stats::Scope& scope) {
   return {ALL_OAUTH_FILTER_STATS(POOL_COUNTER_PREFIX(scope, prefix))};

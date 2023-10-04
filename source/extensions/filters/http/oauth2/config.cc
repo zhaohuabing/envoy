@@ -66,16 +66,27 @@ Http::FilterFactoryCb OAuth2Config::createFilterFactoryFromProtoTyped(
 
   auto secret_reader = std::make_shared<SDSSecretReader>(
       secret_provider_token_secret, secret_provider_hmac_secret, context.api());
-  auto config = std::make_shared<FilterConfig>(proto_config, cluster_manager, secret_reader,
+
+  auto oauth2_config = std::make_shared<OAuth2Config>(proto_config);
+  auto filter_config = std::make_shared<FilterConfig>(oauth2_config, cluster_manager, secret_reader,
                                                context.scope(), stats_prefix);
 
   return
-      [&context, config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+      [&context, filter_config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {
         std::unique_ptr<OAuth2Client> oauth_client =
-            std::make_unique<OAuth2ClientImpl>(cluster_manager, config->oauthTokenEndpoint());
+            std::make_unique<OAuth2ClientImpl>(cluster_manager, filter_config->oauthTokenEndpoint()); //TODO: create oauth_client per route
         callbacks.addStreamDecoderFilter(
-            std::make_shared<OAuth2Filter>(config, std::move(oauth_client), context.timeSource()));
+            std::make_shared<OAuth2Filter>(filter_config, std::move(oauth_client), context.timeSource()));
       };
+}
+
+Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+      const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
+      Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&){
+  if (!proto.has_config()) {
+    throw EnvoyException("config must be present for per route config");
+  }
+  return std::make_shared<OAuth2Config>(proto_config);
 }
 
 /*
