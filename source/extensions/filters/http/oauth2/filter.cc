@@ -219,10 +219,10 @@ bool OAuth2CookieValidator::timestampIsValid() const {
 bool OAuth2CookieValidator::isValid() const { return hmacIsValid() && timestampIsValid(); }
 
 OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr global_config,
-                           std::unique_ptr<OAuth2Client>&& oauth_client, TimeSource& time_source)
+                           std::unique_ptr<OAuth2Client>&& oauth_client, TimeSource& time_source,Server::Configuration::FactoryContext& context)
     : validator_(std::make_shared<OAuth2CookieValidator>(time_source, config->cookieNames())),
       oauth_client_(std::move(oauth_client)), config_(std::move(config)), global_config_(std::move(global_config)),
-      time_source_(time_source) {
+      time_source_(time_source), context_(context) {
 
   oauth_client_->setCallbacks(*this);
 }
