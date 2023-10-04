@@ -128,6 +128,26 @@ class OAuth2Config : public ::Envoy::Router::RouteSpecificFilterConfig {
 public:
   OAuth2Config(const envoy::extensions::filters::http::oauth2::v3::OAuth2Config& proto_config,
                Upstream::ClusterManager& cluster_manager);
+  const std::string& clusterName() const { return oauth_token_endpoint_.cluster(); }
+  const std::string& clientId() const { return client_id_; }
+  bool forwardBearerToken() const { return forward_bearer_token_; }
+  const std::vector<Http::HeaderUtility::HeaderData>& passThroughMatchers() const {
+    return pass_through_header_matchers_;
+  }
+
+  const envoy::config::core::v3::HttpUri& oauthTokenEndpoint() const {
+    return oauth_token_endpoint_;
+  }
+  const Http::Utility::Url& authorizationEndpointUrl() const { return authorization_endpoint_url_; }
+  const Http::Utility::QueryParams& authorizationQueryParams() const {
+    return authorization_query_params_;
+  }
+  const std::string& redirectUri() const { return redirect_uri_; }
+  const Matchers::PathMatcher& redirectPathMatcher() const { return redirect_matcher_; }
+  const Matchers::PathMatcher& signoutPath() const { return signout_path_; }
+  const std::string& encodedResourceQueryParams() const { return encoded_resource_query_params_; }
+  const CookieNames& cookieNames() const { return cookie_names_; }
+  const AuthType& authType() const { return auth_type_; }
 
 private:
   friend class FilterConfig;
