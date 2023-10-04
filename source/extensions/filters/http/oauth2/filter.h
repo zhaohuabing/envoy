@@ -169,7 +169,7 @@ public:
   const envoy::config::core::v3::HttpUri& oauthTokenEndpoint() const {
     return oauth2_config_->oauth_token_endpoint_;
   }
-  const Http::Utility::Url& authorizationEndpointUrl() const { return oauth2_config_->uthorization_endpoint_url_; }
+  const Http::Utility::Url& authorizationEndpointUrl() const { return oauth2_config_->authorization_endpoint_url_; }
   const Http::Utility::QueryParams& authorizationQueryParams() const {
     return oauth2_config_->authorization_query_params_;
   }
