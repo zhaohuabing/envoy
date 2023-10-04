@@ -82,11 +82,11 @@ Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
 
 Router::RouteSpecificFilterConfigConstSharedPtr FilterFactory::createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
-      Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&){
+      Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&){
   if (!proto.has_config()) {
     throw EnvoyException("config must be present for per route config");
   }
-  return std::make_shared<OAuth2Config>(proto);
+  return std::make_shared<OAuth2Config>(proto, context.clusterManager());
 }
 
 /*
