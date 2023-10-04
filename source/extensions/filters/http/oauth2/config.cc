@@ -87,8 +87,9 @@ Router::RouteSpecificFilterConfigConstSharedPtr FilterFactory::createRouteSpecif
     throw EnvoyException("config must be present for per route config");
   }
 
-  auto oauth2_config = std::make_shared<OAuth2Config>(proto_config, cluster_manager);
-  return std::make_shared<OAuth2Config>(oauth2_config, context.clusterManager());
+  const auto& proto_config = proto.config();
+  auto& cluster_manager = context.clusterManager();
+  return std::make_shared<OAuth2Config>(proto_config, cluster_manager);
 }
 
 /*
@@ -100,3 +101,4 @@ REGISTER_FACTORY(FilterFactory, Server::Configuration::NamedHttpFilterConfigFact
 } // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy
+
