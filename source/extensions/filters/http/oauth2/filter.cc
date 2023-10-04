@@ -239,12 +239,12 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   // Get the per-route config
   const auto* oauth2_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
-  if (config) {
+  if (oauth2_config) {
     config_->setOAuth2Config(oauth2_config);
   }
 
   //todo create oauth_client per route and secret reader per route
-  
+
   // Skip Filter and continue chain if a Passthrough header is matching
   // Must be done before the sanitation of the authorization header,
   // otherwise the authorization header might be altered or removed
