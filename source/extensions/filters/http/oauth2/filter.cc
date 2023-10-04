@@ -244,7 +244,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   // Must be done before the sanitation of the authorization header,
   // otherwise the authorization header might be altered or removed
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.oauth_header_passthrough_fix")) {
-    for (const auto& matcher : config.passThroughMatchers()) {
+    for (const auto& matcher : config_->passThroughMatchers()) {
       if (matcher.matchesHeaders(headers)) {
         config_->stats().oauth_passthrough_.inc();
         return Http::FilterHeadersStatus::Continue;
@@ -268,7 +268,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const absl::string_view path_str = path_header->value().getStringView();
 
   // We should check if this is a sign out request.
-  if (config.signoutPath().match(path_header->value().getStringView())) {
+  if (config_->signoutPath().match(path_header->value().getStringView())) {
     return signOutUser(headers);
   }
 
@@ -279,7 +279,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     // correctly but cause a race condition on future requests that have their location set
     // to the callback path.
 
-    if (config.redirectPathMatcher().match(path_str)) {
+    if (config_->redirectPathMatcher().match(path_str)) {
       Http::Utility::QueryParams query_parameters = Http::Utility::parseQueryString(path_str);
 
       if (query_parameters.find(queryParamsState()) == query_parameters.end()) {
@@ -300,7 +300,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
         return Http::FilterHeadersStatus::StopIteration;
       }
       // Avoid infinite redirect storm
-      if (config.redirectPathMatcher().match(state_url.pathAndQueryParams())) {
+      if (config_->redirectPathMatcher().match(state_url.pathAndQueryParams())) {
         sendUnauthorizedResponse();
         return Http::FilterHeadersStatus::StopIteration;
       }
@@ -322,7 +322,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   //
   // The following conditional could be replaced with a regex pattern-match,
   // if we're concerned about strict matching against the callback path.
-  if (!config.redirectPathMatcher().match(path_str)) {
+  if (!config_->redirectPathMatcher().match(path_str)) {
     redirectToOAuthServer(headers);
     return Http::FilterHeadersStatus::StopIteration;
   }
@@ -357,12 +357,12 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     return Http::FilterHeadersStatus::StopIteration;
   }
 
-  Formatter::FormatterImpl formatter(config.redirectUri());
+  Formatter::FormatterImpl formatter(config_->redirectUri());
   const auto redirect_uri = formatter.format(
       headers, *Http::ResponseHeaderMapImpl::create(), *Http::ResponseTrailerMapImpl::create(),
       decoder_callbacks_->streamInfo(), "", AccessLog::AccessLogType::NotSet);
-  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), config.clientSecret(),
-                                     redirect_uri, config.authType());
+  oauth_client_->asyncGetAccessToken(auth_code_, config_->clientId(), config_->clientSecret(),
+                                     redirect_uri, config_->authType());
 
   // pause while we await the next step from the OAuth server
   return Http::FilterHeadersStatus::StopAllIterationAndBuffer;
@@ -373,16 +373,16 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
 bool OAuth2Filter::canSkipOAuth(Http::RequestHeaderMap& headers) const {
   // We can skip OAuth if the supplied HMAC cookie is valid. Apply the OAuth details as headers
   // if we successfully validate the cookie.
-  validator_->setParams(headers, config.tokenSecret());
+  validator_->setParams(headers, config_->tokenSecret());
   if (validator_->isValid()) {
     config_->stats().oauth_success_.inc();
-    if (config.forwardBearerToken() && !validator_->token().empty()) {
+    if (config_->forwardBearerToken() && !validator_->token().empty()) {
       setBearerToken(headers, validator_->token());
     }
     return true;
   }
   if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.oauth_header_passthrough_fix")) {
-    for (const auto& matcher : config.passThroughMatchers()) {
+    for (const auto& matcher : config_->passThroughMatchers()) {
       if (matcher.matchesHeaders(headers)) {
         return true;
       }
