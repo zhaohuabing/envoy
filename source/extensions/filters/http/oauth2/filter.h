@@ -146,7 +146,7 @@ private:
   const std::vector<Http::HeaderUtility::HeaderData> pass_through_header_matchers_;
   const CookieNames cookie_names_;
   const AuthType auth_type_;
-}
+};
 
 using OAuth2ConfigSharedPtr = std::shared_ptr<OAuth2Config>;
 
