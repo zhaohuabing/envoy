@@ -45,14 +45,17 @@ Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
   }
 
   const auto& proto_config = proto.config();
+  auto& cluster_manager = context.clusterManager();
+
+  auto global_config = std::make_shared<OAuth2Config>(proto_config, cluster_manager);
   auto filter_config = std::make_shared<FilterConfig>(context.scope(), stats_prefix);
 
   return
-      [&context, filter_config, oauth2_config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+      [&context, filter_config, global_config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {
         std::unique_ptr<OAuth2Client> oauth_client =
             std::make_unique<OAuth2ClientImpl>(cluster_manager, filter_config->oauthTokenEndpoint()); //TODO: create oauth_client per route
         callbacks.addStreamDecoderFilter(
-            std::make_shared<OAuth2Filter>(filter_config, oauth2_config, std::move(oauth_client), context.timeSource(),context));
+            std::make_shared<OAuth2Filter>(filter_config, global_config, std::move(oauth_client), context.timeSource(),context));
       };
 }
 
