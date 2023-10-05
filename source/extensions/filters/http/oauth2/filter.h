@@ -249,8 +249,7 @@ private:
 class OAuth2Filter : public Http::PassThroughDecoderFilter, public FilterCallbacks {
 public:
   OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr global_config,
-               std::unique_ptr<OAuth2Client>&& oauth_client, TimeSource& time_source, 
-               Server::Configuration::FactoryContext& context);
+               TimeSource& time_source, Server::Configuration::FactoryContext& context);
 
   // Http::PassThroughDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers, bool) override;

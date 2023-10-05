@@ -22,21 +22,6 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Oauth2 {
 
-namespace {
-Secret::GenericSecretConfigProviderSharedPtr
-secretsProvider(const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& config,
-                Secret::SecretManager& secret_manager,
-                Server::Configuration::TransportSocketFactoryContext& transport_socket_factory,
-                Init::Manager& init_manager) {
-  if (config.has_sds_config()) {
-    return secret_manager.findOrCreateGenericSecretProvider(config.sds_config(), config.name(),
-                                                            transport_socket_factory, init_manager);
-  } else {
-    return secret_manager.findStaticGenericSecretProvider(config.name());
-  }
-}
-} // namespace
-
 Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::oauth2::v3::OAuth2& proto,
     const std::string& stats_prefix, Server::Configuration::FactoryContext& context) {
@@ -51,11 +36,9 @@ Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
   auto filter_config = std::make_shared<FilterConfig>(context.scope(), stats_prefix);
 
   return
-      [&context, filter_config, global_config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {
-        std::unique_ptr<OAuth2Client> oauth_client =
-            std::make_unique<OAuth2ClientImpl>(cluster_manager, global_config->oauthTokenEndpoint()); //TODO: create oauth_client per route
-        callbacks.addStreamDecoderFilter(
-            std::make_shared<OAuth2Filter>(filter_config, global_config, std::move(oauth_client), context.timeSource(),context));
+      [&context, filter_config, global_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+      callbacks.addStreamDecoderFilter(
+            std::make_shared<OAuth2Filter>(filter_config, global_config, context.timeSource(),context));
       };
 }
 
