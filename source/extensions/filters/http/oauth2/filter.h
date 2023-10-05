@@ -205,8 +205,6 @@ public:
   const std::string& redirectUri() const { return oauth2_config_->redirect_uri_; }
   const Matchers::PathMatcher& redirectPathMatcher() const { return oauth2_config_->redirect_matcher_; }
   const Matchers::PathMatcher& signoutPath() const { return oauth2_config_->signout_path_; }
-  std::string clientSecret() const { return secret_reader_->clientSecret(); }
-  std::string tokenSecret() const { return secret_reader_->tokenSecret(); }
   FilterStats& stats() { return stats_; }
   const std::string& encodedResourceQueryParams() const { return oauth2_config_->encoded_resource_query_params_; }
   const CookieNames& cookieNames() const { return oauth2_config_->cookie_names_; }
@@ -312,6 +310,7 @@ private:
   OAuth2ConfigSharedPtr global_config_;
   TimeSource& time_source_;
   Server::Configuration::FactoryContext& context_;
+  std::shared_ptr<SecretReader> secret_reader_;
 
   // Determines whether or not the current request can skip the entire OAuth flow (HMAC is valid,
   // connection is mTLS, etc.)
@@ -326,7 +325,7 @@ private:
   void addResponseCookies(Http::ResponseHeaderMap& headers, const std::string& encoded_token) const;
   const std::string& bearerPrefix() const;
   const OAuth2Config& getConfig() const;
-  std::shared_ptr<SecretReader> secret_reader_;
+  void createSecretReader();
 };
 
 } // namespace Oauth2

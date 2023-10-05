@@ -136,6 +136,19 @@ Http::Utility::QueryParams buildAutorizationQueryParams(
           : Http::Utility::PercentEncoding::encode(scopes_list, ":/=&? ");
   return query_params;
 }
+
+Secret::GenericSecretConfigProviderSharedPtr
+secretsProvider(const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& config,
+                Secret::SecretManager& secret_manager,
+                Server::Configuration::TransportSocketFactoryContext& transport_socket_factory,
+                Init::Manager& init_manager) {
+  if (config.has_sds_config()) {
+    return secret_manager.findOrCreateGenericSecretProvider(config.sds_config(), config.name(),
+                                                            transport_socket_factory, init_manager);
+  } else {
+    return secret_manager.findStaticGenericSecretProvider(config.name());
+  }
+}
 } // namespace
 
 OAuth2Config::OAuth2Config(
@@ -274,25 +287,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     return signOutUser(headers);
   }
 
-  const auto& token_secret = config.tokenSecret();
-  const auto& hmac_secret = config.hmacSecret();
-
-  auto& cluster_manager = context_.clusterManager();
-  auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
-  auto& transport_socket_factory = context_.getTransportSocketFactoryContext();
-  auto secret_provider_token_secret = secretsProvider(
-      token_secret, secret_manager, transport_socket_factory, context_.initManager());
-  if (secret_provider_token_secret == nullptr) {
-    throw EnvoyException("invalid token secret configuration");
-  }
-  auto secret_provider_hmac_secret =
-      secretsProvider(hmac_secret, secret_manager, transport_socket_factory, context_.initManager());
-  if (secret_provider_hmac_secret == nullptr) {
-    throw EnvoyException("invalid HMAC secret configuration");
-  }
-
-  secret_reader_ = std::make_shared<SDSSecretReader>(
-      secret_provider_token_secret, secret_provider_hmac_secret, context.api());
+  createSecretReader();
 
   if (canSkipOAuth(headers)) {
     // Update the path header with the query string parameters after a successful OAuth login.
@@ -383,7 +378,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const auto redirect_uri = formatter.format(
       headers, *Http::ResponseHeaderMapImpl::create(), *Http::ResponseTrailerMapImpl::create(),
       decoder_callbacks_->streamInfo(), "", AccessLog::AccessLogType::NotSet);
-  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), config_->clientSecret(),
+  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), secret_reader_->tokenSecret()),
                                      redirect_uri, config.authType());
 
   // pause while we await the next step from the OAuth server
@@ -395,7 +390,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
 bool OAuth2Filter::canSkipOAuth(Http::RequestHeaderMap& headers) const {
   // We can skip OAuth if the supplied HMAC cookie is valid. Apply the OAuth details as headers
   // if we successfully validate the cookie.
-  validator_->setParams(headers, config_->tokenSecret());
+  validator_->setParams(headers, secret_reader_->tokenSecret());
   if (validator_->isValid()) {
     config_->stats().oauth_success_.inc();
     if (config_->forwardBearerToken() && !validator_->token().empty()) {
@@ -508,7 +503,7 @@ std::string OAuth2Filter::getEncodedToken() const {
 
   auto& crypto_util = Envoy::Common::Crypto::UtilitySingleton::get();
 
-  auto token_secret = config_->tokenSecret();
+  auto token_secret = secret_reader_->tokenSecret();
   std::vector<uint8_t> token_secret_vec(token_secret.begin(), token_secret.end());
   const std::string pre_encoded_token =
       Hex::encode(crypto_util.getSha256Hmac(token_secret_vec, token_payload));
@@ -599,6 +594,28 @@ const OAuth2Config& OAuth2Filter::getConfig() const {
     return *per_route_config;
   }
   return *global_config_;
+}
+
+void OAuth2Filter::createSecretReader() {
+const auto& token_secret = config.tokenSecret();
+  const auto& hmac_secret = config.hmacSecret();
+
+  auto& cluster_manager = context_.clusterManager();
+  auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
+  auto& transport_socket_factory = context_.getTransportSocketFactoryContext();
+  auto secret_provider_token_secret = secretsProvider(
+      token_secret, secret_manager, transport_socket_factory, context_.initManager());
+  if (secret_provider_token_secret == nullptr) {
+    throw EnvoyException("invalid token secret configuration");
+  }
+  auto secret_provider_hmac_secret =
+      secretsProvider(hmac_secret, secret_manager, transport_socket_factory, context_.initManager());
+  if (secret_provider_hmac_secret == nullptr) {
+    throw EnvoyException("invalid HMAC secret configuration");
+  }
+
+  secret_reader_ = std::make_shared<SDSSecretReader>(
+      secret_provider_token_secret, secret_provider_hmac_secret, context_.api());
 }
 
 } // namespace Oauth2
