@@ -308,6 +308,7 @@ private:
   std::unique_ptr<OAuth2Client> oauth_client_;
   FilterConfigSharedPtr config_;
   OAuth2ConfigSharedPtr global_config_;
+  const OAuth2Config* current_config_;
   TimeSource& time_source_;
   Server::Configuration::FactoryContext& context_;
   std::shared_ptr<SecretReader> secret_reader_;
@@ -324,7 +325,7 @@ private:
   std::string getEncodedToken() const;
   void addResponseCookies(Http::ResponseHeaderMap& headers, const std::string& encoded_token) const;
   const std::string& bearerPrefix() const;
-  const OAuth2Config& getConfig() const;
+  void getConfig();
   void createSecretReader();
 };
 

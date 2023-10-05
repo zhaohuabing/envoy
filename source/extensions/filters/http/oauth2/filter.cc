@@ -234,7 +234,8 @@ bool OAuth2CookieValidator::timestampIsValid() const {
 bool OAuth2CookieValidator::isValid() const { return hmacIsValid() && timestampIsValid(); }
 
 OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr global_config,
-                           std::unique_ptr<OAuth2Client>&& oauth_client, TimeSource& time_source,Server::Configuration::FactoryContext& context)
+                           std::unique_ptr<OAuth2Client>&& oauth_client,
+                           TimeSource& time_source,Server::Configuration::FactoryContext& context)
     : validator_(std::make_shared<OAuth2CookieValidator>(time_source, config->cookieNames())),
       oauth_client_(std::move(oauth_client)), config_(std::move(config)), global_config_(std::move(global_config)),
       time_source_(time_source), context_(context) {
@@ -252,14 +253,14 @@ OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr g
  */
 Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   // Get the per-route config
-  const auto& config = getConfig();
+  getConfig();
   //todo create oauth_client per route and secret reader per route
 
   // Skip Filter and continue chain if a Passthrough header is matching
   // Must be done before the sanitation of the authorization header,
   // otherwise the authorization header might be altered or removed
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.oauth_header_passthrough_fix")) {
-    for (const auto& matcher : config.passThroughMatchers()) {
+    for (const auto& matcher : current_config_->passThroughMatchers()) {
       if (matcher.matchesHeaders(headers)) {
         config_->stats().oauth_passthrough_.inc();
         return Http::FilterHeadersStatus::Continue;
@@ -283,7 +284,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const absl::string_view path_str = path_header->value().getStringView();
 
   // We should check if this is a sign out request.
-  if (config.signoutPath().match(path_header->value().getStringView())) {
+  if (current_config_->signoutPath().match(path_header->value().getStringView())) {
     return signOutUser(headers);
   }
 
@@ -296,7 +297,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     // correctly but cause a race condition on future requests that have their location set
     // to the callback path.
 
-    if (config.redirectPathMatcher().match(path_str)) {
+    if (current_config_->redirectPathMatcher().match(path_str)) {
       Http::Utility::QueryParams query_parameters = Http::Utility::parseQueryString(path_str);
 
       if (query_parameters.find(queryParamsState()) == query_parameters.end()) {
@@ -317,7 +318,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
         return Http::FilterHeadersStatus::StopIteration;
       }
       // Avoid infinite redirect storm
-      if (config.redirectPathMatcher().match(state_url.pathAndQueryParams())) {
+      if (current_config_->redirectPathMatcher().match(state_url.pathAndQueryParams())) {
         sendUnauthorizedResponse();
         return Http::FilterHeadersStatus::StopIteration;
       }
@@ -339,7 +340,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   //
   // The following conditional could be replaced with a regex pattern-match,
   // if we're concerned about strict matching against the callback path.
-  if (!config.redirectPathMatcher().match(path_str)) {
+  if (!current_config_->redirectPathMatcher().match(path_str)) {
     redirectToOAuthServer(headers);
     return Http::FilterHeadersStatus::StopIteration;
   }
@@ -374,12 +375,12 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     return Http::FilterHeadersStatus::StopIteration;
   }
 
-  Formatter::FormatterImpl formatter(config.redirectUri());
+  Formatter::FormatterImpl formatter(current_config_->redirectUri());
   const auto redirect_uri = formatter.format(
       headers, *Http::ResponseHeaderMapImpl::create(), *Http::ResponseTrailerMapImpl::create(),
       decoder_callbacks_->streamInfo(), "", AccessLog::AccessLogType::NotSet);
-  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), secret_reader_->tokenSecret(),
-                                     redirect_uri, config.authType());
+  oauth_client_->asyncGetAccessToken(auth_code_, current_config_->clientId(), secret_reader_->tokenSecret(),
+                                     redirect_uri, current_config_->authType());
 
   // pause while we await the next step from the OAuth server
   return Http::FilterHeadersStatus::StopAllIterationAndBuffer;
@@ -587,18 +588,15 @@ void OAuth2Filter::sendUnauthorizedResponse() {
                                      absl::nullopt, EMPTY_STRING);
 }
 
-const OAuth2Config& OAuth2Filter::getConfig() const {
+void OAuth2Filter::getConfig() {
   const auto* per_route_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
-  if (per_route_config) {
-    return *per_route_config;
-  }
-  return *global_config_;
+  current_config_ = per_route_config ? per_route_config : global_config_.get();
 }
 
 void OAuth2Filter::createSecretReader() {
-const auto& token_secret = config.tokenSecret();
-  const auto& hmac_secret = config.hmacSecret();
+const auto& token_secret = current_config_->tokenSecret();
+  const auto& hmac_secret = current_config_->hmacSecret();
 
   auto& cluster_manager = context_.clusterManager();
   auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
