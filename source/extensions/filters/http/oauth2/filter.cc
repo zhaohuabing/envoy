@@ -142,10 +142,13 @@ secretsProvider(const envoy::extensions::transport_sockets::tls::v3::SdsSecretCo
                 Secret::SecretManager& secret_manager,
                 Server::Configuration::TransportSocketFactoryContext& transport_socket_factory,
                 Init::Manager& init_manager) {
+  std::cout << "secretsProvider 1 XXXXXXXXXXXXX : " << std::endl;                  
   if (config.has_sds_config()) {
+    std::cout << "secretsProvider 2 XXXXXXXXXXXXX : " << std::endl;  
     return secret_manager.findOrCreateGenericSecretProvider(config.sds_config(), config.name(),
                                                             transport_socket_factory, init_manager);
   } else {
+    std::cout << "secretsProvider 3 XXXXXXXXXXXXX : " << std::endl;  
     return secret_manager.findStaticGenericSecretProvider(config.name());
   }
 }
@@ -230,11 +233,10 @@ bool OAuth2CookieValidator::isValid() const { return hmacIsValid() && timestampI
 
 OAuth2Filter::OAuth2Filter(FilterConfigSharedPtr config, OAuth2ConfigSharedPtr global_config,
                            TimeSource& time_source,Server::Configuration::FactoryContext& context)
-    : validator_(std::make_shared<OAuth2CookieValidator>(time_source, current_config_->cookieNames())),
-      config_(std::move(config)), global_config_(std::move(global_config)),
+    : config_(std::move(config)), global_config_(std::move(global_config)),
       time_source_(time_source), context_(context) {
+  std::cout << " OAuth2Filter XXXXXXXXXXXXX : " << std::endl;
 
-  oauth_client_->setCallbacks(*this);
 }
 
 /**
@@ -374,9 +376,9 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
       headers, *Http::ResponseHeaderMapImpl::create(), *Http::ResponseTrailerMapImpl::create(),
       decoder_callbacks_->streamInfo(), "", AccessLog::AccessLogType::NotSet);
 
-   oauth_client_ =
+  oauth_client_ =
       std::make_unique<OAuth2ClientImpl>(context_.clusterManager(), current_config_->oauthTokenEndpoint());
-
+  oauth_client_->setCallbacks(*this);
   oauth_client_->asyncGetAccessToken(auth_code_, current_config_->clientId(), secret_reader_->tokenSecret(),
                                      redirect_uri, current_config_->authType());
 
@@ -389,6 +391,8 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
 bool OAuth2Filter::canSkipOAuth(Http::RequestHeaderMap& headers) const {
   // We can skip OAuth if the supplied HMAC cookie is valid. Apply the OAuth details as headers
   // if we successfully validate the cookie.
+  validator_ = std::make_shared<OAuth2CookieValidator>(time_source_, current_config_->cookieNames());
+
   validator_->setParams(headers, secret_reader_->tokenSecret());
   if (validator_->isValid()) {
     config_->stats().oauth_success_.inc();
@@ -599,16 +603,19 @@ const auto& token_secret = current_config_->tokenSecret();
   auto& cluster_manager = context_.clusterManager();
   auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
   auto& transport_socket_factory = context_.getTransportSocketFactoryContext();
+  std::cout << " 1 XXXXXXXXXXXXX : " << std::endl;  
   auto secret_provider_token_secret = secretsProvider(
       token_secret, secret_manager, transport_socket_factory, context_.initManager());
   if (secret_provider_token_secret == nullptr) {
     throw EnvoyException("invalid token secret configuration");
   }
+  std::cout << " 2 XXXXXXXXXXXXX : " << std::endl;  
   auto secret_provider_hmac_secret =
       secretsProvider(hmac_secret, secret_manager, transport_socket_factory, context_.initManager());
   if (secret_provider_hmac_secret == nullptr) {
     throw EnvoyException("invalid HMAC secret configuration");
   }
+  std::cout << " 3 XXXXXXXXXXXXX : " << std::endl;  
 
   secret_reader_ = std::make_shared<SDSSecretReader>(
       secret_provider_token_secret, secret_provider_hmac_secret, context_.api());
