@@ -57,7 +57,7 @@ Router::RouteSpecificFilterConfigConstSharedPtr FilterFactory::createRouteSpecif
 /*
  * Static registration for the OAuth2 filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(FilterFactory, Server::Configuration::NamedHttpFilterConfigFactory);
+LEGACY_REGISTER_FACTORY(FilterFactory, Server::Configuration::NamedHttpFilterConfigFactory, "envoy.filters.http.oauth2");
 
 } // namespace Oauth2
 } // namespace HttpFilters
