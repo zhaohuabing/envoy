@@ -181,13 +181,8 @@ OAuth2Config::OAuth2Config(
   }
 }
 
-FilterConfig::FilterConfig(
-    OAuth2ConfigSharedPtr oauth2_config,
-    std::shared_ptr<SecretReader> secret_reader,
-    Stats::Scope& scope, const std::string& stats_prefix)
-    : oauth2_config_(oauth2_config),
-      secret_reader_(secret_reader),
-      stats_(FilterConfig::generateStats(stats_prefix, scope)) {}
+FilterConfig::FilterConfig(Stats::Scope& scope, const std::string& stats_prefix)
+    : stats_(FilterConfig::generateStats(stats_prefix, scope)) {}
 
 FilterStats FilterConfig::generateStats(const std::string& prefix, Stats::Scope& scope) {
   return {ALL_OAUTH_FILTER_STATS(POOL_COUNTER_PREFIX(scope, prefix))};

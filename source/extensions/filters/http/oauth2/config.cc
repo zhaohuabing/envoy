@@ -45,31 +45,7 @@ Http::FilterFactoryCb FilterFactory::createFilterFactoryFromProtoTyped(
   }
 
   const auto& proto_config = proto.config();
-  const auto& credentials = proto_config.credentials();
-
-  const auto& token_secret = credentials.token_secret();
-  const auto& hmac_secret = credentials.hmac_secret();
-
-  auto& cluster_manager = context.clusterManager();
-  auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
-  auto& transport_socket_factory = context.getTransportSocketFactoryContext();
-  auto secret_provider_token_secret = secretsProvider(
-      token_secret, secret_manager, transport_socket_factory, context.initManager());
-  if (secret_provider_token_secret == nullptr) {
-    throw EnvoyException("invalid token secret configuration");
-  }
-  auto secret_provider_hmac_secret =
-      secretsProvider(hmac_secret, secret_manager, transport_socket_factory, context.initManager());
-  if (secret_provider_hmac_secret == nullptr) {
-    throw EnvoyException("invalid HMAC secret configuration");
-  }
-
-  auto secret_reader = std::make_shared<SDSSecretReader>(
-      secret_provider_token_secret, secret_provider_hmac_secret, context.api());
-
-  auto oauth2_config = std::make_shared<OAuth2Config>(proto_config, cluster_manager);
-  auto filter_config = std::make_shared<FilterConfig>(oauth2_config, secret_reader,
-                                               context.scope(), stats_prefix);
+  auto filter_config = std::make_shared<FilterConfig>(context.scope(), stats_prefix);
 
   return
       [&context, filter_config, oauth2_config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {

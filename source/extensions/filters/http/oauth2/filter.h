@@ -185,36 +185,12 @@ using OAuth2ConfigSharedPtr = std::shared_ptr<OAuth2Config>;
  */
 class FilterConfig {
 public:
-  FilterConfig(OAuth2ConfigSharedPtr oauth2_config,
-               std::shared_ptr<SecretReader> secret_reader, Stats::Scope& scope,
-               const std::string& stats_prefix);
-  const std::string& clusterName() const { return oauth2_config_->oauth_token_endpoint_.cluster(); }
-  const std::string& clientId() const { return oauth2_config_->client_id_; }
-  bool forwardBearerToken() const { return oauth2_config_->forward_bearer_token_; }
-  const std::vector<Http::HeaderUtility::HeaderData>& passThroughMatchers() const {
-    return oauth2_config_->pass_through_header_matchers_;
-  }
-
-  const envoy::config::core::v3::HttpUri& oauthTokenEndpoint() const {
-    return oauth2_config_->oauth_token_endpoint_;
-  }
-  const Http::Utility::Url& authorizationEndpointUrl() const { return oauth2_config_->authorization_endpoint_url_; }
-  const Http::Utility::QueryParams& authorizationQueryParams() const {
-    return oauth2_config_->authorization_query_params_;
-  }
-  const std::string& redirectUri() const { return oauth2_config_->redirect_uri_; }
-  const Matchers::PathMatcher& redirectPathMatcher() const { return oauth2_config_->redirect_matcher_; }
-  const Matchers::PathMatcher& signoutPath() const { return oauth2_config_->signout_path_; }
+  FilterConfig(Stats::Scope& scope, const std::string& stats_prefix);
   FilterStats& stats() { return stats_; }
-  const std::string& encodedResourceQueryParams() const { return oauth2_config_->encoded_resource_query_params_; }
-  const CookieNames& cookieNames() const { return oauth2_config_->cookie_names_; }
-  const AuthType& authType() const { return oauth2_config_->auth_type_; }
 
 private:
   static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
 
-  OAuth2ConfigSharedPtr oauth2_config_;
-  std::shared_ptr<SecretReader> secret_reader_;
   FilterStats stats_;
 };
 
