@@ -378,7 +378,7 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
   const auto redirect_uri = formatter.format(
       headers, *Http::ResponseHeaderMapImpl::create(), *Http::ResponseTrailerMapImpl::create(),
       decoder_callbacks_->streamInfo(), "", AccessLog::AccessLogType::NotSet);
-  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), secret_reader_->tokenSecret()),
+  oauth_client_->asyncGetAccessToken(auth_code_, config.clientId(), secret_reader_->tokenSecret(),
                                      redirect_uri, config.authType());
 
   // pause while we await the next step from the OAuth server
