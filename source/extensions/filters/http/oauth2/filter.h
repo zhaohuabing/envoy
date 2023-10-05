@@ -326,6 +326,7 @@ private:
   void addResponseCookies(Http::ResponseHeaderMap& headers, const std::string& encoded_token) const;
   const std::string& bearerPrefix() const;
   const OAuth2Config& getConfig() const;
+  std::shared_ptr<SecretReader> secret_reader_;
 };
 
 } // namespace Oauth2

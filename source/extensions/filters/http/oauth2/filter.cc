@@ -274,6 +274,26 @@ Http::FilterHeadersStatus OAuth2Filter::decodeHeaders(Http::RequestHeaderMap& he
     return signOutUser(headers);
   }
 
+  const auto& token_secret = config.tokenSecret();
+  const auto& hmac_secret = config.hmacSecret();
+
+  auto& cluster_manager = context_.clusterManager();
+  auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
+  auto& transport_socket_factory = context_.getTransportSocketFactoryContext();
+  auto secret_provider_token_secret = secretsProvider(
+      token_secret, secret_manager, transport_socket_factory, context_.initManager());
+  if (secret_provider_token_secret == nullptr) {
+    throw EnvoyException("invalid token secret configuration");
+  }
+  auto secret_provider_hmac_secret =
+      secretsProvider(hmac_secret, secret_manager, transport_socket_factory, context_.initManager());
+  if (secret_provider_hmac_secret == nullptr) {
+    throw EnvoyException("invalid HMAC secret configuration");
+  }
+
+  secret_reader_ = std::make_shared<SDSSecretReader>(
+      secret_provider_token_secret, secret_provider_hmac_secret, context.api());
+
   if (canSkipOAuth(headers)) {
     // Update the path header with the query string parameters after a successful OAuth login.
     // This is necessary if a website requests multiple resources which get redirected to the
