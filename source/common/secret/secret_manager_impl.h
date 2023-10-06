@@ -83,18 +83,22 @@ private:
                  const std::string& config_name,
                  Server::Configuration::TransportSocketFactoryContext& secret_provider_context,
                  Init::Manager& init_manager) {
+      std::cout << "findOrCreate 1 XXXXXXXXXXXXX : " << std::endl;
       const std::string map_key =
           absl::StrCat(MessageUtil::hash(sds_config_source), ".", config_name);
-
+      std::cout << "findOrCreate 2 XXXXXXXXXXXXX : " << std::endl;
       std::shared_ptr<SecretType> secret_provider = dynamic_secret_providers_[map_key].lock();
+      std::cout << "findOrCreate 3 XXXXXXXXXXXXX : " << std::endl;
       if (!secret_provider) {
         // SdsApi is owned by ListenerImpl and ClusterInfo which are destroyed before
         // SecretManagerImpl. It is safe to invoke this callback at the destructor of SdsApi.
         std::function<void()> unregister_secret_provider = [map_key, this]() {
           removeDynamicSecretProvider(map_key);
         };
+        std::cout << "findOrCreate 4 XXXXXXXXXXXXX : " << std::endl;
         secret_provider = SecretType::create(secret_provider_context, sds_config_source,
                                              config_name, unregister_secret_provider);
+        std::cout << "findOrCreate 5 XXXXXXXXXXXXX : " << std::endl;                                     
         dynamic_secret_providers_[map_key] = secret_provider;
       }
       // It is important to add the init target to the manager regardless the secret provider is new
@@ -110,6 +114,7 @@ private:
       // It is expected that correct init manager will be passed to this method by the caller
       // separately.
       init_manager.add(*secret_provider->initTarget());
+      std::cout << "findOrCreate 6 XXXXXXXXXXXXX : " << std::endl;
       return secret_provider;
     }
 
