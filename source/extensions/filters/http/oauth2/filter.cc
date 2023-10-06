@@ -591,7 +591,13 @@ void OAuth2Filter::sendUnauthorizedResponse() {
 void OAuth2Filter::getConfig() {
   const auto* per_route_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<OAuth2Config>(decoder_callbacks_);
-  current_config_ = per_route_config ? per_route_config : global_config_.get();
+  if (per_route_config){
+    std::cout << "getConfig per_route_config XXXXXXXXXXXXX : " << std::endl;
+    current_config_ = per_route_config;
+  }else{
+    std::cout << "getConfig global_route_config XXXXXXXXXXXXX  : " << std::endl;
+    current_config_ = global_config_.get();
+  }
 }
 
 void OAuth2Filter::createSecretReader() {
