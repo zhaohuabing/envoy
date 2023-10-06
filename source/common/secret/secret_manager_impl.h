@@ -84,6 +84,8 @@ private:
                  Server::Configuration::TransportSocketFactoryContext& secret_provider_context,
                  Init::Manager& init_manager) {
       std::cout << "findOrCreate 1 XXXXXXXXXXXXX : " << std::endl;
+      std::cout << "findOrCreate 1 XXXXXXXXXXXXX : " << config_name << std::endl;
+      std::cout << "findOrCreate 1 XXXXXXXXXXXXX : " << sds_config_source << std::endl;
       const std::string map_key =
           absl::StrCat(MessageUtil::hash(sds_config_source), ".", config_name);
       std::cout << "findOrCreate 2 XXXXXXXXXXXXX : " << std::endl;
