@@ -278,17 +278,21 @@ void ActiveStreamFilterBase::resetIdleTimer() {
 const Router::RouteSpecificFilterConfig*
 ActiveStreamFilterBase::mostSpecificPerFilterConfig() const {
   auto current_route = getRoute();
-   std::cout << "ActiveStreamFilterBase::mostSpecificPerFilterConfig() XXXXXXXXXXX" << std::endl;
+   std::cout << "ActiveStreamFilterBase::mostSpecificPerFilterConfig() 1 XXXXXXXXXXX" << std::endl;
   if (current_route == nullptr) {
      std::cout << "ActiveStreamFilterBase::mostSpecificPerFilterConfig() current_route is null XXXXXXXXXXX" << std::endl;
     return nullptr;
   }
 
   auto* result = current_route->mostSpecificPerFilterConfig(filter_context_.config_name);
-
+   std::cout << "ActiveStreamFilterBase::mostSpecificPerFilterConfig() 2 XXXXXXXXXXX" << std::endl;
   if (result == nullptr && filter_context_.filter_name != filter_context_.config_name) {
     // Fallback to use filter name.
     result = current_route->mostSpecificPerFilterConfig(filter_context_.filter_name);
+    std::cout << "ActiveStreamFilterBase::mostSpecificPerFilterConfig() 3 XXXXXXXXXXX" << std::endl;
+  }
+  if (result == nullptr) {
+    std::cout << "ActiveStreamFilterBase::mostSpecificPerFilterConfig() 4 result is null XXXXXXXXXXX" << std::endl;
   }
   return result;
 }
