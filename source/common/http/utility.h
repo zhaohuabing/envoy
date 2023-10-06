@@ -636,6 +636,7 @@ const ConfigType* resolveMostSpecificPerFilterConfig(const Http::StreamFilterCal
   static_assert(std::is_base_of<Router::RouteSpecificFilterConfig, ConfigType>::value,
                 "ConfigType must be a subclass of Router::RouteSpecificFilterConfig");
   ASSERT(callbacks != nullptr);
+  std::out << "resolveMostSpecificPerFilterConfig XXXXXXXXXXX" << std::endl;
   return dynamic_cast<const ConfigType*>(callbacks->mostSpecificPerFilterConfig());
 }
 

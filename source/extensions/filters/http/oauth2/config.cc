@@ -48,7 +48,7 @@ Router::RouteSpecificFilterConfigConstSharedPtr FilterFactory::createRouteSpecif
   if (!proto.has_config()) {
     throw EnvoyException("config must be present for per route config");
   }
-
+  std::cout << "createRouteSpecificFilterConfigTyped XXXXXXXXX" << std::endl;
   const auto& proto_config = proto.config();
   auto& cluster_manager = context.clusterManager();
   return std::make_shared<OAuth2Config>(proto_config, cluster_manager);
