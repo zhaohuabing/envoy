@@ -138,16 +138,17 @@ void ProtoExceptionUtil::throwProtoValidationException(const std::string& valida
 
 size_t MessageUtil::hash(const Protobuf::Message& message) {
   std::string text_format;
-
+  std::cout << "MessageUtil 1 XXXXXXXXXXXXX : " << std::endl;
   {
     Protobuf::TextFormat::Printer printer;
     printer.SetExpandAny(true);
     printer.SetUseFieldNumber(true);
     printer.SetSingleLineMode(true);
     printer.SetHideUnknownFields(true);
+      std::cout << "MessageUtil 2 XXXXXXXXXXXXX : " << std::endl;
     printer.PrintToString(message, &text_format);
   }
-
+  std::cout << "MessageUtil 3 XXXXXXXXXXXXX : " << std::endl;
   return HashUtil::xxHash64(text_format);
 }
 
