@@ -173,8 +173,8 @@ private:
   const std::vector<Http::HeaderUtility::HeaderData> pass_through_header_matchers_;
   const CookieNames cookie_names_;
   const AuthType auth_type_;
-  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& token_secret_;
-  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& hmac_secret_;
+  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig token_secret_;
+  const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig hmac_secret_;
 };
 
 using OAuth2ConfigSharedPtr = std::shared_ptr<OAuth2Config>;
