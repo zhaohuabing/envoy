@@ -97,9 +97,11 @@ private:
           removeDynamicSecretProvider(map_key);
         };
         std::cout << "findOrCreate 4 XXXXXXXXXXXXX : " << std::endl;
+        secret_provider_context.initManager();
+        std::cout << "findOrCreate 5 XXXXXXXXXXXXX : " << std::endl;
         secret_provider = SecretType::create(secret_provider_context, sds_config_source,
                                              config_name, unregister_secret_provider);
-        std::cout << "findOrCreate 5 XXXXXXXXXXXXX : " << std::endl;                                     
+        std::cout << "findOrCreate 6 XXXXXXXXXXXXX : " << std::endl;                                     
         dynamic_secret_providers_[map_key] = secret_provider;
       }
       // It is important to add the init target to the manager regardless the secret provider is new
