@@ -47,7 +47,7 @@ SubscriptionPtr SubscriptionFactoryImpl::subscriptionFromConfigSource(
                                                    options,
                                                    absl::nullopt,
                                                    stats};
-
+std::cout << "subscriptionFromConfigSource 1 XXXXXXXXXXX" << std::endl;
   switch (config.config_source_specifier_case()) {
   case envoy::config::core::v3::ConfigSource::ConfigSourceSpecifierCase::kPath: {
     Utility::checkFilesystemSubscriptionBackingPath(config.path(), api_);
@@ -105,6 +105,7 @@ SubscriptionPtr SubscriptionFactoryImpl::subscriptionFromConfigSource(
         "Didn't find a registered config subscription factory implementation for name: '{}'",
         subscription_type));
   }
+  std::cout << "subscriptionFromConfigSource 2 XXXXXXXXXXX" << std::endl;
   return factory->create(data);
 }
 
