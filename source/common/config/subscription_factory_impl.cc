@@ -55,8 +55,10 @@ std::cout << "subscriptionFromConfigSource 1 XXXXXXXXXXX" << std::endl;
     break;
   }
   case envoy::config::core::v3::ConfigSource::ConfigSourceSpecifierCase::kPathConfigSource: {
+    std::cout << "subscriptionFromConfigSource 2 XXXXXXXXXXX" << std::endl;
     Utility::checkFilesystemSubscriptionBackingPath(config.path_config_source().path(), api_);
     subscription_type = "envoy.config_subscription.filesystem";
+    std::cout << "subscriptionFromConfigSource 3 XXXXXXXXXXX" << std::endl;
     break;
   }
   case envoy::config::core::v3::ConfigSource::ConfigSourceSpecifierCase::kApiConfigSource: {
@@ -100,12 +102,13 @@ std::cout << "subscriptionFromConfigSource 1 XXXXXXXXXXX" << std::endl;
   }
   ConfigSubscriptionFactory* factory =
       Registry::FactoryRegistry<ConfigSubscriptionFactory>::getFactory(subscription_type);
+   std::cout << "subscriptionFromConfigSource 4 XXXXXXXXXXX" << std::endl;
   if (factory == nullptr) {
     throw EnvoyException(fmt::format(
         "Didn't find a registered config subscription factory implementation for name: '{}'",
         subscription_type));
   }
-  std::cout << "subscriptionFromConfigSource 2 XXXXXXXXXXX" << std::endl;
+  std::cout << "subscriptionFromConfigSource 5 XXXXXXXXXXX" << std::endl;
   return factory->create(data);
 }
 
