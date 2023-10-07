@@ -398,7 +398,20 @@ public:
     auto& server_context = secret_provider_context.serverFactoryContext();
     std::cout << "GenericSecretSdsApi 2 XXXXXXXXXXX" << std::endl;
     Config::Utility::checkLocalInfo("GenericSecretSdsApi", server_context.localInfo());
-    std::cout << "GenericSecretSdsApi 3 XXXXXXXXXXX" << std::endl;
+    std::cout << "GenericSecretSdsApi 3 XXXXXXXXXXX" << sds_config.path_config_source().path() << std::endl;
+    std::cout << "GenericSecretSdsApi 4 XXXXXXXXXXX" << sds_config_name << std::endl;
+    secret_provider_context.clusterManager().subscriptionFactory();
+    std::cout << "GenericSecretSdsApi 5 XXXXXXXXXXX" << std::endl;
+    server_context.mainThreadDispatcher().timeSource();
+    std::cout << "GenericSecretSdsApi 6 XXXXXXXXXXX" << std::endl;
+        secret_provider_context.messageValidationVisitor();
+    std::cout << "GenericSecretSdsApi 6 XXXXXXXXXXX" << std::endl;
+        server_context.serverScope().store();
+    std::cout << "GenericSecretSdsApi 7 XXXXXXXXXXX" << std::endl;
+        server_context.mainThreadDispatcher();
+    std::cout << "GenericSecretSdsApi 8 XXXXXXXXXXX" << std::endl;
+    server_context.api();
+    std::cout << "GenericSecretSdsApi 9 XXXXXXXXXXX" << std::endl;
     return std::make_shared<GenericSecretSdsApi>(
         sds_config, sds_config_name, secret_provider_context.clusterManager().subscriptionFactory(),
         server_context.mainThreadDispatcher().timeSource(),
