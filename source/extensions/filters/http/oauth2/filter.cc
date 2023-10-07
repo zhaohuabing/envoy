@@ -603,7 +603,7 @@ void OAuth2Filter::getConfig() {
 void OAuth2Filter::createSecretReader() {
 const auto& token_secret = current_config_->tokenSecret();
   const auto& hmac_secret = current_config_->hmacSecret();
- std::cout << "createSecretReader 1 XXXXXXXXXXXXX : " << "token_secret:" << token_secret.sds_config().name() << token_secret.sds_config().path_config_source().path() <<  std::endl;
+ std::cout << "createSecretReader 1 XXXXXXXXXXXXX : " << "token_secret:" << token_secret.name() << token_secret.sds_config().path_config_source().path() <<  std::endl;
   auto& cluster_manager = context_.clusterManager();
   auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
   auto& transport_socket_factory = context_.getTransportSocketFactoryContext();
