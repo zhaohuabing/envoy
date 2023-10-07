@@ -394,8 +394,11 @@ public:
          const std::string& sds_config_name, std::function<void()> destructor_cb) {
     // We need to do this early as we invoke the subscription factory during initialization, which
     // is too late to throw.
+    std::cout << "GenericSecretSdsApi 1 XXXXXXXXXXX" << std::endl;
     auto& server_context = secret_provider_context.serverFactoryContext();
+    std::cout << "GenericSecretSdsApi 2 XXXXXXXXXXX" << std::endl;
     Config::Utility::checkLocalInfo("GenericSecretSdsApi", server_context.localInfo());
+    std::cout << "GenericSecretSdsApi 3 XXXXXXXXXXX" << std::endl;
     return std::make_shared<GenericSecretSdsApi>(
         sds_config, sds_config_name, secret_provider_context.clusterManager().subscriptionFactory(),
         server_context.mainThreadDispatcher().timeSource(),
