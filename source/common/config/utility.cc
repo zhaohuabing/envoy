@@ -84,7 +84,7 @@ void Utility::checkLocalInfo(absl::string_view error_prefix,
 void Utility::checkFilesystemSubscriptionBackingPath(const std::string& path, Api::Api& api) {
   // TODO(junr03): the file might be deleted between this check and the
   // watch addition.
-  std::cout << "checkFilesystemSubscriptionBackingPath 1 XXXXXXXXXXX" << std::endl;
+  std::cout << "checkFilesystemSubscriptionBackingPath 1 XXXXXXXXXXX" << path << std::endl;
   if (!api.fileSystem().fileExists(path)) {
     throw EnvoyException(fmt::format(
         "paths must refer to an existing path in the system: '{}' does not exist", path));
