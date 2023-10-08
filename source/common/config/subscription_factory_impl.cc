@@ -56,6 +56,7 @@ std::cout << "subscriptionFromConfigSource 1 XXXXXXXXXXX" << std::endl;
   }
   case envoy::config::core::v3::ConfigSource::ConfigSourceSpecifierCase::kPathConfigSource: {
     std::cout << "subscriptionFromConfigSource 2 XXXXXXXXXXX" << std::endl;
+    std::cout << "subscriptionFromConfigSource 3 XXXXXXXXXXX" << config.path_config_source().path() << std::endl;
     Utility::checkFilesystemSubscriptionBackingPath(config.path_config_source().path(), api_);
     subscription_type = "envoy.config_subscription.filesystem";
     std::cout << "subscriptionFromConfigSource 3 XXXXXXXXXXX" << std::endl;
