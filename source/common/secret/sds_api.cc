@@ -29,9 +29,9 @@ SdsApi::SdsApi(envoy::config::core::v3::ConfigSource sds_config, absl::string_vi
       subscription_factory_(subscription_factory),
       time_source_(time_source), secret_data_{sds_config_name_, "uninitialized",
                                               time_source_.systemTime()} {
-  std::cout << "SdsApi 1 XXXXXXXXXXX" << std::endl;                              
+  std::cout << "SdsApi 1 XXXXXXXXXXX" << std::endl;
   const auto resource_name = getResourceName();
-    std::cout << "SdsApi 2 XXXXXXXXXXX" << std::endl;
+    std::cout << "SdsApi 2 XXXXXXXXXXX" << sds_config_.path_config_source().path() << std::endl;
   // This has to happen here (rather than in initialize()) as it can throw exceptions.
   subscription_ = subscription_factory_.subscriptionFromConfigSource(
       sds_config_, Grpc::Common::typeUrl(resource_name), *scope_, *this, resource_decoder_, {});
