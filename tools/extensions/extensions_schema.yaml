@@ -68,6 +68,7 @@ categories:
 - envoy.config.validators
 - envoy.config_subscription
 - envoy.config_mux
+- envoy.credentials
 - envoy.filters.http
 - envoy.filters.listener
 - envoy.filters.network
@@ -132,7 +133,6 @@ categories:
 - envoy.http.early_header_mutation
 - envoy.http.custom_response
 - envoy.router.cluster_specifier_plugin
-- envoy.credential_injector.credential
 
 status_values:
 - name: stable
