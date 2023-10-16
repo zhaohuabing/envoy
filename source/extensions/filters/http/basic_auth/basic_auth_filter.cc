@@ -45,7 +45,7 @@ bool FilterConfig::validateUser(const std::string& username, const std::string& 
   return false;
 }
 
-BasicAuthFilter::BasicAuthFilter(FilterConfigPtr config) : config_(std::move(config)) {}
+BasicAuthFilter::BasicAuthFilter(FilterConfigSharedPtr config) : config_(std::move(config)) {}
 
 Http::FilterHeadersStatus BasicAuthFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   ENVOY_LOG(debug, "Called Filter : {}", __func__);
