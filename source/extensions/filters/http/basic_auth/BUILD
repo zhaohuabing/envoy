@@ -32,7 +32,7 @@ envoy_cc_extension(
     deps = [
         ":basic_auth_lib",
         "//envoy/registry",
-	"//source/common/config:datasource_lib",
+	    "//source/common/config:datasource_lib",
         "//source/common/protobuf:utility_lib",
         "//source/extensions/filters/http/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/http/basic_auth/v3:pkg_cc_proto",

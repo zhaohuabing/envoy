@@ -15,7 +15,8 @@ std::vector<User> readHtpasswd(std::string htpasswd) {
   std::istringstream htpsswd_ss(htpasswd);
   std::string line;
 
-  // Define a regular expression pattern to match the username, salt, and password
+  // Define a regular expression pattern to match the username, and password hash
+  // Only support SHA1 for now
   std::regex htpasswdRegex(R"((\w+):\{SHA\}(.+))");
 
   while (std::getline(htpsswd_ss, line)) {
@@ -24,7 +25,6 @@ std::vector<User> readHtpasswd(std::string htpasswd) {
     if (std::regex_search(line, match, htpasswdRegex)) {
       name = match[1];
       hash = match[2];
-      std::cout << "Name: " << name <<" Password hash: "<< hash << std::endl;
       users.push_back({name, hash});
     } else {
       throw EnvoyException("unsupported htpasswd format: please use {SHA}");

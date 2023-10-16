@@ -36,10 +36,6 @@ bool FilterConfig::validateUser(const std::string& username, const std::string& 
   for (auto user : users_) {
     if (user.name == username) {
       std::string hashedPassword = computeSHA1(password);
-      std::cout << "Username: " << username << std::endl;
-      std::cout << "password: " << password << std::endl;
-      std::cout << "Hashed Password: " << hashedPassword << std::endl;
-      std::cout << "stored Password: " << user.hash << std::endl;
       if (hashedPassword == user.hash) {
         return true;
       }
@@ -49,7 +45,7 @@ bool FilterConfig::validateUser(const std::string& username, const std::string& 
   return false;
 }
 
-BasicAuthFilter::BasicAuthFilter(FilterConfigSharedPtr config) : config_(std::move(config)) {}
+BasicAuthFilter::BasicAuthFilter(FilterConfigPtr config) : config_(std::move(config)) {}
 
 Http::FilterHeadersStatus BasicAuthFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   ENVOY_LOG(debug, "Called Filter : {}", __func__);
@@ -57,6 +53,7 @@ Http::FilterHeadersStatus BasicAuthFilter::decodeHeaders(Http::RequestHeaderMap&
   auto auth_header = headers.get(Http::CustomHeaders::get().Authorization);
   if (!auth_header.empty()) {
     auto auth_value = auth_header[0]->value().getStringView();
+
     if (auth_value.substr(0, 6) == "Basic ") {
       // Extract and decode the Base64 part of the header.
       auto base64Token = auth_value.substr(6);
@@ -64,12 +61,11 @@ Http::FilterHeadersStatus BasicAuthFilter::decodeHeaders(Http::RequestHeaderMap&
 
       // The decoded string is in the format "username:password".
       size_t colonPos = decoded.find(':');
+
       if (colonPos != std::string::npos) {
         std::string username = decoded.substr(0, colonPos);
         std::string password = decoded.substr(colonPos + 1);
 
-        std::cout << "Username: " << username << std::endl;
-        std::cout << "Password: " << password << std::endl;
         if (config_->validateUser(username, password)) {
           config_->stats().allowed_.inc();
           return Http::FilterHeadersStatus::Continue;
@@ -81,13 +77,12 @@ Http::FilterHeadersStatus BasicAuthFilter::decodeHeaders(Http::RequestHeaderMap&
         }
       }
     }
-    decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, "Missing username and password", nullptr,
-                                             absl::nullopt, "");
-    return Http::FilterHeadersStatus::StopIteration;
   }
-  decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, "Missing username and password", nullptr,
-                                             absl::nullopt, "");
-  return Http::FilterHeadersStatus::Continue;
+
+  config_->stats().denied_.inc();
+  decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, "Missing username or password",
+                                     nullptr, absl::nullopt, "");
+  return Http::FilterHeadersStatus::StopIteration;
 }
 
 void BasicAuthFilter::setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) {

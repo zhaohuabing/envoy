@@ -51,13 +51,13 @@ private:
   std::vector<User> users_;
   BasicAuthStats stats_;
 };
-using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
+using FilterConfigPtr = std::unique_ptr<FilterConfig>;
 
 // The Envoy filter to process HTTP basic auth.
 class BasicAuthFilter : public Http::PassThroughFilter,
                         public Logger::Loggable<Logger::Id::basic_auth> {
 public:
-  BasicAuthFilter(FilterConfigSharedPtr config);
+  BasicAuthFilter(FilterConfigPtr config);
 
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers, bool) override;
@@ -66,7 +66,7 @@ public:
 private:
   // The callback function.
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_;
-  FilterConfigSharedPtr config_;
+  FilterConfigPtr config_;
 };
 
 } // namespace BasicAuth
