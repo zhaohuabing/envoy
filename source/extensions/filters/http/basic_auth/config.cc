@@ -24,8 +24,16 @@ std::vector<User> readHtpasswd(std::string htpasswd) {
       name = line.substr(0, colonPos);
       hash = line.substr(colonPos + 1);
 
+      if (name.length() == 0) {
+        throw EnvoyException("invalid user name");
+      }
+
       if (hash.find("{SHA}") == 0) {
         hash = hash.substr(5);
+        if (hash.length() != 28) {
+          throw EnvoyException("invalid SHA hash length");
+        }
+
         users.push_back({name, hash});
         continue;
       }
@@ -44,7 +52,7 @@ Http::FilterFactoryCb BasicAuthFilterFactory::createFilterFactoryFromProtoTyped(
   auto users = readHtpasswd(htpasswd);
   FilterConfigSharedPtr config =
       std::make_shared<FilterConfig>(users, stats_prefix, context.scope());
-  return [users, config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+  return [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamDecoderFilter(std::make_shared<BasicAuthFilter>(config));
   };
 }
