@@ -14,7 +14,7 @@ class NamedCredentialInjectorConfigFactory : public Config::TypedFactory {
 public:
   ~NamedCredentialInjectorConfigFactory() override = default;
 
-  virtual CredentialInjectorPtr
+  virtual CredentialInjectorSharedPtr
   createCredentialInjectorFromProto(const Protobuf::Message& config,
                                    Server::Configuration::FactoryContext& context) PURE;
 

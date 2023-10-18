@@ -260,6 +260,13 @@ envoy.filters.http.cdn_loop:
   status: alpha
   type_urls:
   - envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig
+envoy.filters.http.credential_injector:
+  categories:
+  - envoy.filters.http
+  security_posture: unknown
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.http.credential_injector.v3.CredentialInjector
 envoy.filters.http.geoip:
   categories:
   - envoy.filters.http

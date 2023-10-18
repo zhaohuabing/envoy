@@ -10,12 +10,12 @@ namespace BasicAuth {
 /**
  * Implementation of credential injector's interface.
  */
-class BasicAuthImpl : public Common::CredentialInjector {
+class BasicAuthCredentialInjector : public Common::CredentialInjector {
 public:
-  BasicAuthImpl(std::string username, std::string password);
+  BasicAuthCredentialInjector(std::string username, std::string password);
 
   // Common::CredentialInjector
-  virtual void inject(RequestHeaderMap& headers) override;
+  bool inject(RequestHeaderMap& headers, bool overrite) override;
 
 private:
   std::string username_;

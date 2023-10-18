@@ -1,9 +1,5 @@
 #include "source/extensions/filters/http/credential_injector/credential_injector_filter.h"
 
-#include <openssl/sha.h>
-
-#include "source/common/common/base64.h"
-#include "source/common/http/header_utility.h"
 #include "source/common/http/headers.h"
 
 namespace Envoy {
@@ -11,83 +7,25 @@ namespace Extensions {
 namespace HttpFilters {
 namespace CredentialInjector {
 
-namespace {
+FilterConfig::FilterConfig(CredentialInjectorSharedPtr credential_injector,
+                           const std::string& stats_prefix, Stats::Scope& scope)
+    : injector_(credential_injector),
+      stats_(generateStats(stats_prefix + "credential_injector.", scope)) {}
 
-// Function to compute SHA1 hash
-std::string computeSHA1(const std::string& password) {
-  unsigned char hash[SHA_DIGEST_LENGTH];
+CredentialInjectorFilter::CredentialInjectorFilter(FilterConfigSharedPtr config)
+    : config_(std::move(config)) {}
 
-  // Calculate the SHA-1 hash
-  SHA1(reinterpret_cast<const unsigned char*>(password.c_str()), password.length(), hash);
-
-  // Encode the binary hash in Base64
-  std::string encodedHash = Base64::encode(reinterpret_cast<const char*>(hash), SHA_DIGEST_LENGTH);
-
-  return encodedHash;
-}
-
-} // namespace
-
-FilterConfig::FilterConfig(UserMap users, const std::string& stats_prefix, Stats::Scope& scope)
-    : users_(users), stats_(generateStats(stats_prefix + "credential_injector.", scope)) {}
-
-bool FilterConfig::validateUser(const std::string& username, const std::string& password) {
-  const auto user = users_.find(username);
-  if (user == users_.end()) {
-    return false;
-  }
-
-  std::string hashedPassword = computeSHA1(password);
-  if (hashedPassword == user->second.hash) {
-    return true;
-  }
-
-  return false;
-}
-
-CredentialInjectorFilter::CredentialInjectorFilter(FilterConfigSharedPtr config) : config_(std::move(config)) {}
-
-Http::FilterHeadersStatus CredentialInjectorFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
+Http::FilterHeadersStatus CredentialInjectorFilter::decodeHeaders(Http::RequestHeaderMap& headers,
+                                                                  bool) {
   ENVOY_LOG(debug, "Called Filter : {}", __func__);
 
-  auto auth_header = headers.get(Http::CustomHeaders::get().Authorization);
-  if (!auth_header.empty()) {
-    auto auth_value = auth_header[0]->value().getStringView();
-
-    if (auth_value.substr(0, 6) == "Basic ") {
-      // Extract and decode the Base64 part of the header.
-      auto base64Token = auth_value.substr(6);
-      std::string decoded = Base64::decodeWithoutPadding(base64Token);
-
-      // The decoded string is in the format "username:password".
-      size_t colonPos = decoded.find(':');
-
-      if (colonPos != std::string::npos) {
-        std::string username = decoded.substr(0, colonPos);
-        std::string password = decoded.substr(colonPos + 1);
-
-        if (config_->validateUser(username, password)) {
-          config_->stats().allowed_.inc();
-          return Http::FilterHeadersStatus::Continue;
-        } else {
-          config_->stats().denied_.inc();
-          decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, "Basic Auth failed", nullptr,
-                                             absl::nullopt, "");
-          return Http::FilterHeadersStatus::StopIteration;
-        }
-      }
-    }
+  if (config_->injector()->inject(headers, true)) {
+    config_->stats().injected_.inc();
+  } else {
+    config_->stats().failed_.inc();
   }
 
-  config_->stats().denied_.inc();
-  decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, "Missing username or password",
-                                     nullptr, absl::nullopt, "");
-  return Http::FilterHeadersStatus::StopIteration;
-}
-
-void CredentialInjectorFilter::setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) {
-  ENVOY_LOG(debug, "Called Filter : {}", __func__);
-  decoder_callbacks_ = &callbacks;
+  return Http::FilterHeadersStatus::Continue;
 }
 
 } // namespace CredentialInjector

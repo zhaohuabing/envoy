@@ -13,7 +13,7 @@ namespace Common {
 template <class ConfigProto>
 class CredentailInjectorFactoryBase : public NamedCredentialInjectorConfigFactory {
 public:
-  CredentialInjectorPtr
+  CredentialInjectorSharedPtr
   createCredentialInjectorFromProto(const Protobuf::Message& proto_config,
                                    Server::Configuration::FactoryContext& context) override {
     return createCredentialInjectorFromProtoTyped(
@@ -32,7 +32,7 @@ protected:
   CredentailInjectorFactoryBase(const std::string& name) : name_(name) {}
 
 private:
-  virtual CredentialInjectorPtr
+  virtual CredentialInjectorSharedPtr
   createCredentialInjectorFromProtoTyped(const ConfigProto&,
                                         Server::Configuration::FactoryContext&) PURE;
 

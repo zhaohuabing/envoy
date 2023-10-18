@@ -16,14 +16,18 @@ public:
 
   /**
    * Inject credential to HTTP headers.
-   * @param headers supplies the reference to HTTP headers. The credential will be injected into the headers.
+   * @param headers supplies the reference to HTTP headers. The credential will be injected into the
+   * headers.
+   * @param overrite whether to overwrite the existing credential in the headers.
+   *
+   * @return true if the credential is injected successfully.
    */
-  virtual void inject(RequestHeaderMap& headers) PURE;
+  virtual bool inject(Http::RequestHeaderMap& headers, bool overrite) PURE;
 };
 
-using CredentialInjectorPtr = std::unique_ptr<CredentialInjector>;
+using CredentialInjectorSharedPtr = std::shared_ptr<CredentialInjector>;
 
 } // namespace Common
-} // namespace Credential
+} // namespace Credentials
 } // namespace Extensions
 } // namespace Envoy

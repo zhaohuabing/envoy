@@ -13,13 +13,12 @@ envoy_cc_library(
     name = "credential_injector_lib",
     srcs = ["credential_injector_filter.cc"],
     hdrs = ["credential_injector_filter.h"],
-    external_deps = ["ssl"],
     deps = [
         "//envoy/server:filter_config_interface",
-        "//source/common/common:base64_lib",
         "//source/common/config:utility_lib",
         "//source/common/http:header_map_lib",
         "//source/common/protobuf:utility_lib",
+        "//source/extensions/credentials/common:credential_interface",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
     ],
 )
@@ -31,8 +30,9 @@ envoy_cc_extension(
     deps = [
         ":credential_injector_lib",
         "//envoy/registry",
-        "//source/common/config:datasource_lib",
+	"//source/common/config:utility_lib",
         "//source/common/protobuf:utility_lib",
+        "//source/extensions/credentials/common:credential_config_interface",
         "//source/extensions/filters/http/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/http/credential_injector/v3:pkg_cc_proto",
     ],

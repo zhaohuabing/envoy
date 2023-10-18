@@ -11,7 +11,8 @@ namespace HttpFilters {
 namespace CredentialInjector {
 
 class CredentialInjectorFilterFactory
-    : public Common::FactoryBase<envoy::extensions::filters::http::credential_injector::v3::CredentialInjector> {
+    : public Common::FactoryBase<
+          envoy::extensions::filters::http::credential_injector::v3::CredentialInjector> {
 public:
   CredentialInjectorFilterFactory() : FactoryBase("envoy.filters.http.credential_injector") {}
 
@@ -25,3 +26,4 @@ private:
 } // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy
+

@@ -13,6 +13,8 @@ namespace Extensions {
 namespace Credentials {
 namespace BasicAuth {
 
+using envoy::extensions::credentials::basic_auth::v3::BasicAuth;
+
 namespace {
 
 const std::string& basicAuthExtensionName() {
@@ -21,16 +23,14 @@ const std::string& basicAuthExtensionName() {
 
 } // namespace
 
-class BasicAuthCredentialInjectorFactory
-    : public Common::CredentailInjectorFactoryBase<
-          envoy::extensions::credentials::basic_auth::v3::BasicAuth> {
+class BasicAuthCredentialInjectorFactory : public Common::CredentailInjectorFactoryBase<BasicAuth> {
 public:
   BasicAuthCredentialInjectorFactory() : CredentailInjectorFactoryBase(basicAuthExtensionName()) {}
 
 private:
-  common::CredentialInjectorPtr createCredentialInjectorFromProtoTyped(
-      const envoy::extensions::credentials::basic_auth::v3::BasicAuth& config,
-      Server::Configuration::FactoryContext& context) override;
+  common::CredentialInjectorSharedPtr
+  createCredentialInjectorFromProtoTyped(const BasicAuth& config,
+                                         Server::Configuration::FactoryContext& context) override;
 };
 
 DECLARE_FACTORY(BasicAuthCredentialInjectorFactory);
