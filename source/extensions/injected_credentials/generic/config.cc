@@ -1,4 +1,5 @@
 #include "source/extensions/injected_credentials/generic/config.h"
+#include "source/extensions/injected_credentials/common/credential.h"
 
 #include "envoy/secret/secret_manager.h"
 #include "envoy/secret/secret_provider.h"
@@ -11,10 +12,10 @@ namespace Generic {
 
 namespace {
 Secret::GenericSecretConfigProviderSharedPtr
-secretsProvider(const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& config,
-                Secret::SecretManager& secret_manager,
-                Server::Configuration::TransportSocketFactoryContext& transport_socket_factory,
-                Init::Manager& init_manager) {
+secretConfigProvider(const envoy::extensions::transport_sockets::tls::v3::SdsSecretConfig& config,
+                     Secret::SecretManager& secret_manager,
+                     Server::Configuration::TransportSocketFactoryContext& transport_socket_factory,
+                     Init::Manager& init_manager) {
   if (config.has_sds_config()) {
     return secret_manager.findOrCreateGenericSecretProvider(config.sds_config(), config.name(),
                                                             transport_socket_factory, init_manager);
@@ -32,16 +33,17 @@ GenericCredentialInjectorFactory::createCredentialInjectorFromProtoTyped(
   auto& cluster_manager = server_context.clusterManager();
   auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
   auto& transport_socket_factory = context.getTransportSocketFactoryContext();
-  auto secret_provider = secretsProvider(credential_secret, secret_manager,
-                                         transport_socket_factory, context.initManager());
+  auto secret_config_provider = secretConfigProvider(credential_secret, secret_manager,
+                                              transport_socket_factory, context.initManager());
 
-  auto secret_reader = std::make_shared<const Common::SDSSecretReader>(
-      std::move(secret_provider), context.serverFactoryContext().threadLocal(), server_context.api());
+  auto secret_provider = std::make_shared<const Secret::ThreadLocalGenericSecretProvider>(
+      std::move(secret_config_provider), context.serverFactoryContext().threadLocal(),
+      server_context.api());
   std::string header = config.header();
   if (header.empty()) {
     header = "Authorization";
   }
-  return std::make_shared<GenericCredentialInjector>(header, secret_reader);
+  return std::make_shared<GenericCredentialInjector>(header, secret_provider);
 }
 
 /**

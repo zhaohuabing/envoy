@@ -1,8 +1,7 @@
 #pragma once
 
-#include "source/common/config/datasource.h"
+#include "source/common/secret/secret_provider_impl.h"
 #include "source/extensions/injected_credentials/common/credential.h"
-#include "source/extensions/injected_credentials/common/secret_reader.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -15,8 +14,8 @@ namespace Generic {
 class GenericCredentialInjector : public Common::CredentialInjector {
 public:
   GenericCredentialInjector(const std::string& header,
-                            Common::SecretReaderConstSharedPtr secret_reader)
-      : header_(header), secret_reader_(secret_reader){};
+                            Secret::ThreadLocalGenericSecretProvider secret_provider)
+      : header_(header), secret_provider_(secret_provider){};
 
   // Common::CredentialInjector
   RequestPtr requestCredential(Callbacks& callbacks) override {
@@ -30,7 +29,7 @@ public:
 
 private:
   const std::string header_;
-  const Common::SecretReaderConstSharedPtr secret_reader_;
+  Secret::ThreadLocalGenericSecretProvider secret_provider_;
 };
 
 } // namespace Generic

@@ -15,6 +15,7 @@ envoy_cc_library(
     hdrs = ["generic_impl.h"],
     deps = [
         "//source/common/config:datasource_lib",
+        "//source/common/secret:secret_provider_impl_lib",
         "//source/extensions/injected_credentials/common:credential_interface",
         "//source/extensions/injected_credentials/common:secret_reader_lib",
     ],
@@ -28,7 +29,6 @@ envoy_cc_extension(
         ":generic_lib",
         "//source/common/http:headers_lib",
         "//source/extensions/injected_credentials/common:credential_factory_base_lib",
-        "//source/extensions/injected_credentials/common:secret_reader_lib",
         "@envoy_api//envoy/extensions/injected_credentials/generic/v3:pkg_cc_proto",
     ],
 )

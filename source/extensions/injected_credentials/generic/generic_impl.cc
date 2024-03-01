@@ -10,11 +10,11 @@ absl::Status GenericCredentialInjector::inject(Http::RequestHeaderMap& headers, 
     return absl::AlreadyExistsError("Credential already exists in the header");
   }
 
-  if (secret_reader_->credential().empty()) {
+  if (secret_provider_.secret().empty()) {
     return absl::NotFoundError("Failed to get credential from secret");
   }
 
-  headers.setCopy(Http::LowerCaseString(header_), secret_reader_->credential());
+  headers.setCopy(Http::LowerCaseString(header_), secret_provider_.secret());
   return absl::OkStatus();
 }
 
