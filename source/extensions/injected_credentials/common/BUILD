@@ -21,6 +21,7 @@ envoy_cc_library(
     hdrs = ["secret_reader.h"],
     deps = [
         "//source/common/config:datasource_lib",
+        "//source/common/secret:secret_provider_impl_lib",
     ],
 )
 
