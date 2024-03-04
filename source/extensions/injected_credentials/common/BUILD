@@ -17,15 +17,6 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "secret_reader_lib",
-    hdrs = ["secret_reader.h"],
-    deps = [
-        "//source/common/config:datasource_lib",
-        "//source/common/secret:secret_provider_impl_lib",
-    ],
-)
-
-envoy_cc_library(
     name = "credential_config_interface",
     hdrs = ["factory.h"],
     deps = [

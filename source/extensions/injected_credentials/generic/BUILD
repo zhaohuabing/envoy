@@ -14,10 +14,8 @@ envoy_cc_library(
     srcs = ["generic_impl.cc"],
     hdrs = ["generic_impl.h"],
     deps = [
-        "//source/common/config:datasource_lib",
         "//source/common/secret:secret_provider_impl_lib",
         "//source/extensions/injected_credentials/common:credential_interface",
-        "//source/extensions/injected_credentials/common:secret_reader_lib",
     ],
 )
 
