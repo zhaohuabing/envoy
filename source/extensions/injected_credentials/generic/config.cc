@@ -33,10 +33,10 @@ GenericCredentialInjectorFactory::createCredentialInjectorFromProtoTyped(
   auto& cluster_manager = server_context.clusterManager();
   auto& secret_manager = cluster_manager.clusterManagerFactory().secretManager();
   auto& transport_socket_factory = context.getTransportSocketFactoryContext();
-  auto secret_config_provider = secretConfigProvider(
-      credential_secret, secret_manager, transport_socket_factory, context.initManager());
+  auto secret_config_provider = secretConfigProvider(credential_secret, secret_manager,
+                                              transport_socket_factory, context.initManager());
 
-  auto secret_provider = std::make_shared<Secret::ThreadLocalGenericSecretProvider>(
+  auto secret_provider = std::make_shared<const Secret::ThreadLocalGenericSecretProvider>(
       std::move(secret_config_provider), context.serverFactoryContext().threadLocal(),
       server_context.api());
   std::string header = config.header();

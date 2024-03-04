@@ -30,7 +30,7 @@ public:
 
 private:
   const std::string header_;
-  std::shared_ptr<Secret::ThreadLocalGenericSecretProvider> secret_provider_;
+  const std::shared_ptr<Secret::ThreadLocalGenericSecretProvider> secret_provider_;
 };
 
 } // namespace Generic
