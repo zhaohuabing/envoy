@@ -21,7 +21,7 @@ public:
   absl::Status inject(Envoy::Http::RequestHeaderMap& headers, bool overwrite) override;
 
 private:
-  const std::string header_;
+  const Http::LowerCaseString header_;
   const Common::SecretReaderConstSharedPtr secret_reader_;
 };
 
