@@ -14,6 +14,8 @@ namespace BasicAuth {
 
 namespace {
 
+const LowerCaseString WWWAuthenticateHeader{"www-authenticate"};  
+
 // Function to compute SHA1 hash
 std::string computeSHA1(absl::string_view password) {
   unsigned char hash[SHA_DIGEST_LENGTH];
@@ -97,7 +99,10 @@ bool BasicAuthFilter::validateUser(const UserMap& users, absl::string_view usern
 Http::FilterHeadersStatus BasicAuthFilter::onDenied(absl::string_view body,
                                                     absl::string_view response_code_details) {
   config_->stats().denied_.inc();
-  decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, body, nullptr, absl::nullopt,
+  auto modify_headers = (Http::HeaderMap& headers) {
+      headers.addCopy(WWWAuthenticateHeader, "Basic realm=\"envoy\"");
+  };
+  decoder_callbacks_->sendLocalReply(Http::Code::Unauthorized, body, modify_headers, absl::nullopt,
                                      response_code_details);
   return Http::FilterHeadersStatus::StopIteration;
 }

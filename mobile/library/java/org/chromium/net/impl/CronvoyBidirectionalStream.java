@@ -764,7 +764,7 @@ public final class CronvoyBidirectionalStream
       if (!headerKey.startsWith(X_ENVOY) && !headerKey.equals("date")) {
         for (String value : headerEntry.getValue()) {
           headers.add(new AbstractMap.SimpleEntry<>(headerKey, value));
-        }
+      }
       }
     }
     // proxy and caching are not supported.
