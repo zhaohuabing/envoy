@@ -6,6 +6,81 @@ behavior_changes:
 minor_behavior_changes:
 # *Changes that may cause incompatibilities for some users, but should not for most*
 
+- area: access_log
+  change: |
+    New implementation of the JSON formatter will be enabled by default.
+    The :ref:`sort_properties <envoy_v3_api_field_config.core.v3.JsonFormatOptions.sort_properties>` field will
+    be ignored in the new implementation because the new implementation always sorts properties. And the new implementation
+    will always keep the value type in the JSON output. For example, the duration field will always be rendered as a number
+    instead of a string.
+    This behavior change could be disabled temporarily by setting the runtime
+    ``envoy.reloadable_features.logging_with_fast_json_formatter`` to false.
+- area: xds
+  change: |
+    A minor delta-xDS optimization that avoids copying resources when ingesting them was introduced.
+    No impact to the behavior is expected, but a runtime flag was added as this may impact config-ingestion
+    related extensions (e.g., custom-config-validators, config-tracker), as the order of the elements passed
+    to the callback functions may be different. This change can be temporarily reverted
+    by setting ``envoy.reloadable_features.xds_prevent_resource_copy`` to ``false``.
+- area: formatter
+  change: |
+    The NaN and Infinity values of float will be serialized to ``null`` and ``"inf"`` respectively in the
+    metadata (``DYNAMIC_METADATA``, ``CLUSTER_METADATA``, etc.) formatter.
+- area: sds
+  change: |
+    Relaxed the backing cluster validation for Secret Discovery Service(SDS). Currently, the cluster that supports SDS,
+    needs to be a primary cluster i.e. a non-EDS cluster defined in bootstrap configuration. This change relaxes that
+    restriction i.e. SDS cluster can be a dynamic cluster. This change is enabled by default, and can be reverted by setting
+    the runtime flag ``envoy.restart_features.skip_backing_cluster_check_for_sds`` to ``false``.
+- area: http
+  change: |
+    If the :ref:`pack_trace_reason <envoy_v3_api_field_extensions.request_id.uuid.v3.UuidRequestIdConfig.pack_trace_reason>`
+    is set to false, Envoy will not parse the trace reason from the ``x-request-id`` header to ensure reads and writes of
+    trace reason be consistant.
+    If the :ref:`pack_trace_reason <envoy_v3_api_field_extensions.request_id.uuid.v3.UuidRequestIdConfig.pack_trace_reason>`
+    is set to true and external ``x-request-id`` value is used, the trace reason in the external request id will not
+    be trusted and will be cleared.
+- area: oauth2
+  change: |
+    :ref:`use_refresh_token <envoy_v3_api_field_extensions.filters.http.oauth2.v3.OAuth2Config.use_refresh_token>`
+    is now enabled by default. This behavioral change can be temporarily reverted by setting runtime guard
+    ``envoy.reloadable_features.oauth2_use_refresh_token`` to false.
+- area: oauth2
+  change: |
+    The ``state`` parameter in the OAuth2 authorization request has been changed to a base64url-encoded JSON object.
+    The JSON object contains the original request URL and a nonce for CSRF prevention.
+- area: quic
+  change: |
+    Enable UDP GRO in QUIC client connections by default. This behavior can be reverted by setting
+    the runtime guard ``envoy.reloadable_features.prefer_quic_client_udp_gro`` to false.
+- area: scoped_rds
+  change: |
+    The :ref:`route_configuration <envoy_v3_api_field_config.route.v3.ScopedRouteConfiguration.route_configuration>` field
+    is supported when the ``ScopedRouteConfiguration`` resource is delivered via SRDS.
+- area: http
+  change: |
+    Local replies now traverse the filter chain if 1xx headers have been sent to the client. This change can be reverted
+    by setting the runtime guard ``envoy.reloadable_features.local_reply_traverses_filter_chain_after_1xx`` to false.
+- area: dns
+  change: |
+    Patched c-ares to address CVE-2024-25629.
+- area: csrf
+  change: |
+    Increase only the statistics counter ``missing_source_origin`` for requests with a missing source origin.
+    Previously, the ``request_invalid`` counter was also increased for such requests.
+- area: rate_limit
+  change: |
+    add ``WEEK`` to the unit of time for rate limit.
+- area: rds
+  change: |
+    When a new RDS provider config is pushed via xDS and the only difference is change to
+    :ref:`initial_fetch_timeout <envoy_v3_api_field_config.core.v3.ConfigSource.initial_fetch_timeout>`,
+    the already existing provider will be reused. Envoy will not ask RDS server for routes
+    config because existing provider already has up to date routes config.
+    This behavioral change can be temporarily reverted by setting runtime guard
+    ``envoy.reloadable_features.normalize_rds_provider_config`` to false.
+>>>>>>> 0c6a1d2b84 (Fix: oauth2 state encoding (#37473))
+
 bug_fixes:
 # *Changes expected to improve the state of the world and are unlikely to have negative effects*
 
