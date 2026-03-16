@@ -630,6 +630,18 @@ typedef void* envoy_dynamic_module_type_http_filter_scheduler_module_ptr;
  */
 typedef void* envoy_dynamic_module_type_http_filter_config_scheduler_module_ptr;
 
+/**
+ * envoy_dynamic_module_type_http_body_type identifies which HTTP body view a callback operates on.
+ *
+ * ReceivedRequestBody/ReceivedResponseBody refer to the latest body chunk delivered to the current
+ * body callback.
+ *
+ * BufferedRequestBody/BufferedResponseBody refer to Envoy's decoding/encoding buffer when
+ * buffering is enabled. These buffered bodies do not necessarily include the latest received
+ * chunk. If envoy_dynamic_module_callback_http_received_buffered_request_body or
+ * envoy_dynamic_module_callback_http_received_buffered_response_body returns true, the latest
+ * received body already is the buffered body and should not be combined again.
+ */
 typedef enum envoy_dynamic_module_type_http_body_type {
   envoy_dynamic_module_type_http_body_type_ReceivedRequestBody,
   envoy_dynamic_module_type_http_body_type_BufferedRequestBody,
@@ -1734,6 +1746,11 @@ bool envoy_dynamic_module_callback_http_drain_body(
  * Then X resumes the filter chain after receiving the whole request body.
  * When the next filter Y will receives the buffered request body and this callback will return
  * true.
+ *
+ * When this returns false, BufferedRequestBody should be treated as Envoy's buffered body so far
+ * and ReceivedRequestBody should be treated as the latest body chunk delivered to the current
+ * callback. When this returns true, the latest received request body already is the buffered body,
+ * so a module that wants the whole request body must not combine them again.
  *
  * @param filter_envoy_ptr is the pointer to the DynamicModuleHttpFilter object of the
  * corresponding HTTP filter.
