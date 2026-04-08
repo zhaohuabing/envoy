@@ -135,7 +135,7 @@ public:
     ON_CALL(test_random_, random()).WillByDefault(Return(123456789));
     filter_ = std::make_shared<OAuth2Filter>(
         config_,
-        [this, oauth_client_holder](const FilterConfigSharedPtr&) -> std::unique_ptr<OAuth2Client> {
+        [this, oauth_client_holder](const FilterConfig&) -> std::unique_ptr<OAuth2Client> {
           if (*oauth_client_holder != nullptr) {
             return std::move(*oauth_client_holder);
           }
@@ -148,7 +148,7 @@ public:
     filter_->setDecoderFilterCallbacks(decoder_callbacks_);
     filter_->setEncoderFilterCallbacks(encoder_callbacks_);
     if (config_ != nullptr) {
-      filter_->setActiveConfig(config_);
+      filter_->setActiveConfig(config_.get());
     }
     validator_ = std::make_shared<MockOAuth2CookieValidator>();
     if (config_ != nullptr) {
