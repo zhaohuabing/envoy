@@ -9,19 +9,27 @@
 #include "envoy/common/exception.h"
 #include "envoy/common/resource.h"
 #include "envoy/config/core/v3/base.pb.h"
+#include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/listener/v3/udp_listener_config.pb.h"
 #include "envoy/config/typed_metadata.h"
 #include "envoy/init/manager.h"
+#include "envoy/network/address.h"
 #include "envoy/network/connection.h"
 #include "envoy/network/connection_balancer.h"
 #include "envoy/network/listen_socket.h"
 #include "envoy/network/udp_packet_writer_handler.h"
+#include "envoy/server/overload/load_shed_point.h"
 #include "envoy/stats/scope.h"
 
 #include "source/common/common/interval_value.h"
 
+#include "absl/strings/string_view.h"
+
 namespace Envoy {
 namespace Network {
+
+// Set this to the maximum value which effectively accepts all connections.
+constexpr uint32_t DefaultMaxConnectionsToAcceptPerSocketEvent = UINT32_MAX;
 
 class ActiveUdpListenerFactory;
 class UdpListenerWorkerRouter;
@@ -73,9 +81,18 @@ public:
    * workers. For example, the actual listen() call, post listen socket options, etc. This is done
    * so that all error handling can occur on the main thread and the gap between performing these
    * actions and using the socket is minimized.
+   * @return a status indicating if an error occurred.
    */
-  virtual void doFinalPreWorkerInit() PURE;
+  virtual absl::Status doFinalPreWorkerInit() PURE;
 };
+
+} // namespace Network
+
+namespace Quic {
+class QuicPacketWriterFactory;
+} // namespace Quic
+
+namespace Network {
 
 /**
  * Configuration for a UDP listener.
@@ -95,9 +112,16 @@ public:
   virtual UdpPacketWriterFactory& packetWriterFactory() PURE;
 
   /**
+   * @return factory for creating QUIC packet writers.
+   */
+  virtual Quic::QuicPacketWriterFactory* quicPacketWriterFactory() PURE;
+
+  /**
+   * @param address is used to query the address specific router.
    * @return the UdpListenerWorkerRouter for this listener.
    */
-  virtual UdpListenerWorkerRouter& listenerWorkerRouter() PURE;
+  virtual UdpListenerWorkerRouter&
+  listenerWorkerRouter(const Network::Address::Instance& address) PURE;
 
   /**
    * @return the configuration for the listener.
@@ -106,6 +130,75 @@ public:
 };
 
 using UdpListenerConfigOptRef = OptRef<UdpListenerConfig>;
+
+// Forward declare.
+class InternalListenerRegistry;
+
+/**
+ * Configuration for an internal listener.
+ */
+class InternalListenerConfig {
+public:
+  virtual ~InternalListenerConfig() = default;
+
+  /**
+   * @return InternalListenerRegistry& The internal registry of this internal listener config. The
+   *         registry outlives this listener config.
+   */
+  virtual InternalListenerRegistry& internalListenerRegistry() PURE;
+};
+
+using InternalListenerConfigOptRef = OptRef<InternalListenerConfig>;
+
+/**
+ * Description of the listener.
+ */
+class ListenerInfo {
+public:
+  virtual ~ListenerInfo() = default;
+
+  /**
+   * @return absl::string_view the name of the listener as set in configuration.
+   */
+  virtual absl::string_view name() const PURE;
+
+  /**
+   * @return const envoy::config::core::v3::Metadata& the config metadata associated with this
+   * listener.
+   */
+  virtual const envoy::config::core::v3::Metadata& metadata() const PURE;
+
+  /**
+   * @return const Envoy::Config::TypedMetadata& return the typed metadata provided in the config
+   * for this listener.
+   */
+  virtual const Envoy::Config::TypedMetadata& typedMetadata() const PURE;
+
+  /**
+   * @return envoy::config::core::v3::TrafficDirection the direction of the traffic relative to
+   * the local proxy.
+   */
+  virtual envoy::config::core::v3::TrafficDirection direction() const PURE;
+
+  /**
+   * @return whether the listener is a Quic listener.
+   */
+  virtual bool isQuic() const PURE;
+
+  /**
+   * @return envoy::config::listener::v3::Listener::DrainType the drain type configured on this
+   * listener. DEFAULT listeners drain in response to /healthcheck/fail in addition to listener
+   * removal/modification and hot restart; MODIFY_ONLY listeners do not.
+   */
+  virtual envoy::config::listener::v3::Listener::DrainType drainType() const PURE;
+
+  /**
+   * @return bool whether the listener should bypass overload manager actions
+   */
+  virtual bool shouldBypassOverloadManager() const PURE;
+};
+
+using ListenerInfoConstSharedPtr = std::shared_ptr<const ListenerInfo>;
 
 /**
  * A configuration for an individual listener.
@@ -127,16 +220,16 @@ public:
   virtual FilterChainFactory& filterChainFactory() PURE;
 
   /**
-   * @return ListenSocketFactory& the factory to create listen socket.
+   * @return std::vector<ListenSocketFactoryPtr>& the factories to create listen sockets.
    */
-  virtual ListenSocketFactory& listenSocketFactory() PURE;
+  virtual std::vector<ListenSocketFactoryPtr>& listenSocketFactories() PURE;
 
   /**
    * @return bool specifies whether the listener should actually listen on the port.
    *         A listener that doesn't listen on a port can only receive connections
    *         redirected from other listeners.
    */
-  virtual bool bindToPort() PURE;
+  virtual bool bindToPort() const PURE;
 
   /**
    * @return bool if a connection should be handed off to another Listener after the original
@@ -150,6 +243,12 @@ public:
    * write buffers.
    */
   virtual uint32_t perConnectionBufferLimitBytes() const PURE;
+
+  /**
+   * @return std::chrono::milliseconds specifying how long a connection is allowed to remain above
+   * the buffer high watermark before it is closed. A zero duration disables the timeout.
+   */
+  virtual std::chrono::milliseconds perConnectionBufferHighWatermarkTimeout() const PURE;
 
   /**
    * @return std::chrono::milliseconds the time to wait for all listener filters to complete
@@ -181,20 +280,26 @@ public:
   virtual const std::string& name() const PURE;
 
   /**
+   * @return ListenerInfoConstSharedPtr& description of the listener.
+   */
+  virtual const ListenerInfoConstSharedPtr& listenerInfo() const PURE;
+
+  /**
    * @return the UDP configuration for the listener IFF it is a UDP listener.
    */
   virtual UdpListenerConfigOptRef udpListenerConfig() PURE;
 
   /**
-   * @return traffic direction of the listener.
+   * @return the internal configuration for the listener IFF it is an internal listener.
    */
-  virtual envoy::config::core::v3::TrafficDirection direction() const PURE;
+  virtual InternalListenerConfigOptRef internalListenerConfig() PURE;
 
   /**
+   * @param address is used for query the address specific connection balancer.
    * @return the connection balancer for this listener. All listeners have a connection balancer,
    *         though the implementation may be a NOP balancer.
    */
-  virtual ConnectionBalancer& connectionBalancer() PURE;
+  virtual ConnectionBalancer& connectionBalancer(const Network::Address::Instance& address) PURE;
 
   /**
    * Open connection resources for this listener.
@@ -202,9 +307,9 @@ public:
   virtual ResourceLimit& openConnections() PURE;
 
   /**
-   * @return std::vector<AccessLog::InstanceSharedPtr> access logs emitted by the listener.
+   * @return AccessLog::InstanceSharedPtrVector access logs emitted by the listener.
    */
-  virtual const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() const PURE;
+  virtual const AccessLog::InstanceSharedPtrVector& accessLogs() const PURE;
 
   /**
    * @return pending connection backlog for TCP listeners.
@@ -212,9 +317,25 @@ public:
   virtual uint32_t tcpBacklogSize() const PURE;
 
   /**
+   * @return the maximum number of connections that will be accepted for a given socket event.
+   */
+  virtual uint32_t maxConnectionsToAcceptPerSocketEvent() const PURE;
+
+  /**
    * @return init manager of the listener.
    */
   virtual Init::Manager& initManager() PURE;
+
+  /**
+   * @return bool whether the listener should avoid blocking connections based on the globally set
+   * limit.
+   */
+  virtual bool ignoreGlobalConnLimit() const PURE;
+
+  /**
+   * @return bool whether the listener should bypass overload manager actions
+   */
+  virtual bool shouldBypassOverloadManager() const PURE;
 };
 
 /**
@@ -238,6 +359,13 @@ public:
    * Called when a new connection is rejected.
    */
   virtual void onReject(RejectCause cause) PURE;
+
+  /**
+   * Called when the listener has finished accepting connections per socket
+   * event.
+   * @param connections_accepted number of connections accepted.
+   */
+  virtual void recordConnectionsAcceptedOnSocketEvent(uint32_t connections_accepted) PURE;
 };
 
 /**
@@ -264,6 +392,8 @@ struct UdpRecvData {
   LocalPeerAddresses addresses_;
   Buffer::InstancePtr buffer_;
   MonotonicTime receive_time_;
+  uint8_t tos_ = 0;
+  Buffer::OwnedImpl saved_cmsg_;
 };
 
 /**
@@ -352,9 +482,14 @@ public:
    * An estimated number of UDP packets this callback expects to process in current read event.
    */
   virtual size_t numPacketsExpectedPerEventLoop() const PURE;
+
+  /**
+   * Information about which cmsg to save to QuicReceivedPacket, if any.
+   */
+  virtual const IoHandle::UdpSaveCmsgConfig& udpSaveCmsgConfig() const PURE;
 };
 
-using UdpListenerCallbacksOptRef = absl::optional<std::reference_wrapper<UdpListenerCallbacks>>;
+using UdpListenerCallbacksOptRef = std::optional<std::reference_wrapper<UdpListenerCallbacks>>;
 
 /**
  * An abstract socket listener. Free the listener to stop listening on the socket.
@@ -378,6 +513,17 @@ public:
    * after being opened.
    */
   virtual void setRejectFraction(UnitFloat reject_fraction) PURE;
+
+  /**
+   * Configures the LoadShedPoints for this listener.
+   */
+  virtual void
+  configureLoadShedPoints(Server::LoadShedPointProvider& load_shed_point_provider) PURE;
+
+  /**
+   * Check whether the listener should bypass overload manager actions
+   */
+  virtual bool shouldBypassOverloadManager() const PURE;
 };
 
 using ListenerPtr = std::unique_ptr<Listener>;

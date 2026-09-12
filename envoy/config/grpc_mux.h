@@ -1,14 +1,26 @@
 #pragma once
 
+#include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
-#include "envoy/common/exception.h"
+#include "envoy/common/backoff_strategy.h"
 #include "envoy/common/pure.h"
+#include "envoy/config/core/v3/config_source.pb.h"
+#include "envoy/config/eds_resources_cache.h"
 #include "envoy/config/subscription.h"
+#include "envoy/grpc/async_client.h"
+#include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
+#include "envoy/upstream/load_stats_reporter.h"
 
 #include "source/common/common/cleanup.h"
-#include "source/common/protobuf/protobuf.h"
+#include "source/common/protobuf/arena_wrapped_proto.h"
+
+#include "absl/base/attributes.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 
 namespace Envoy {
 namespace Config {
@@ -100,17 +112,47 @@ public:
   virtual GrpcMuxWatchPtr addWatch(const std::string& type_url,
                                    const absl::flat_hash_set<std::string>& resources,
                                    SubscriptionCallbacks& callbacks,
-                                   OpaqueResourceDecoder& resource_decoder,
+                                   OpaqueResourceDecoderSharedPtr resource_decoder,
                                    const SubscriptionOptions& options) PURE;
 
   virtual void requestOnDemandUpdate(const std::string& type_url,
                                      const absl::flat_hash_set<std::string>& for_update) PURE;
+
+  /**
+   * Returns an EdsResourcesCache for this GrpcMux if there is one.
+   * @return EdsResourcesCacheOptRef optional eds resources cache for the gRPC-mux.
+   */
+  virtual EdsResourcesCacheOptRef edsResourcesCache() PURE;
+
+  /**
+   * Updates the current gRPC-Mux object to use a new gRPC client, and config.
+   */
+  virtual absl::Status updateMuxSource(
+      Grpc::RawAsyncClientSharedPtr&& primary_async_client,
+      Grpc::RawAsyncClientSharedPtr&& failover_async_client, Stats::Scope& scope,
+      BackOffStrategyPtr&& backoff_strategy,
+      const envoy::config::core::v3::ApiConfigSource& ads_config_source,
+      std::function<std::unique_ptr<Upstream::LoadStatsReporter>()> load_stats_reporter_factory =
+          nullptr) PURE;
+
+  /**
+   * Returns a load-stats-reporter that was created for the gRPC-Mux.
+   * Returns nullptr if a load-stats-reporter wasn't created for the gRPC-Mux.
+   */
+  virtual Upstream::LoadStatsReporter* loadStatsReporter() const PURE;
+
+  /**
+   * Returns a load-stats-reporter if it was previously created for the
+   * gRPC-Mux, or creates one and returns it. Enables lazy-initialization of the
+   * load-stats-reporter.
+   */
+  virtual Upstream::LoadStatsReporter* maybeCreateLoadStatsReporter() PURE;
 };
 
 using GrpcMuxPtr = std::unique_ptr<GrpcMux>;
 using GrpcMuxSharedPtr = std::shared_ptr<GrpcMux>;
 
-template <class ResponseProto> using ResponseProtoPtr = std::unique_ptr<ResponseProto>;
+template <class ResponseProto> using ResponseProtoPtr = ArenaWrappedProto<ResponseProto>;
 /**
  * A grouping of callbacks that a GrpcMux should provide to its GrpcStream.
  */
@@ -127,8 +169,11 @@ public:
   /**
    * For the GrpcStream to prompt the context to take appropriate action in response to
    * failure to establish the gRPC stream.
+   * @param next_attempt_may_send_initial_resource_version a flag indicating whether the
+   *        next reconnection attempt will be to the same source that was previously successful
+   *        or not (used to pass primary/failover reconnection information to the GrpcMux).
    */
-  virtual void onEstablishmentFailure() PURE;
+  virtual void onEstablishmentFailure(bool next_attempt_may_send_initial_resource_version) PURE;
 
   /**
    * For the GrpcStream to pass received protos to the context.

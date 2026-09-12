@@ -18,8 +18,13 @@ from datetime import datetime
 
 import yaml
 
+from docutils import nodes, utils
+
 from sphinx.directives.code import CodeBlock
-import sphinx_rtd_theme
+from sphinx.util.nodes import split_explicit_title
+
+# TODO(phlax): move the pygments style to envoy.docs.sphinx_runner and remove this
+sys.path.append(os.path.abspath("./_pygments"))
 
 
 class SphinxConfigError(Exception):
@@ -49,10 +54,62 @@ class SubstitutionCodeBlock(CodeBlock):
         return list(CodeBlock.run(self))
 
 
+def dockerhub_envoy_role(
+        typ: str,
+        rawtext: str,
+        text: str,
+        lineno: int,
+        inliner,  # : Inliner,
+        options: dict = {},
+        content: list[str] = []) -> tuple[list, list]:
+    text = utils.unescape(text)
+    has_explicit_title, title, part = split_explicit_title(text)
+
+    if part.startswith("envoy"):
+        part = part[len("envoy"):]
+
+    # envoy-build-ubuntu images
+    if part.startswith("build"):
+        parts = part.split("-")
+        if len(parts) > 2:
+            title = f"envoyproxy/envoy-build-ubuntu:{''.join(parts[2:])}-<build_sha>"
+            full_url = f"https://hub.docker.com/r/envoyproxy/envoy-build-ubuntu/tags?name={''.join(parts[2:])}"
+        else:
+            title = f"envoyproxy/envoy-build-ubuntu:<build_sha>"
+            full_url = f"https://hub.docker.com/r/envoyproxy/envoy-build-ubuntu/tags"
+
+    # dev images
+    elif part.endswith("-dev"):
+        if part == "-dev":
+            part = "dev"
+        title = f"envoyproxy/envoy:{part}"
+        full_url = f"https://hub.docker.com/r/envoyproxy/envoy/tags?name={part}"
+
+    # envoy images
+    else:
+        variant = (
+            f"-{_config('docker_image_tag_name')}" if part else _config("docker_image_tag_name"))
+        title = f"envoyproxy/envoy:{part}{variant}"
+        full_url = f"https://hub.docker.com/r/envoyproxy/envoy/tags?name={part}{variant}"
+
+    if not has_explicit_title:
+        title = title
+    pnode = nodes.reference(title, title, internal=False, refuri=full_url)
+    return [pnode], []
+
+
+def _blank_permalink_icon(app):
+    # sphinx_rtd_theme overwrites this with a Font Awesome glyph when it loads,
+    # after conf.py has run; the stylesheet draws the `#` itself.
+    app.config.html_permalinks_icon = ''
+
+
 def setup(app):
     app.add_config_value('release_level', '', 'env')
     app.add_config_value('substitutions', [], 'html')
     app.add_directive('substitution-code-block', SubstitutionCodeBlock)
+    app.add_role('dockerhub_envoy', dockerhub_envoy_role)
+    app.connect('builder-inited', _blank_permalink_icon)
 
 
 missing_config = (
@@ -91,30 +148,39 @@ def _config(key):
 sys.path.append(os.path.abspath("./_ext"))
 
 extensions = [
-    'sphinxcontrib.httpdomain', 'sphinx.ext.extlinks', 'sphinx.ext.ifconfig', 'intersphinx_custom',
-    'sphinx_tabs.tabs', 'sphinx_copybutton', 'validating_code_block', 'sphinxext.rediraffe',
-    'powershell_lexer'
+    'envoy.docs.sphinx_runner.ext.httpdomain',
+    'sphinx.ext.extlinks',
+    'sphinx.ext.ifconfig',
+    'sphinx.ext.intersphinx',
+    'sphinx_tabs.tabs',
+    'sphinx_copybutton',
+    'envoy.docs.sphinx_runner.ext.validating_code_block',
+    'sphinxext.rediraffe',
+    'envoy.docs.sphinx_runner.ext.powershell_lexer',
+    'sphinxcontrib.jquery',
 ]
 
 release_level = _config('release_level')
 blob_sha = _config('blob_sha')
 
 extlinks = {
-    'repo': ('https://github.com/envoyproxy/envoy/blob/{}/%s'.format(blob_sha), ''),
-    'api': ('https://github.com/envoyproxy/envoy/blob/{}/api/%s'.format(blob_sha), ''),
+    'repo': ('https://github.com/envoyproxy/envoy/blob/{}/%s'.format(blob_sha), '%s'),
+    'api': ('https://github.com/envoyproxy/envoy/blob/{}/api/%s'.format(blob_sha), '%s'),
 }
+
+# Only lookup intersphinx for explicitly prefixed in cross-references
+# This makes docs versioning work
+intersphinx_disabled_reftypes = ['*']
 
 # Setup global substitutions
 if 'pre-release' in release_level:
     substitutions = [
-        ('|envoy_docker_image|', 'envoy-dev:{}'.format(blob_sha)),
-        ('|envoy_windows_docker_image|', 'envoy-windows-dev:{}'.format(blob_sha)),
-        ('|envoy_distroless_docker_image|', 'envoy-distroless-dev:{}'.format(blob_sha))
+        ('|envoy_docker_image|', 'envoy:dev-{}'.format(blob_sha)),
+        ('|envoy_distroless_docker_image|', 'envoy:distroless-dev-{}'.format(blob_sha))
     ]
 else:
     substitutions = [('|envoy_docker_image|', 'envoy:{}'.format(blob_sha)),
-                     ('|envoy_windows_docker_image|', 'envoy-windows:{}'.format(blob_sha)),
-                     ('|envoy_distroless_docker_image|', 'envoy-distroless:{}'.format(blob_sha))]
+                     ('|envoy_distroless_docker_image|', 'envoy:distroless-{}'.format(blob_sha))]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -147,16 +213,22 @@ version = _config('version_string')
 # The full version, including alpha/beta/rc tags.
 release = _config('version_string')
 
+short_tag_name = _config('docker_image_tag_name')
+if short_tag_name.endswith("-latest"):
+    short_tag_name = short_tag_name[:-len("-latest")]
+
 rst_epilog = """
 .. |DOCKER_IMAGE_TAG_NAME| replace:: {}
-""".format(_config('docker_image_tag_name'))
+
+.. |DOCKER_IMAGE_TAG_NAME_SHORT| replace:: {}
+""".format(_config('docker_image_tag_name'), short_tag_name)
 
 # The language for content autogenerated by Sphinx. Refer to documentation
 # for a list of supported languages.
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -172,6 +244,7 @@ exclude_patterns = [
     '_venv',
     'Thumbs.db',
     '.DS_Store',
+    '**/._*',
 ]
 
 # The reST default role (used for this markup: `text`) to use for all
@@ -213,10 +286,15 @@ html_theme = 'sphinx_rtd_theme'
 html_theme_options = {
     'logo_only': True,
     'includehidden': False,
+    'collapse_navigation': True,
+    'sticky_navigation': True,
+    'navigation_depth': 4,
+    'titles_only': True,
+    'style_external_links': True,
 }
 
 # Add any paths that contain custom themes here, relative to this directory.
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+# html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 # The name for this set of Sphinx documents.
 # "<project> v<release> documentation" by default.
@@ -239,7 +317,33 @@ html_favicon = 'favicon.ico'
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['_static']
 
+# envoy.css carries the design tokens and must load first; the component
+# modules below are listed separately so each is a parallel <link> rather than
+# an @import waterfall. See docs/root/_static/css/envoy/.
 html_style = 'css/envoy.css'
+
+html_css_files = [
+    'css/envoy/base.css',
+    'css/envoy/topbar.css',
+    'css/envoy/sidebar.css',
+    'css/envoy/content.css',
+    'css/envoy/code.css',
+    'css/envoy/admonitions.css',
+    'css/envoy/tables.css',
+    'css/envoy/toc.css',
+    'css/envoy/proto.css',
+    'css/envoy/lists.css',
+    'css/envoy/search.css',
+    # loaded last so its overrides win without extra specificity
+    'css/envoy/responsive.css',
+]
+
+# envoy-theme.js is a classic script so the stored theme applies before the
+# first paint; everything else is a deferred module. See _static/js/envoy/.
+html_js_files = [
+    'js/envoy-theme.js',
+    ('js/envoy.js', {'type': 'module'}),
+]
 
 # Add any extra paths that contain custom files (such as robots.txt or
 # .htaccess) here, relative to this directory. These files are copied
@@ -288,6 +392,12 @@ html_style = 'css/envoy.css'
 # This is the file name suffix for HTML files (e.g. ".xhtml").
 #html_file_suffix = None
 
+# `.html` by default so builds render straight from disk or an object store
+# (PR previews, local dev). envoy-website builds with
+# `--@envoy-docs//:pretty_links`, which exports an empty suffix, and serves
+# `/foo` from `foo.html` itself.
+html_link_suffix = os.environ.get("ENVOY_DOCS_LINK_SUFFIX", ".html")
+
 # Language to be used for generating the HTML full-text search index.
 # Sphinx supports the following languages:
 #   'da', 'de', 'en', 'es', 'fi', 'fr', 'hu', 'it', 'ja'
@@ -309,22 +419,8 @@ htmlhelp_basename = 'envoydoc'
 # TODO(phlax): add redirect diff (`rediraffe_branch` setting)
 #  - not sure how diffing will work with main merging in PRs - might need
 #    to be injected dynamically, somehow
-rediraffe_redirects = "envoy-redirects.txt"
+rediraffe_redirects = "redirects.txt"
 
-intersphinx_mapping = {
-    'v1.5': ('https://www.envoyproxy.io/docs/envoy/v1.5.0', None),
-    'v1.6': ('https://www.envoyproxy.io/docs/envoy/v1.6.0', None),
-    'v1.7': ('https://www.envoyproxy.io/docs/envoy/v1.7.1', None),
-    'v1.8': ('https://www.envoyproxy.io/docs/envoy/v1.8.0', None),
-    'v1.9': ('https://www.envoyproxy.io/docs/envoy/v1.9.1', None),
-    'v1.10': ('https://www.envoyproxy.io/docs/envoy/v1.10.0', None),
-    'v1.11': ('https://www.envoyproxy.io/docs/envoy/v1.11.2', None),
-    'v1.12': ('https://www.envoyproxy.io/docs/envoy/v1.12.6', None),
-    'v1.13': ('https://www.envoyproxy.io/docs/envoy/v1.13.3', None),
-    'v1.14': ('https://www.envoyproxy.io/docs/envoy/v1.14.7', None),
-    'v1.15': ('https://www.envoyproxy.io/docs/envoy/v1.15.5', None),
-    'v1.16': ('https://www.envoyproxy.io/docs/envoy/v1.16.5', None),
-    'v1.17': ('https://www.envoyproxy.io/docs/envoy/v1.17.4', None),
-    'v1.18': ('https://www.envoyproxy.io/docs/envoy/v1.18.4', None),
-    'v1.19': ('https://www.envoyproxy.io/docs/envoy/v1.19.1', None),
-}
+intersphinx_mapping = _config("intersphinx_mapping")
+
+pygments_style = "style.EnvoyCodeStyle"

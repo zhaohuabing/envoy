@@ -18,14 +18,12 @@ FaultManagerImpl::FaultImpl::FaultImpl(
   delay_ms_ = std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(base_fault, delay, 0));
 
   switch (base_fault.fault_type()) {
+    PANIC_ON_PROTO_ENUM_SENTINEL_VALUES;
   case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::RedisFault::DELAY:
     fault_type_ = FaultType::Delay;
     break;
   case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::RedisFault::ERROR:
     fault_type_ = FaultType::Error;
-    break;
-  default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
     break;
   }
 
@@ -131,7 +129,7 @@ const Fault* FaultManagerImpl::getFaultForCommandInternal(const std::string& com
 
 const Fault* FaultManagerImpl::getFaultForCommand(const std::string& command) const {
   if (!fault_map_.empty()) {
-    if (fault_map_.count(command) > 0) {
+    if (fault_map_.contains(command)) {
       return getFaultForCommandInternal(command);
     } else {
       return getFaultForCommandInternal(FaultManagerKeyNames::get().AllKey);

@@ -1,5 +1,6 @@
 #include "mocks.h"
 
+#include "absl/functional/any_invocable.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -20,6 +21,8 @@ MockDispatcher::MockDispatcher() : MockDispatcher("test_thread") {}
 
 MockDispatcher::MockDispatcher(const std::string& name) : name_(name) {
   time_system_ = std::make_unique<GlobalTimeSystem>();
+  auto thread_factory = &Api::createApiForTest()->threadFactory();
+  Envoy::Thread::ThreadId thread_id = thread_factory->currentThreadId();
   ON_CALL(*this, initializeStats(_, _)).WillByDefault(Return());
   ON_CALL(*this, clearDeferredDeleteList()).WillByDefault(Invoke([this]() -> void {
     to_delete_.clear();
@@ -28,14 +31,23 @@ MockDispatcher::MockDispatcher(const std::string& name) : name_(name) {
   ON_CALL(*this, createScaledTimer_(_, _)).WillByDefault(ReturnNew<NiceMock<Event::MockTimer>>());
   ON_CALL(*this, createScaledTypedTimer_(_, _))
       .WillByDefault(ReturnNew<NiceMock<Event::MockTimer>>());
-  ON_CALL(*this, post(_)).WillByDefault(Invoke([](PostCb cb) -> void { cb(); }));
+  ON_CALL(*this, post(_)).WillByDefault([thread_factory, thread_id](PostCb cb) -> void {
+    ASSERT(thread_factory->currentThreadId() == thread_id,
+           "MockDispatcher tried to execute a callback on a different thread - a test with threads "
+           "should probably use a dispatcher from Api::createApiForTest() instead.");
+    cb();
+  });
 
   ON_CALL(buffer_factory_, createBuffer_(_, _, _))
-      .WillByDefault(Invoke([](std::function<void()> below_low, std::function<void()> above_high,
-                               std::function<void()> above_overflow) -> Buffer::Instance* {
-        return new Buffer::WatermarkBuffer(below_low, above_high, above_overflow);
-      }));
-  ON_CALL(*this, isThreadSafe()).WillByDefault(Return(true));
+      .WillByDefault(
+          Invoke([](absl::AnyInvocable<void()> below_low, absl::AnyInvocable<void()> above_high,
+                    absl::AnyInvocable<void()> above_overflow) -> Buffer::Instance* {
+            return new Buffer::WatermarkBuffer(std::move(below_low), std::move(above_high),
+                                               std::move(above_overflow));
+          }));
+  ON_CALL(*this, isThreadSafe()).WillByDefault([thread_factory, thread_id]() {
+    return thread_factory->currentThreadId() == thread_id;
+  });
 }
 
 MockDispatcher::~MockDispatcher() = default;
@@ -70,13 +82,29 @@ MockTimer::~MockTimer() {
   }
 }
 
-MockSchedulableCallback::~MockSchedulableCallback() = default;
+MockSchedulableCallback::~MockSchedulableCallback() {
+  if (destroy_cb_) {
+    destroy_cb_->Call();
+  }
+}
 
-MockSchedulableCallback::MockSchedulableCallback(MockDispatcher* dispatcher)
-    : dispatcher_(dispatcher) {
+MockSchedulableCallback::MockSchedulableCallback(MockDispatcher* dispatcher,
+                                                 std::function<void()> callback,
+                                                 testing::MockFunction<void()>* destroy_cb)
+    : dispatcher_(dispatcher), callback_(callback), destroy_cb_(destroy_cb) {
+  ON_CALL(*this, scheduleCallbackCurrentIteration()).WillByDefault(Assign(&enabled_, true));
+  ON_CALL(*this, scheduleCallbackNextIteration()).WillByDefault(Assign(&enabled_, true));
+  ON_CALL(*this, cancel()).WillByDefault(Assign(&enabled_, false));
+  ON_CALL(*this, enabled()).WillByDefault(ReturnPointee(&enabled_));
+}
+
+MockSchedulableCallback::MockSchedulableCallback(MockDispatcher* dispatcher,
+                                                 testing::MockFunction<void()>* destroy_cb)
+    : dispatcher_(dispatcher), destroy_cb_(destroy_cb) {
   EXPECT_CALL(*dispatcher, createSchedulableCallback_(_))
       .WillOnce(DoAll(SaveArg<0>(&callback_), Return(this)))
       .RetiresOnSaturation();
+
   ON_CALL(*this, scheduleCallbackCurrentIteration()).WillByDefault(Assign(&enabled_, true));
   ON_CALL(*this, scheduleCallbackNextIteration()).WillByDefault(Assign(&enabled_, true));
   ON_CALL(*this, cancel()).WillByDefault(Assign(&enabled_, false));
@@ -90,6 +118,9 @@ MockSignalEvent::MockSignalEvent(MockDispatcher* dispatcher) {
 }
 
 MockSignalEvent::~MockSignalEvent() = default;
+
+MockEvwatchObserverManager::MockEvwatchObserverManager() = default;
+MockEvwatchObserverManager::~MockEvwatchObserverManager() = default;
 
 MockFileEvent::MockFileEvent() = default;
 MockFileEvent::~MockFileEvent() = default;

@@ -19,14 +19,15 @@
 #include "test/integration/clusters/cluster_factory_config.pb.validate.h"
 #include "test/integration/clusters/custom_static_cluster.h"
 #include "test/mocks/common.h"
-#include "test/mocks/local_info/mocks.h"
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/server/admin.h"
-#include "test/mocks/server/instance.h"
 #include "test/mocks/server/options.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/ssl/mocks.h"
+#include "test/test_common/registry.h"
+#include "test/test_common/status_utility.h"
 
+using ::Envoy::StatusHelpers::HasStatusMessage;
 using testing::NiceMock;
 
 namespace Envoy {
@@ -40,39 +41,30 @@ class TestStaticClusterFactory : public Event::TestUsingSimulatedTime,
 public:
   TestStaticClusterFactory() : ClusterFactoryImplBase("envoy.clusters.test_static") {}
 
-  std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr> createClusterImpl(
-      const envoy::config::cluster::v3::Cluster& cluster, ClusterFactoryContext& context,
-      Server::Configuration::TransportSocketFactoryContextImpl& socket_factory_context,
-      Stats::ScopePtr&& stats_scope) override {
-    return std::make_pair(std::make_shared<CustomStaticCluster>(
-                              cluster, context.runtime(), socket_factory_context,
-                              std::move(stats_scope), context.addedViaApi(), 1, "127.0.0.1", 80),
+  absl::StatusOr<std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>>
+  createClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
+                    ClusterFactoryContext& context) override {
+    absl::Status creation_status = absl::OkStatus();
+    return std::make_pair(std::make_shared<CustomStaticCluster>(cluster, context, 1, "127.0.0.1",
+                                                                80, creation_status),
                           nullptr);
   }
 };
 
 class ClusterFactoryTestBase {
 protected:
-  ClusterFactoryTestBase() : api_(Api::createApiForTest(stats_)) {
+  ClusterFactoryTestBase() {
     outlier_event_logger_ = std::make_shared<Outlier::MockEventLogger>();
     dns_resolver_ = std::make_shared<Network::MockDnsResolver>();
   }
 
-  NiceMock<Server::MockAdmin> admin_;
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context_;
   Ssl::MockContextManager ssl_context_manager_;
   NiceMock<MockClusterManager> cm_;
-  const NiceMock<LocalInfo::MockLocalInfo> local_info_;
-  NiceMock<Event::MockDispatcher> dispatcher_;
-  NiceMock<Runtime::MockLoader> runtime_;
-  Stats::TestUtil::TestStore stats_;
-  Singleton::ManagerImpl singleton_manager_{Thread::threadFactoryForTest()};
-  NiceMock<ThreadLocal::MockInstance> tls_;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
-  Api::ApiPtr api_;
   Network::DnsResolverSharedPtr dns_resolver_;
-  AccessLog::MockAccessLogManager log_manager_;
+  std::function<Network::DnsResolverSharedPtr()> dns_resolver_fn_ =
+      [this]() -> Network::DnsResolverSharedPtr { return this->dns_resolver_; };
   Outlier::EventLoggerSharedPtr outlier_event_logger_;
-  Server::MockOptions options_;
 };
 
 class TestStaticClusterImplTest : public testing::Test, public ClusterFactoryTestBase {};
@@ -99,11 +91,9 @@ TEST_F(TestStaticClusterImplTest, CreateWithoutConfig) {
 
   const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
   auto create_result = ClusterFactoryImplBase::create(
-      cluster_config, cm_, stats_, tls_, dns_resolver_, ssl_context_manager_, runtime_, dispatcher_,
-      log_manager_, local_info_, admin_, singleton_manager_, std::move(outlier_event_logger_),
-      false, validation_visitor_, *api_, options_);
-  auto cluster = create_result.first;
-  cluster->initialize([] {});
+      cluster_config, server_context_, dns_resolver_fn_, std::move(outlier_event_logger_), false);
+  auto cluster = create_result->first;
+  cluster->initialize([] { return absl::OkStatus(); });
 
   EXPECT_EQ(1UL, cluster->prioritySet().hostSetsPerPriority()[1]->healthyHosts().size());
   EXPECT_EQ("", cluster->prioritySet().hostSetsPerPriority()[1]->hosts()[0]->hostname());
@@ -144,11 +134,9 @@ TEST_F(TestStaticClusterImplTest, CreateWithStructConfig) {
 
   const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
   auto create_result = ClusterFactoryImplBase::create(
-      cluster_config, cm_, stats_, tls_, dns_resolver_, ssl_context_manager_, runtime_, dispatcher_,
-      log_manager_, local_info_, admin_, singleton_manager_, std::move(outlier_event_logger_),
-      false, validation_visitor_, *api_, options_);
-  auto cluster = create_result.first;
-  cluster->initialize([] {});
+      cluster_config, server_context_, dns_resolver_fn_, std::move(outlier_event_logger_), false);
+  auto cluster = create_result->first;
+  cluster->initialize([] { return absl::OkStatus(); });
 
   EXPECT_EQ(1UL, cluster->prioritySet().hostSetsPerPriority()[10]->healthyHosts().size());
   EXPECT_EQ("", cluster->prioritySet().hostSetsPerPriority()[10]->hosts()[0]->hostname());
@@ -179,7 +167,7 @@ TEST_F(TestStaticClusterImplTest, CreateWithTypedConfig) {
       cluster_type:
           name: envoy.clusters.custom_static
           typed_config:
-            "@type": type.googleapis.com/test.integration.clusters.CustomStaticConfig
+            "@type": type.googleapis.com/test.integration.clusters.CustomStaticConfig1
             priority: 10
             address: 127.0.0.1
             port_value: 80
@@ -187,11 +175,9 @@ TEST_F(TestStaticClusterImplTest, CreateWithTypedConfig) {
 
   const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
   auto create_result = ClusterFactoryImplBase::create(
-      cluster_config, cm_, stats_, tls_, dns_resolver_, ssl_context_manager_, runtime_, dispatcher_,
-      log_manager_, local_info_, admin_, singleton_manager_, std::move(outlier_event_logger_),
-      false, validation_visitor_, *api_, options_);
-  auto cluster = create_result.first;
-  cluster->initialize([] {});
+      cluster_config, server_context_, dns_resolver_fn_, std::move(outlier_event_logger_), false);
+  auto cluster = create_result->first;
+  cluster->initialize([] { return absl::OkStatus(); });
 
   EXPECT_EQ(1UL, cluster->prioritySet().hostSetsPerPriority()[10]->healthyHosts().size());
   EXPECT_EQ("", cluster->prioritySet().hostSetsPerPriority()[10]->hosts()[0]->hostname());
@@ -206,7 +192,7 @@ TEST_F(TestStaticClusterImplTest, CreateWithTypedConfig) {
   EXPECT_FALSE(cluster->info()->addedViaApi());
 }
 
-TEST_F(TestStaticClusterImplTest, UnsupportedClusterType) {
+TEST_F(TestStaticClusterImplTest, UnsupportedClusterName) {
   const std::string yaml = R"EOF(
     name: staticcluster
     connect_timeout: 0.25s
@@ -221,22 +207,41 @@ TEST_F(TestStaticClusterImplTest, UnsupportedClusterType) {
                     port_value: 443
     cluster_type:
         name: envoy.clusters.bad_cluster_name
-        typed_config:
-          "@type": type.googleapis.com/test.integration.clusters.CustomStaticConfig
-          priority: 10
   )EOF";
-  // the factory is not registered, expect to throw
-  EXPECT_THROW_WITH_MESSAGE(
-      {
-        const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
-        ClusterFactoryImplBase::create(
-            cluster_config, cm_, stats_, tls_, dns_resolver_, ssl_context_manager_, runtime_,
-            dispatcher_, log_manager_, local_info_, admin_, singleton_manager_,
-            std::move(outlier_event_logger_), false, validation_visitor_, *api_, options_);
-      },
-      EnvoyException,
-      "Didn't find a registered cluster factory implementation for name: "
-      "'envoy.clusters.bad_cluster_name'");
+  // the factory is not registered, expect to fail
+  const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
+  auto create_result = ClusterFactoryImplBase::create(
+      cluster_config, server_context_, dns_resolver_fn_, std::move(outlier_event_logger_), false);
+  EXPECT_THAT(create_result,
+              HasStatusMessage("Didn't find a registered cluster factory implementation for name: "
+                               "'envoy.clusters.bad_cluster_name'"));
+}
+
+TEST_F(TestStaticClusterImplTest, UnsupportedClusterType) {
+  std::string yaml = R"EOF(
+    name: staticcluster
+    connect_timeout: 0.25s
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+        endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 10.0.0.1
+                    port_value: 443
+    cluster_type:
+        name: envoy.clusters.logical_dns
+        typed_config:
+          "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  )EOF";
+  // the factory is not registered, expect to fail
+  const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
+  auto create_result = ClusterFactoryImplBase::create(
+      cluster_config, server_context_, dns_resolver_fn_, std::move(outlier_event_logger_), false);
+  EXPECT_THAT(create_result,
+              HasStatusMessage("Didn't find a registered cluster factory implementation for type: "
+                               "'envoy.config.cluster.v3.Cluster'"));
 }
 
 TEST_F(TestStaticClusterImplTest, HostnameWithoutDNS) {
@@ -256,20 +261,16 @@ TEST_F(TestStaticClusterImplTest, HostnameWithoutDNS) {
                     address: 10.0.0.1
                     port_value: 443
       cluster_type:
-        name: envoy.clusters.test_static
+        name: envoy.clusters.custom_static
     )EOF";
 
-  EXPECT_THROW_WITH_MESSAGE(
-      {
-        const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
-        ClusterFactoryImplBase::create(
-            cluster_config, cm_, stats_, tls_, dns_resolver_, ssl_context_manager_, runtime_,
-            dispatcher_, log_manager_, local_info_, admin_, singleton_manager_,
-            std::move(outlier_event_logger_), false, validation_visitor_, *api_, options_);
-      },
-      EnvoyException,
-      "Cannot use hostname for consistent hashing loadbalancing for cluster of type: "
-      "'envoy.clusters.test_static'");
+  const envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV3Yaml(yaml);
+  auto create_result = ClusterFactoryImplBase::create(
+      cluster_config, server_context_, dns_resolver_fn_, std::move(outlier_event_logger_), false);
+  EXPECT_THAT(create_result,
+              HasStatusMessage(
+                  "Cannot use hostname for consistent hashing loadbalancing for cluster of type: "
+                  "'envoy.clusters.custom_static'"));
 }
 
 } // namespace

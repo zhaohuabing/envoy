@@ -7,11 +7,11 @@
 #include "source/common/network/address_impl.h"
 #include "source/common/router/string_accessor_impl.h"
 #include "source/common/stream_info/uint32_accessor_impl.h"
+#include "source/common/stream_info/utility.h"
 #include "source/extensions/access_loggers/grpc/http_grpc_access_log_impl.h"
 
 #include "test/mocks/access_log/mocks.h"
-#include "test/mocks/grpc/mocks.h"
-#include "test/mocks/local_info/mocks.h"
+#include "test/mocks/common.h"
 #include "test/mocks/ssl/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
@@ -64,7 +64,7 @@ TEST(HttpGrpcAccessLog, TlsLifetimeCheck) {
                          common_config,
                      Common::GrpcAccessLoggerType type) {
           // This is a part of the actual getOrCreateLogger code path and shouldn't crash.
-          std::make_pair(MessageUtil::hash(common_config), type);
+          std::ignore = std::make_pair(MessageUtil::hash(common_config), type);
           return nullptr;
         });
     // Set tls callback in the HttpGrpcAccessLog constructor,
@@ -81,7 +81,7 @@ TEST(HttpGrpcAccessLog, TlsLifetimeCheck) {
 class HttpGrpcAccessLogTest : public testing::Test {
 public:
   void init() {
-    ON_CALL(*filter_, evaluate(_, _, _, _)).WillByDefault(Return(true));
+    ON_CALL(*filter_, evaluate(_, _)).WillByDefault(Return(true));
     config_.mutable_common_config()->set_log_name("hello_log");
     config_.mutable_common_config()->add_filter_state_objects_to_log("string_accessor");
     config_.mutable_common_config()->add_filter_state_objects_to_log("uint32_accessor");
@@ -101,6 +101,27 @@ public:
                                                       logger_cache_);
   }
 
+  void initWithCommandParsers(const std::vector<Formatter::CommandParserPtr>& command_parsers) {
+    ON_CALL(*filter_, evaluate(_, _)).WillByDefault(Return(true));
+    config_.mutable_common_config()->set_log_name("hello_log");
+    config_.mutable_common_config()->add_filter_state_objects_to_log("string_accessor");
+    config_.mutable_common_config()->add_filter_state_objects_to_log("uint32_accessor");
+    config_.mutable_common_config()->add_filter_state_objects_to_log("serialized");
+    config_.mutable_common_config()->set_transport_api_version(
+        envoy::config::core::v3::ApiVersion::V3);
+    EXPECT_CALL(*logger_cache_, getOrCreateLogger(_, _))
+        .WillOnce(
+            [this](const envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig&
+                       config,
+                   Common::GrpcAccessLoggerType logger_type) {
+              EXPECT_EQ(config.DebugString(), config_.common_config().DebugString());
+              EXPECT_EQ(Common::GrpcAccessLoggerType::HTTP, logger_type);
+              return logger_;
+            });
+    access_log_ = std::make_unique<HttpGrpcAccessLog>(AccessLog::FilterPtr{filter_}, config_, tls_,
+                                                      logger_cache_, command_parsers);
+  }
+
   void expectLog(const std::string& expected_log_entry_yaml) {
     if (access_log_ == nullptr) {
       init();
@@ -111,14 +132,16 @@ public:
     EXPECT_CALL(*logger_, log(An<HTTPAccessLogEntry&&>()))
         .WillOnce(
             Invoke([expected_log_entry](envoy::data::accesslog::v3::HTTPAccessLogEntry&& entry) {
+              entry.mutable_common_properties()->clear_duration();
               EXPECT_EQ(entry.DebugString(), expected_log_entry.DebugString());
             }));
   }
 
   void expectLogRequestMethod(const std::string& request_method) {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
     stream_info.start_time_ = SystemTime(1h);
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", request_method},
@@ -132,12 +155,17 @@ common_properties:
       port_value: 0
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  access_log_type: NotSet
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
 request:
@@ -146,7 +174,7 @@ request:
 response: {{}}
     )EOF",
                           request_method, request_method.length() + 7));
-    access_log_->log(&request_headers, nullptr, nullptr, stream_info);
+    access_log_->log({&request_headers}, stream_info);
   }
 
   Stats::IsolatedStoreImpl scope_;
@@ -158,13 +186,46 @@ response: {{}}
   HttpGrpcAccessLogPtr access_log_;
 };
 
+class TestCommandParser : public Formatter::CommandParser {
+public:
+  absl::StatusOr<Formatter::FormatterProviderPtr>
+  parse(absl::string_view command, absl::string_view, std::optional<size_t>) const override {
+    if (command == "TEST_CUSTOM_CMD") {
+      class TestProvider : public Formatter::FormatterProvider {
+      public:
+        std::optional<std::string> format(const Formatter::Context&,
+                                          const StreamInfo::StreamInfo&) const override {
+          return "custom_resolved_value";
+        }
+        Protobuf::Value formatValue(const Formatter::Context&,
+                                    const StreamInfo::StreamInfo&) const override {
+          Protobuf::Value val;
+          val.set_string_value("custom_resolved_value");
+          return val;
+        }
+        bool formatTo(std::string& sink, const Formatter::Context&,
+                      const StreamInfo::StreamInfo&) const override {
+          sink.append("custom_resolved_value");
+          return true;
+        }
+        void formatValueTo(Formatter::ValueSink& sink, const Formatter::Context&,
+                           const StreamInfo::StreamInfo&) const override {
+          sink.addString("custom_resolved_value");
+        }
+      };
+      return std::make_unique<TestProvider>();
+    }
+    return nullptr;
+  }
+};
+
 class TestSerializedFilterState : public StreamInfo::FilterState::Object {
 public:
   ProtobufTypes::MessagePtr serializeAsProto() const override {
-    auto any = std::make_unique<ProtobufWkt::Any>();
-    ProtobufWkt::Duration value;
+    auto any = std::make_unique<Protobuf::Any>();
+    Protobuf::Duration value;
     value.set_seconds(10);
-    any->PackFrom(value);
+    std::ignore = any->PackFrom(value);
     return any;
   }
 };
@@ -172,40 +233,49 @@ public:
 // Test HTTP log marshaling.
 TEST_F(HttpGrpcAccessLogTest, Marshalling) {
   InSequence s;
+  NiceMock<MockTimeSystem> time_system;
 
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
     stream_info.start_time_monotonic_ = MonotonicTime(1h);
-    stream_info.last_downstream_tx_byte_sent_ = 2ms;
+    EXPECT_CALL(time_system, monotonicTime)
+        .WillOnce(Return(MonotonicTime(std::chrono::hours(1) + std::chrono::milliseconds(2))));
+    stream_info.downstream_timing_.onLastDownstreamTxByteSent(time_system);
+    StreamInfo::TimingUtility timing(stream_info);
+    ASSERT(timing.lastDownstreamTxByteSent().has_value());
     stream_info.downstream_connection_info_provider_->setLocalAddress(
-        std::make_shared<Network::Address::PipeInstance>("/foo"));
-    (*stream_info.metadata_.mutable_filter_metadata())["foo"] = ProtobufWkt::Struct();
+        *Network::Address::PipeInstance::create("/foo"));
+    (*stream_info.metadata_.mutable_filter_metadata())["foo"] = Protobuf::Struct();
     stream_info.filter_state_->setData("string_accessor",
                                        std::make_unique<Router::StringAccessorImpl>("test_value"),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.filter_state_->setData("uint32_accessor",
                                        std::make_unique<StreamInfo::UInt32AccessorImpl>(42),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
     stream_info.filter_state_->setData("serialized", std::make_unique<TestSerializedFilterState>(),
-                                       StreamInfo::FilterState::StateType::ReadOnly,
                                        StreamInfo::FilterState::LifeSpan::FilterChain);
+    stream_info.onRequestComplete();
+
     expectLog(R"EOF(
 common_properties:
   downstream_remote_address:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     pipe:
       path: "/foo"
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   time_to_last_downstream_tx_byte:
@@ -226,14 +296,17 @@ common_properties:
 request: {}
 response: {}
 )EOF");
-    access_log_->log(nullptr, nullptr, nullptr, stream_info);
+    access_log_->log({}, stream_info);
   }
 
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
-    stream_info.last_downstream_tx_byte_sent_ = std::chrono::nanoseconds(2000000);
+    EXPECT_CALL(time_system, monotonicTime)
+        .WillOnce(Return(MonotonicTime(std::chrono::nanoseconds(2000000))));
+    stream_info.downstream_timing_.onLastDownstreamTxByteSent(time_system);
+    stream_info.onRequestComplete();
 
     expectLog(R"EOF(
 common_properties:
@@ -241,14 +314,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   time_to_last_downstream_tx_byte:
@@ -256,32 +334,45 @@ common_properties:
 request: {}
 response: {}
 )EOF");
-    access_log_->log(nullptr, nullptr, nullptr, stream_info);
+    access_log_->log({}, stream_info);
   }
 
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
     stream_info.start_time_ = SystemTime(1h);
 
-    stream_info.last_downstream_rx_byte_received_ = 2ms;
-    stream_info.first_upstream_tx_byte_sent_ = 4ms;
-    stream_info.last_upstream_tx_byte_sent_ = 6ms;
-    stream_info.first_upstream_rx_byte_received_ = 8ms;
-    stream_info.last_upstream_rx_byte_received_ = 10ms;
-    stream_info.first_downstream_tx_byte_sent_ = 12ms;
-    stream_info.last_downstream_tx_byte_sent_ = 14ms;
+    MockTimeSystem time_system;
+    EXPECT_CALL(time_system, monotonicTime)
+        .WillOnce(Return(MonotonicTime(std::chrono::milliseconds(2))));
+    stream_info.downstream_timing_.onLastDownstreamRxByteReceived(time_system);
+    stream_info.upstream_info_->upstreamTiming().first_upstream_tx_byte_sent_ =
+        MonotonicTime(std::chrono::milliseconds(4));
+    stream_info.upstream_info_->upstreamTiming().last_upstream_tx_byte_sent_ =
+        MonotonicTime(std::chrono::milliseconds(6));
+    stream_info.upstream_info_->upstreamTiming().first_upstream_rx_byte_received_ =
+        MonotonicTime(std::chrono::milliseconds(8));
+    stream_info.upstream_info_->upstreamTiming().last_upstream_rx_byte_received_ =
+        MonotonicTime(std::chrono::milliseconds(10));
+    EXPECT_CALL(time_system, monotonicTime)
+        .WillOnce(Return(MonotonicTime(std::chrono::milliseconds(12))));
+    stream_info.downstream_timing_.onFirstDownstreamTxByteSent(time_system);
+    EXPECT_CALL(time_system, monotonicTime)
+        .WillOnce(Return(MonotonicTime(std::chrono::milliseconds(14))));
+    stream_info.downstream_timing_.onLastDownstreamTxByteSent(time_system);
 
-    stream_info.setUpstreamLocalAddress(
+    stream_info.upstream_info_->setUpstreamLocalAddress(
         std::make_shared<Network::Address::Ipv4Instance>("10.0.0.2"));
     stream_info.protocol_ = Http::Protocol::Http10;
     stream_info.addBytesReceived(10);
     stream_info.addBytesSent(20);
-    stream_info.response_code_ = 200;
+    stream_info.setResponseCode(200);
     stream_info.response_code_details_ = "via_upstream";
-    absl::string_view route_name_view("route-name-test");
-    stream_info.setRouteName(route_name_view);
-    ON_CALL(stream_info, hasResponseFlag(StreamInfo::ResponseFlag::FaultInjected))
+    const std::string route_name("route-name-test");
+    ON_CALL(stream_info, getRouteName()).WillByDefault(ReturnRef(route_name));
+
+    ON_CALL(stream_info, hasResponseFlag(StreamInfo::CoreResponseFlag::FaultInjected))
         .WillByDefault(Return(true));
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":scheme", "scheme_value"},
@@ -302,14 +393,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   time_to_last_rx_byte:
@@ -358,14 +454,15 @@ response:
   response_body_bytes: 20
   response_code_details: "via_upstream"
 )EOF");
-    access_log_->log(&request_headers, &response_headers, nullptr, stream_info);
+    access_log_->log({&request_headers, &response_headers}, stream_info);
   }
 
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
-    stream_info.upstream_transport_failure_reason_ = "TLS error";
+    stream_info.upstream_info_->setUpstreamTransportFailureReason("TLS error");
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "WHACKADOO"},
@@ -377,14 +474,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   upstream_transport_failure_reason: "TLS error"
@@ -393,12 +495,12 @@ request:
   request_headers_bytes: 16
 response: {}
 )EOF");
-    access_log_->log(&request_headers, nullptr, nullptr, stream_info);
+    access_log_->log({&request_headers}, stream_info);
   }
 
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
 
     auto connection_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
@@ -408,6 +510,8 @@ response: {}
     ON_CALL(*connection_info, uriSanLocalCertificate()).WillByDefault(Return(localSans));
     const std::string peerSubject = "peerSubject";
     ON_CALL(*connection_info, subjectPeerCertificate()).WillByDefault(ReturnRef(peerSubject));
+    const std::string peerIssuer = "peerIssuer";
+    ON_CALL(*connection_info, issuerPeerCertificate()).WillByDefault(ReturnRef(peerIssuer));
     const std::string localSubject = "localSubject";
     ON_CALL(*connection_info, subjectLocalCertificate()).WillByDefault(ReturnRef(localSubject));
     const std::string sessionId =
@@ -418,6 +522,7 @@ response: {}
     ON_CALL(*connection_info, ciphersuiteId()).WillByDefault(Return(0x2CC0));
     stream_info.downstream_connection_info_provider_->setSslConnection(connection_info);
     stream_info.downstream_connection_info_provider_->setRequestedServerName("sni");
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "WHACKADOO"},
@@ -429,14 +534,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   tls_properties:
@@ -453,24 +563,26 @@ common_properties:
       - uri: peerSan1
       - uri: peerSan2
       subject: peerSubject
+      issuer: peerIssuer
     tls_session_id: D62A523A65695219D46FE1FFE285A4C371425ACE421B110B5B8D11D3EB4D5F0B
 request:
   request_method: "METHOD_UNSPECIFIED"
   request_headers_bytes: 16
 response: {}
 )EOF");
-    access_log_->log(&request_headers, nullptr, nullptr, stream_info);
+    access_log_->log({&request_headers}, stream_info);
   }
 
   // TLSv1.2
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
 
     auto connection_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
     const std::string empty;
     ON_CALL(*connection_info, subjectPeerCertificate()).WillByDefault(ReturnRef(empty));
+    ON_CALL(*connection_info, issuerPeerCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, subjectLocalCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, sessionId()).WillByDefault(ReturnRef(empty));
     const std::string tlsVersion = "TLSv1.2";
@@ -478,6 +590,7 @@ response: {}
     ON_CALL(*connection_info, ciphersuiteId()).WillByDefault(Return(0x2F));
     stream_info.downstream_connection_info_provider_->setSslConnection(connection_info);
     stream_info.downstream_connection_info_provider_->setRequestedServerName("sni");
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "WHACKADOO"},
@@ -489,14 +602,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   tls_properties:
@@ -509,18 +627,19 @@ request:
   request_method: "METHOD_UNSPECIFIED"
 response: {}
 )EOF");
-    access_log_->log(nullptr, nullptr, nullptr, stream_info);
+    access_log_->log({}, stream_info);
   }
 
   // TLSv1.1
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
 
     auto connection_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
     const std::string empty;
     ON_CALL(*connection_info, subjectPeerCertificate()).WillByDefault(ReturnRef(empty));
+    ON_CALL(*connection_info, issuerPeerCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, subjectLocalCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, sessionId()).WillByDefault(ReturnRef(empty));
     const std::string tlsVersion = "TLSv1.1";
@@ -528,6 +647,7 @@ response: {}
     ON_CALL(*connection_info, ciphersuiteId()).WillByDefault(Return(0x2F));
     stream_info.downstream_connection_info_provider_->setSslConnection(connection_info);
     stream_info.downstream_connection_info_provider_->setRequestedServerName("sni");
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "WHACKADOO"},
@@ -539,14 +659,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   tls_properties:
@@ -559,18 +684,19 @@ request:
   request_method: "METHOD_UNSPECIFIED"
 response: {}
 )EOF");
-    access_log_->log(nullptr, nullptr, nullptr, stream_info);
+    access_log_->log({}, stream_info);
   }
 
   // TLSv1
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
 
     auto connection_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
     const std::string empty;
     ON_CALL(*connection_info, subjectPeerCertificate()).WillByDefault(ReturnRef(empty));
+    ON_CALL(*connection_info, issuerPeerCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, subjectLocalCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, sessionId()).WillByDefault(ReturnRef(empty));
     const std::string tlsVersion = "TLSv1";
@@ -578,6 +704,7 @@ response: {}
     ON_CALL(*connection_info, ciphersuiteId()).WillByDefault(Return(0x2F));
     stream_info.downstream_connection_info_provider_->setSslConnection(connection_info);
     stream_info.downstream_connection_info_provider_->setRequestedServerName("sni");
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "WHACKADOO"},
@@ -589,14 +716,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   tls_properties:
@@ -609,18 +741,19 @@ request:
   request_method: "METHOD_UNSPECIFIED"
 response: {}
 )EOF");
-    access_log_->log(nullptr, nullptr, nullptr, stream_info);
+    access_log_->log({}, stream_info);
   }
 
   // Unknown TLS version (TLSv1.4)
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
 
     auto connection_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
     const std::string empty;
     ON_CALL(*connection_info, subjectPeerCertificate()).WillByDefault(ReturnRef(empty));
+    ON_CALL(*connection_info, issuerPeerCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, subjectLocalCertificate()).WillByDefault(ReturnRef(empty));
     ON_CALL(*connection_info, sessionId()).WillByDefault(ReturnRef(empty));
     const std::string tlsVersion = "TLSv1.4";
@@ -628,6 +761,7 @@ response: {}
     ON_CALL(*connection_info, ciphersuiteId()).WillByDefault(Return(0x2F));
     stream_info.downstream_connection_info_provider_->setSslConnection(connection_info);
     stream_info.downstream_connection_info_provider_->setRequestedServerName("sni");
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":method", "WHACKADOO"},
@@ -639,14 +773,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
   tls_properties:
@@ -659,7 +798,72 @@ request:
   request_method: "METHOD_UNSPECIFIED"
 response: {}
 )EOF");
-    access_log_->log(nullptr, nullptr, nullptr, stream_info);
+    access_log_->log({}, stream_info);
+  }
+
+  // Intermediate log entry.
+  {
+    NiceMock<StreamInfo::MockStreamInfo> stream_info;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
+    stream_info.start_time_ = SystemTime(1h);
+    stream_info.start_time_monotonic_ = MonotonicTime(1h);
+    EXPECT_CALL(time_system, monotonicTime)
+        .WillOnce(Return(MonotonicTime(std::chrono::hours(1) + std::chrono::milliseconds(2))));
+    stream_info.downstream_timing_.onLastDownstreamTxByteSent(time_system);
+    StreamInfo::TimingUtility timing(stream_info);
+    ASSERT(timing.lastDownstreamTxByteSent().has_value());
+    stream_info.downstream_connection_info_provider_->setLocalAddress(
+        *Network::Address::PipeInstance::create("/foo"));
+    (*stream_info.metadata_.mutable_filter_metadata())["foo"] = Protobuf::Struct();
+    stream_info.filter_state_->setData("string_accessor",
+                                       std::make_unique<Router::StringAccessorImpl>("test_value"),
+                                       StreamInfo::FilterState::LifeSpan::FilterChain);
+    stream_info.filter_state_->setData("uint32_accessor",
+                                       std::make_unique<StreamInfo::UInt32AccessorImpl>(42),
+                                       StreamInfo::FilterState::LifeSpan::FilterChain);
+    stream_info.filter_state_->setData("serialized", std::make_unique<TestSerializedFilterState>(),
+                                       StreamInfo::FilterState::LifeSpan::FilterChain);
+
+    expectLog(R"EOF(
+common_properties:
+  intermediate_log_entry: true
+  downstream_remote_address:
+    socket_address:
+      address: "127.0.0.1"
+      port_value: 0
+  access_log_type: NotSet
+  downstream_direct_remote_address:
+    socket_address:
+      address: "127.0.0.3"
+      port_value: 63443
+  downstream_local_address:
+    pipe:
+      path: "/foo"
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
+  start_time:
+    seconds: 3600
+  time_to_last_downstream_tx_byte:
+    nanos: 2000000
+  metadata:
+    filter_metadata:
+      foo: {}
+  filter_state_objects:
+    string_accessor:
+      "@type": type.googleapis.com/google.protobuf.StringValue
+      value: test_value
+    uint32_accessor:
+      "@type": type.googleapis.com/google.protobuf.UInt32Value
+      value: 42
+    serialized:
+      "@type": type.googleapis.com/google.protobuf.Duration
+      value: 10s
+request: {}
+response: {}
+)EOF");
+    access_log_->log({}, stream_info);
   }
 }
 
@@ -685,8 +889,9 @@ TEST_F(HttpGrpcAccessLogTest, MarshallingAdditionalHeaders) {
 
   {
     NiceMock<StreamInfo::MockStreamInfo> stream_info;
-    stream_info.host_ = nullptr;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
     stream_info.start_time_ = SystemTime(1h);
+    stream_info.onRequestComplete();
 
     Http::TestRequestHeaderMapImpl request_headers{
         {":scheme", "scheme_value"},
@@ -695,17 +900,20 @@ TEST_F(HttpGrpcAccessLogTest, MarshallingAdditionalHeaders) {
         {":method", "POST"},
         {"x-envoy-max-retries", "3"}, // test inline header not otherwise logged
         {"x-custom-request", "custom_value"},
+        {"x-custom-request", "custome_value_second"},
         {"x-custom-empty", ""},
     };
     Http::TestResponseHeaderMapImpl response_headers{
         {":status", "200"},
         {"x-envoy-immediate-health-check-fail", "true"}, // test inline header not otherwise logged
         {"x-custom-response", "custom_value"},
+        {"x-custom-response", "custome_response_value"},
         {"x-custom-empty", ""},
     };
 
     Http::TestResponseTrailerMapImpl response_trailers{
         {"x-logged-trailer", "value"},
+        {"x-logged-trailer", "response_trailer_value"},
         {"x-empty-trailer", ""},
         {"x-unlogged-trailer", "2"},
     };
@@ -716,14 +924,19 @@ common_properties:
     socket_address:
       address: "127.0.0.1"
       port_value: 0
+  access_log_type: NotSet
   downstream_direct_remote_address:
     socket_address:
-      address: "127.0.0.1"
-      port_value: 0
+      address: "127.0.0.3"
+      port_value: 63443
   downstream_local_address:
     socket_address:
       address: "127.0.0.2"
       port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
   start_time:
     seconds: 3600
 request:
@@ -731,22 +944,105 @@ request:
   authority: "authority_value"
   path: "path_value"
   request_method: "POST"
-  request_headers_bytes: 132
+  request_headers_bytes: 168
   request_headers:
-    "x-custom-request": "custom_value"
+    "x-custom-request": "custom_value,custome_value_second"
     "x-custom-empty": ""
     "x-envoy-max-retries": "3"
 response:
-  response_headers_bytes: 92
+  response_headers_bytes: 131
   response_headers:
-    "x-custom-response": "custom_value"
+    "x-custom-response": "custom_value,custome_response_value"
     "x-custom-empty": ""
     "x-envoy-immediate-health-check-fail": "true"
   response_trailers:
-    "x-logged-trailer": "value"
+    "x-logged-trailer": "value,response_trailer_value"
     "x-empty-trailer": ""
 )EOF");
-    access_log_->log(&request_headers, &response_headers, &response_trailers, stream_info);
+    access_log_->log({&request_headers, &response_headers, &response_trailers}, stream_info);
+  }
+}
+
+// Test sanitizing non-UTF-8 header values.
+TEST_F(HttpGrpcAccessLogTest, SanitizeUTF8) {
+  InSequence s;
+
+  config_.add_additional_request_headers_to_log("X-Request");
+  config_.add_additional_response_headers_to_log("X-Response");
+  config_.add_additional_response_trailers_to_log("X-Trailer");
+
+  init();
+
+  {
+    NiceMock<StreamInfo::MockStreamInfo> stream_info;
+    stream_info.upstreamInfo()->setUpstreamHost(nullptr);
+    stream_info.start_time_ = SystemTime(1h);
+    std::string non_utf8("prefix");
+    non_utf8.append(1, char(0xc3));
+    non_utf8.append(1, char(0xc7));
+    non_utf8.append("suffix");
+
+    Http::TestRequestHeaderMapImpl request_headers{
+        {":scheme", "scheme_value"},
+        {":authority", "authority_value"},
+        {":path", non_utf8},
+        {":method", "POST"},
+        {"x-envoy-max-retries", "3"}, // test inline header not
+                                      // otherwise logged
+        {"x-request", non_utf8},
+        {"x-request", non_utf8},
+    };
+    Http::TestResponseHeaderMapImpl response_headers{
+        {":status", "200"},
+        {"x-envoy-immediate-health-check-fail", "true"}, // test inline header not otherwise logged
+        {"x-response", non_utf8},
+        {"x-response", non_utf8},
+    };
+
+    Http::TestResponseTrailerMapImpl response_trailers{
+        {"x-trailer", non_utf8},
+        {"x-trailer", non_utf8},
+    };
+
+    stream_info.onRequestComplete();
+    expectLog(fmt::format(R"EOF(
+common_properties:
+  downstream_remote_address:
+    socket_address:
+      address: "127.0.0.1"
+      port_value: 0
+  access_log_type: NotSet
+  downstream_direct_remote_address:
+    socket_address:
+      address: "127.0.0.3"
+      port_value: 63443
+  downstream_local_address:
+    socket_address:
+      address: "127.0.0.2"
+      port_value: 0
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
+  start_time:
+    seconds: 3600
+request:
+  scheme: "scheme_value"
+  authority: "authority_value"
+  path: "{0}"
+  request_method: "POST"
+  request_headers_bytes: 140
+  request_headers:
+    "x-request": "{0},{0}"
+response:
+  response_headers_bytes: 97
+  response_headers:
+    "x-response": "{0},{0}"
+  response_trailers:
+    "x-trailer": "{0},{0}"
+)EOF",
+                          "prefix!!suffix"));
+    access_log_->log({&request_headers, &response_headers, &response_trailers}, stream_info);
   }
 }
 
@@ -761,6 +1057,220 @@ TEST_F(HttpGrpcAccessLogTest, LogWithRequestMethod) {
   expectLogRequestMethod("OPTIONS");
   expectLogRequestMethod("TRACE");
   expectLogRequestMethod("PATCH");
+}
+
+TEST_F(HttpGrpcAccessLogTest, CustomTagTestLiteral) {
+  envoy::type::tracing::v3::CustomTag tag;
+  const auto tag_yaml = R"EOF(
+tag: ltag
+literal:
+  value: lvalue
+  )EOF";
+  TestUtility::loadFromYaml(tag_yaml, tag);
+  *config_.mutable_common_config()->add_custom_tags() = tag;
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  stream_info.start_time_ = SystemTime(1h);
+  stream_info.onRequestComplete();
+
+  expectLog(R"EOF(
+common_properties:
+  downstream_remote_address:
+    socket_address:
+      address: "127.0.0.1"
+      port_value: 0
+  access_log_type: NotSet
+  downstream_local_address:
+    socket_address:
+      address: "127.0.0.2"
+      port_value: 0
+  downstream_direct_remote_address:
+    socket_address:
+      address: "127.0.0.3"
+      port_value: 63443
+  upstream_remote_address:
+    socket_address:
+      address: "10.0.0.1"
+      port_value: 443
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
+  upstream_cluster: "fake_cluster"
+  start_time:
+    seconds: 3600
+  custom_tags:
+    ltag: lvalue
+request: {}
+response: {}
+)EOF");
+  access_log_->log({}, stream_info);
+}
+
+TEST_F(HttpGrpcAccessLogTest, CustomTagTestMetadata) {
+  envoy::type::tracing::v3::CustomTag tag;
+  const auto tag_yaml = R"EOF(
+tag: mtag
+metadata:
+  kind: { host: {} }
+  metadata_key:
+    key: foo
+    path:
+    - key: bar
+  )EOF";
+  TestUtility::loadFromYaml(tag_yaml, tag);
+  *config_.mutable_common_config()->add_custom_tags() = tag;
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  stream_info.start_time_ = SystemTime(1h);
+  std::shared_ptr<NiceMock<Envoy::Upstream::MockHostDescription>> host(
+      new NiceMock<Envoy::Upstream::MockHostDescription>());
+  auto metadata = std::make_shared<envoy::config::core::v3::Metadata>();
+  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, Protobuf::Struct>(
+      "foo", MessageUtil::keyValueStruct("bar", "baz")));
+  ON_CALL(*host, metadata()).WillByDefault(Return(metadata));
+  stream_info.upstreamInfo()->setUpstreamHost(host);
+  stream_info.onRequestComplete();
+
+  expectLog(R"EOF(
+common_properties:
+  downstream_remote_address:
+    socket_address:
+      address: "127.0.0.1"
+      port_value: 0
+  access_log_type: NotSet
+  upstream_remote_address:
+    socket_address:
+      address: "10.0.0.1"
+      port_value: 443
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
+  upstream_cluster: fake_cluster
+  downstream_local_address:
+    socket_address:
+      address: "127.0.0.2"
+      port_value: 0
+  downstream_direct_remote_address:
+    socket_address:
+      address: "127.0.0.3"
+      port_value: 63443
+  start_time:
+    seconds: 3600
+  custom_tags:
+    mtag: baz
+request: {}
+response: {}
+)EOF");
+  access_log_->log({}, stream_info);
+}
+
+TEST_F(HttpGrpcAccessLogTest, CustomTagTestFormatterWithCommandParser) {
+  envoy::type::tracing::v3::CustomTag tag;
+  const auto tag_yaml = R"EOF(
+tag: custom_cmd_tag
+value: "%TEST_CUSTOM_CMD%"
+  )EOF";
+  TestUtility::loadFromYaml(tag_yaml, tag);
+  *config_.mutable_common_config()->add_custom_tags() = tag;
+
+  std::vector<Formatter::CommandParserPtr> command_parsers;
+  command_parsers.push_back(std::make_unique<TestCommandParser>());
+  initWithCommandParsers(command_parsers);
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  stream_info.start_time_ = SystemTime(1h);
+  stream_info.onRequestComplete();
+
+  expectLog(R"EOF(
+common_properties:
+  downstream_remote_address:
+    socket_address:
+      address: "127.0.0.1"
+      port_value: 0
+  access_log_type: NotSet
+  upstream_remote_address:
+    socket_address:
+      address: "10.0.0.1"
+      port_value: 443
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
+  upstream_cluster: "fake_cluster"
+  downstream_local_address:
+    socket_address:
+      address: "127.0.0.2"
+      port_value: 0
+  downstream_direct_remote_address:
+    socket_address:
+      address: "127.0.0.3"
+      port_value: 63443
+  start_time:
+    seconds: 3600
+  custom_tags:
+    custom_cmd_tag: custom_resolved_value
+request: {}
+response: {}
+)EOF");
+  access_log_->log({}, stream_info);
+}
+
+TEST_F(HttpGrpcAccessLogTest, CustomTagTestMetadataDefaultValue) {
+  envoy::type::tracing::v3::CustomTag tag;
+  const auto tag_yaml = R"EOF(
+tag: mtag
+metadata:
+  kind: { host: {} }
+  metadata_key:
+    key: foo
+    path:
+    - key: baz
+  default_value: piyo
+  )EOF";
+  TestUtility::loadFromYaml(tag_yaml, tag);
+  *config_.mutable_common_config()->add_custom_tags() = tag;
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  stream_info.start_time_ = SystemTime(1h);
+  std::shared_ptr<NiceMock<Envoy::Upstream::MockHostDescription>> host(
+      new NiceMock<Envoy::Upstream::MockHostDescription>());
+  stream_info.upstreamInfo()->setUpstreamHost(host);
+  stream_info.onRequestComplete();
+
+  expectLog(R"EOF(
+common_properties:
+  downstream_remote_address:
+    socket_address:
+      address: "127.0.0.1"
+      port_value: 0
+  access_log_type: NotSet
+  upstream_remote_address:
+    socket_address:
+      address: "10.0.0.1"
+      port_value: 443
+  upstream_local_address:
+    socket_address:
+      address: "127.1.2.3"
+      port_value: 58443
+  upstream_cluster: fake_cluster
+  downstream_local_address:
+    socket_address:
+      address: "127.0.0.2"
+      port_value: 0
+  downstream_direct_remote_address:
+    socket_address:
+      address: "127.0.0.3"
+      port_value: 63443
+  start_time:
+    seconds: 3600
+  custom_tags:
+    mtag: piyo
+request: {}
+response: {}
+)EOF");
+  access_log_->log({}, stream_info);
 }
 
 } // namespace

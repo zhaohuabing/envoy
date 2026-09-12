@@ -24,8 +24,8 @@ bool ConsumerGroupMember::expired() const {
          connection_manager_->config().transientObjectLifeSpan().count();
 }
 
-ConnectionManager::ConnectionManager(Config& config, TimeSource& time_source)
-    : config_(config), time_source_(time_source), stats_(config.stats()) {}
+ConnectionManager::ConnectionManager(const ConfigSharedPtr& config, TimeSource& time_source)
+    : config_(config), time_source_(time_source), stats_(config_->stats()) {}
 
 Envoy::Network::FilterStatus ConnectionManager::onData(Envoy::Buffer::Instance& data,
                                                        bool end_stream) {
@@ -137,7 +137,7 @@ void ConnectionManager::purgeDirectiveTable() {
   for (auto it = ack_directive_table_.begin(); it != ack_directive_table_.end();) {
     auto duration = current - it->second.creation_time_;
     if (std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() >
-        config_.transientObjectLifeSpan().count()) {
+        config_->transientObjectLifeSpan().count()) {
       ack_directive_table_.erase(it++);
     } else {
       it++;
@@ -168,7 +168,7 @@ void ConnectionManager::onHeartbeat(RemotingCommandPtr request) {
 
   purgeDirectiveTable();
 
-  ProtobufWkt::Struct body_struct;
+  Protobuf::Struct body_struct;
   try {
     MessageUtil::loadFromJson(body, body_struct);
   } catch (std::exception& e) {
@@ -198,7 +198,7 @@ void ConnectionManager::onHeartbeat(RemotingCommandPtr request) {
 void ConnectionManager::addOrUpdateGroupMember(absl::string_view group,
                                                absl::string_view client_id) {
   ENVOY_LOG(trace, "#addOrUpdateGroupMember. Group: {}, client ID: {}", group, client_id);
-  auto search = group_members_.find(std::string(group.data(), group.length()));
+  auto search = group_members_.find(group);
   if (search == group_members_.end()) {
     std::vector<ConsumerGroupMember> members;
     members.emplace_back(ConsumerGroupMember(client_id, *this));
@@ -294,14 +294,14 @@ void ConnectionManager::onGetConsumerListByGroup(RemotingCommandPtr request) {
     ENVOY_LOG(warn, "There is no consumer belongs to consumer_group: {}",
               requestExtHeader->consumerGroup());
   }
-  ProtobufWkt::Struct body_struct;
+  Protobuf::Struct body_struct;
 
   getConsumerListByGroupResponseBody.encode(body_struct);
 
   RemotingCommandPtr response = std::make_unique<RemotingCommand>(
       enumToSignedInt(ResponseCode::Success), request->version(), request->opaque());
   response->markAsResponse();
-  std::string json = MessageUtil::getJsonStringFromMessageOrDie(body_struct);
+  std::string json = MessageUtil::getJsonStringFromMessageOrError(body_struct);
   response->body().add(json);
   ENVOY_LOG(trace, "GetConsumerListByGroup respond with body: {}", json);
 

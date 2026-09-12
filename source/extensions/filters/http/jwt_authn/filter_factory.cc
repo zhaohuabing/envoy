@@ -5,13 +5,10 @@
 #include "envoy/registry/registry.h"
 
 #include "source/common/config/datasource.h"
+#include "source/common/jwt/jwks.h"
 #include "source/extensions/filters/http/jwt_authn/filter.h"
 
-#include "jwt_verify_lib/jwks.h"
-
 using envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication;
-using ::google::jwt_verify::Jwks;
-using ::google::jwt_verify::Status;
 
 namespace Envoy {
 namespace Extensions {
@@ -19,38 +16,46 @@ namespace HttpFilters {
 namespace JwtAuthn {
 namespace {
 
+using JwtVerify::Jwks;
+using JwtVerify::Status;
+
 /**
  * Validate inline jwks, make sure they are the valid
  */
-void validateJwtConfig(const JwtAuthentication& proto_config, Api::Api& api) {
-  for (const auto& it : proto_config.providers()) {
-    const auto& provider = it.second;
-    const auto inline_jwks = Config::DataSource::read(provider.local_jwks(), true, api);
+absl::Status validateJwtConfig(const JwtAuthentication& proto_config, Api::Api& api) {
+  for (const auto& [name, provider] : proto_config.providers()) {
+    auto inline_jwks_or = Config::DataSource::read(provider.local_jwks(), true, api);
+    RETURN_IF_NOT_OK_REF(inline_jwks_or.status());
+    const auto& inline_jwks = inline_jwks_or.value();
     if (!inline_jwks.empty()) {
       auto jwks_obj = Jwks::createFrom(inline_jwks, Jwks::JWKS);
       if (jwks_obj->getStatus() != Status::Ok) {
-        throw EnvoyException(
-            fmt::format("Provider '{}' in jwt_authn config has invalid local jwks: {}", it.first,
-                        ::google::jwt_verify::getStatusString(jwks_obj->getStatus())));
+        return absl::InvalidArgumentError(
+            fmt::format("Provider '{}' in jwt_authn config has invalid local jwks: {}", name,
+                        JwtVerify::getStatusString(jwks_obj->getStatus())));
       }
     }
   }
+  return absl::OkStatus();
 }
 
 } // namespace
 
-Http::FilterFactoryCb
-FilterFactory::createFilterFactoryFromProtoTyped(const JwtAuthentication& proto_config,
-                                                 const std::string& prefix,
-                                                 Server::Configuration::FactoryContext& context) {
-  validateJwtConfig(proto_config, context.api());
-  auto filter_config = std::make_shared<FilterConfigImpl>(proto_config, prefix, context);
+absl::StatusOr<Http::FilterFactoryCb> FilterFactory::createHttpFilterFactoryFromProtoTyped(
+    const JwtAuthentication& proto_config, Server::Configuration::ServerFactoryContext& context,
+    Server::Configuration::ExtraFactoryContext& extra_context) {
+  RETURN_IF_NOT_OK(validateJwtConfig(proto_config, context.api()));
+  absl::Status creation_status = absl::OkStatus();
+  auto filter_config = std::make_shared<FilterConfigImpl>(
+      proto_config, extra_context.stats_prefix, context, extra_context.scopeOr(context),
+      extra_context.init_manager, creation_status);
+  RETURN_IF_NOT_OK_REF(creation_status);
   return [filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamDecoderFilter(std::make_shared<Filter>(filter_config));
   };
 }
 
-Envoy::Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 FilterFactory::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::jwt_authn::v3::PerRouteConfig& per_route,
     Envoy::Server::Configuration::ServerFactoryContext&,

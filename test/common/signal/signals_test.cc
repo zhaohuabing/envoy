@@ -8,13 +8,18 @@
 #include "source/common/signal/fatal_error_handler.h"
 #include "source/common/signal/signal_action.h"
 
-#include "test/common/stats/stat_test_utility.h"
+#include "test/common/memory/memory_test_utility.h"
+#include "test/test_common/thread_factory_for_test.h"
 #include "test/test_common/utility.h"
 
 namespace Envoy {
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define ASANITIZED /* Sanitized by Clang */
+#endif
+
+#if __has_feature(memory_sanitizer)
+#define MSANITIZED /* Sanitized by Clang */
 #endif
 #endif
 
@@ -71,7 +76,7 @@ public:
 // The sanitizer does its own special signal handling and prints messages that are
 // not ours instead of what this test expects. As of latest Clang this appears
 // to include abort() as well.
-#ifndef ASANITIZED
+#if !defined(ASANITIZED) && !defined(MSANITIZED)
 TEST(SignalsDeathTest, InvalidAddressDeathTest) {
   SignalAction actions;
   EXPECT_DEATH(
@@ -199,7 +204,9 @@ TEST(SignalsDeathTest, IllegalStackAccessDeathTest) {
 
 TEST(Signals, LegalTest) {
   // Don't do anything wrong.
-  { SignalAction actions; }
+  {
+    SignalAction actions;
+  }
   // Nothing should happen...
 }
 
@@ -245,7 +252,7 @@ TEST(FatalErrorHandler, CallHandler) {
 // handlers must be signal-safe and a mock might allocate memory.
 class MemoryCheckingFatalErrorHandler : public FatalErrorHandlerInterface {
 public:
-  MemoryCheckingFatalErrorHandler(const Stats::TestUtil::MemoryTest& memory_test,
+  MemoryCheckingFatalErrorHandler(const Memory::TestUtil::MemoryTest& memory_test,
                                   uint64_t& allocated_after_call)
       : memory_test_(memory_test), allocated_after_call_(allocated_after_call) {}
   void onFatalError(std::ostream& os) const override {
@@ -257,7 +264,7 @@ public:
                                       /*actions*/) const override {}
 
 private:
-  const Stats::TestUtil::MemoryTest& memory_test_;
+  const Memory::TestUtil::MemoryTest& memory_test_;
   uint64_t& allocated_after_call_;
 };
 
@@ -270,7 +277,7 @@ TEST(FatalErrorHandler, DontAllocateMemory) {
   s.reserve(1024);
   std::ostringstream os(std::move(s));
 
-  Stats::TestUtil::MemoryTest memory_test;
+  Memory::TestUtil::MemoryTest memory_test;
 
   uint64_t allocated_after_call;
   MemoryCheckingFatalErrorHandler handler(memory_test, allocated_after_call);

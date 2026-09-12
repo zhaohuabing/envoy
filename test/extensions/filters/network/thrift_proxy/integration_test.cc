@@ -10,6 +10,7 @@
 #include "gtest/gtest.h"
 
 using testing::Combine;
+using testing::Ge;
 using testing::HasSubstr;
 using ::testing::TestParamInfo;
 using testing::Values;
@@ -47,7 +48,6 @@ public:
                     - name: "x-header-2"
                       string_match:
                         safe_regex:
-                          google_re2: {}
                           regex: "0.[5-9]"
                     - name: "x-header-3"
                       range_match:
@@ -75,7 +75,7 @@ public:
   void initializeCall(DriverMode mode) {
     std::tie(transport_, protocol_, multiplexed_, std::ignore) = GetParam();
 
-    absl::optional<std::string> service_name;
+    std::optional<std::string> service_name;
     if (multiplexed_) {
       service_name = "svcname";
     }
@@ -99,7 +99,7 @@ public:
   void initializeOneway() {
     std::tie(transport_, protocol_, multiplexed_, std::ignore) = GetParam();
 
-    absl::optional<std::string> service_name;
+    std::optional<std::string> service_name;
     if (multiplexed_) {
       service_name = "svcname";
     }
@@ -257,6 +257,7 @@ TEST_P(ThriftConnManagerIntegrationTest, Success) {
 }
 
 TEST_P(ThriftConnManagerIntegrationTest, IDLException) {
+  DISABLE_UNDER_WINDOWS; // https://github.com/envoyproxy/envoy/issues/21017
   initializeCall(DriverMode::IDLException);
 
   IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
@@ -304,6 +305,7 @@ TEST_P(ThriftConnManagerIntegrationTest, IDLException) {
 }
 
 TEST_P(ThriftConnManagerIntegrationTest, Exception) {
+  DISABLE_UNDER_WINDOWS; // https://github.com/envoyproxy/envoy/issues/21017
   initializeCall(DriverMode::Exception);
 
   IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
@@ -352,7 +354,7 @@ TEST_P(ThriftConnManagerIntegrationTest, EarlyClose) {
   FakeRawConnectionPtr fake_upstream_connection;
   ASSERT_TRUE(expected_upstream->waitForRawConnection(fake_upstream_connection));
 
-  test_server_->waitForCounterGe("thrift.thrift_stats.cx_destroy_remote_with_active_rq", 1);
+  test_server_->waitForCounter("thrift.thrift_stats.cx_destroy_remote_with_active_rq", Ge(1));
 
   Stats::CounterSharedPtr counter =
       test_server_->counter("thrift.thrift_stats.cx_destroy_remote_with_active_rq");
@@ -376,7 +378,7 @@ TEST_P(ThriftConnManagerIntegrationTest, EarlyCloseWithUpstream) {
 
   tcp_client->close();
 
-  test_server_->waitForCounterGe("thrift.thrift_stats.cx_destroy_remote_with_active_rq", 1);
+  test_server_->waitForCounter("thrift.thrift_stats.cx_destroy_remote_with_active_rq", Ge(1));
 
   Stats::CounterSharedPtr counter =
       test_server_->counter("thrift.thrift_stats.cx_destroy_remote_with_active_rq");
@@ -473,91 +475,52 @@ TEST_P(ThriftConnManagerIntegrationTest, OnewayEarlyClosePartialRequest) {
   FakeRawConnectionPtr fake_upstream_connection;
   ASSERT_TRUE(expected_upstream->waitForRawConnection(fake_upstream_connection));
 
-  test_server_->waitForCounterGe("thrift.thrift_stats.cx_destroy_remote_with_active_rq", 1);
+  test_server_->waitForCounter("thrift.thrift_stats.cx_destroy_remote_with_active_rq", Ge(1));
 
   Stats::CounterSharedPtr counter =
       test_server_->counter("thrift.thrift_stats.cx_destroy_remote_with_active_rq");
   EXPECT_EQ(1U, counter->value());
 }
 
-class ThriftTwitterConnManagerIntegrationTest : public ThriftConnManagerIntegrationTest {};
+TEST_P(ThriftConnManagerIntegrationTest, NegativeVarIntCrashRepro) {
+  // Only relevant for Header transport
+  if (std::get<0>(GetParam()) != TransportType::Header) {
+    return;
+  }
 
-INSTANTIATE_TEST_SUITE_P(FramedTwitter, ThriftTwitterConnManagerIntegrationTest,
-                         Combine(Values(TransportType::Framed), Values(ProtocolType::Twitter),
-                                 Values(false, true), Values(false, true)),
-                         paramToString);
+  initializeCommon();
 
-// Because of the protocol upgrade requests and the difficulty of separating them, we test this
-// protocol independently.
-TEST_P(ThriftTwitterConnManagerIntegrationTest, Success) {
-// This test relies on an old Apache Thrift Python package
-// that is only available in Python2. Disabling the test on Windows.
-#ifndef WIN32
-  initializeCall(DriverMode::Success);
+  Buffer::OwnedImpl buffer;
+  buffer.writeBEInt<int32_t>(100);    // frame size
+  buffer.writeBEInt<int16_t>(0x0FFF); // magic
+  buffer.writeBEInt<int16_t>(0);      // flags
+  buffer.writeBEInt<int32_t>(1);      // sequence number
+  buffer.writeBEInt<int16_t>(10);     // header size / 4 (header_size = 40)
 
-  uint32_t upgrade_request_size = request_bytes_.peekBEInt<uint32_t>() + 4;
-  Buffer::OwnedImpl upgrade_request_bytes;
-  upgrade_request_bytes.move(request_bytes_, upgrade_request_size);
+  // Header data
+  buffer.writeByte(0); // Protocol ID (Binary) - varint 0
+  buffer.writeByte(0); // Num transforms - varint 0
+  buffer.writeByte(1); // Info ID (1) - varint 1
+  buffer.writeByte(1); // Header Count (1) - varint 1
 
-  uint32_t upgrade_response_size = response_bytes_.peekBEInt<uint32_t>() + 4;
-  Buffer::OwnedImpl upgrade_response_bytes;
-  upgrade_response_bytes.move(response_bytes_, upgrade_response_size);
+  // Key length: -1 (encoded as varint 0xFF 0xFF 0xFF 0xFF 0x0F)
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0x0F);
 
-  // Upgrade request/response happens without an upstream.
+  for (int i = 0; i < 80; i++) {
+    buffer.writeByte(0);
+  }
+
   IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
-  ASSERT_TRUE(tcp_client->write(upgrade_request_bytes.toString()));
-  tcp_client->waitForData(upgrade_response_bytes.toString());
-  EXPECT_TRUE(
-      TestUtility::buffersEqual(Buffer::OwnedImpl(tcp_client->data()), upgrade_response_bytes));
+  EXPECT_TRUE(tcp_client->write(buffer.toString(), false, false));
 
-  // First real request triggers upstream connection.
-  ASSERT_TRUE(tcp_client->write(request_bytes_.toString()));
-  FakeRawConnectionPtr fake_upstream_connection;
-  FakeUpstream* expected_upstream = getExpectedUpstream(false);
-  ASSERT_TRUE(expected_upstream->waitForRawConnection(fake_upstream_connection));
+  // The connection should be closed because of the exception in decodeFrameStart
+  tcp_client->waitForDisconnect();
 
-  // Check that upstream receives the upgrade request
-  std::string upgrade_data;
-  ASSERT_TRUE(fake_upstream_connection->waitForData(upgrade_request_size, &upgrade_data));
-  Buffer::OwnedImpl upstream_upgrade_request(upgrade_data);
-  EXPECT_EQ(upgrade_request_bytes.toString(), upstream_upgrade_request.toString());
-
-  // Respond with successful upgrade reply.
-  ASSERT_TRUE(fake_upstream_connection->write(upgrade_response_bytes.toString()));
-
-  // Check that upstream receives the real request.
-  // TODO(zuercher): fix FakeRawConnection to allow data to be reset so we don't have to account
-  // for the upgrade message that we already checked.
-  std::string data;
-  ASSERT_TRUE(
-      fake_upstream_connection->waitForData(upgrade_request_size + request_bytes_.length(), &data));
-  Buffer::OwnedImpl upstream_request(data.substr(upgrade_request_size));
-  EXPECT_EQ(request_bytes_.toString(), upstream_request.toString());
-
-  // Respond to request.
-  ASSERT_TRUE(fake_upstream_connection->write(response_bytes_.toString()));
-
-  // TODO(zuercher): likewise fix IntegrationTcpClient to allow data to be reset so we don't have
-  // to account for the upgrade response we already checked.
-  tcp_client->waitForData(response_bytes_.toString(), false);
-  tcp_client->close();
-
-  EXPECT_TRUE(TestUtility::buffersEqual(
-      Buffer::OwnedImpl(tcp_client->data().substr(upgrade_response_size)), response_bytes_));
-
-  // 2 requests on downstream but the first is an upgrade, so only one on upstream side
-  Stats::CounterSharedPtr counter = test_server_->counter("thrift.thrift_stats.request_call");
-  EXPECT_EQ(2U, counter->value());
-  int upstream_idx = getExpectedUpstreamIdx(false);
-  counter = test_server_->counter(
-      fmt::format("cluster.cluster_{}.thrift.upstream_rq_call", upstream_idx));
-  EXPECT_EQ(1U, counter->value());
-  counter = test_server_->counter("thrift.thrift_stats.response_success");
-  EXPECT_EQ(2U, counter->value());
-  counter = test_server_->counter(
-      fmt::format("cluster.cluster_{}.thrift.upstream_resp_success", upstream_idx));
-  EXPECT_EQ(1U, counter->value());
-#endif
+  test_server_->waitForCounter("thrift.thrift_stats.request_decoding_error", Ge(1));
 }
 
 } // namespace ThriftProxy

@@ -10,12 +10,56 @@
 #include "source/exe/process_wide.h"
 #include "source/server/backtrace.h"
 
-#include "test/common/runtime/utility.h"
 #include "test/mocks/access_log/mocks.h"
 #include "test/test_common/environment.h"
+#include "test/test_common/logging.h"
 #include "test/test_listener.h"
 
+#include "absl/debugging/leak_check.h"
 #include "gmock/gmock.h"
+
+#ifdef ENVOY_SSL_OPENSSL
+
+// Configure OpenSSL to use security level 0, allowing legacy TLS versions (1.0/1.1)
+// and weaker keys (e.g., RSA 1024-bit) so that Envoy's own validation can handle
+// rejections with specific error messages rather than OpenSSL blocking them first.
+class OpenSSLConf {
+public:
+  OpenSSLConf(const char* config) {
+    int fd = mkstemp(path_.data());
+    if (fd != -1) {
+      FILE* file = fdopen(fd, "w");
+      if (file) {
+        if (fwrite(config, 1, strlen(config), file) == strlen(config)) {
+          fclose(file);
+          if (setenv("OPENSSL_CONF", path_.c_str(), 1) == 0) {
+            return;
+          }
+        }
+      }
+    }
+    throw std::runtime_error("Failed to set up OPENSSL_CONF");
+  }
+
+  ~OpenSSLConf() { unlink(path_.c_str()); }
+
+private:
+  std::string path_{"/tmp/openssl.conf.XXXXXX"};
+};
+
+static OpenSSLConf openssl_conf(R"(
+  openssl_conf = openssl_init
+
+  [openssl_init]
+  ssl_conf = ssl_sect
+
+  [ssl_sect]
+  system_default = system_default_sect
+
+  [system_default_sect]
+  CipherString = DEFAULT:@SECLEVEL=0
+)");
+#endif
 
 namespace Envoy {
 
@@ -46,49 +90,53 @@ public:
       : runtime_override_(runtime_override), disable_(disable) {}
 
   // On each test start, edit RuntimeFeaturesDefaults with our custom runtime defaults.
+  // The defaults will be restored by TestListener::OnTestEnd.
   void OnTestStart(const ::testing::TestInfo&) override {
     if (!runtime_override_.empty()) {
-      bool reset = disable_ ? Runtime::RuntimeFeaturesPeer::disableFeature(runtime_override_)
-                            : Runtime::RuntimeFeaturesPeer::enableFeature(runtime_override_);
-      if (!reset) {
-        // If the entry was already in the hash map, don't remove it OnTestEnd.
+      bool old_value = Runtime::runtimeFeatureEnabled(runtime_override_);
+      if (disable_ != old_value) {
+        // If the entry was already in the hash map, don't invert it OnTestEnd.
         runtime_override_.clear();
+      } else {
+        Runtime::maybeSetRuntimeGuard(runtime_override_, !disable_);
       }
     }
   }
 
-  // As each test ends, clean up the RuntimeFeaturesDefaults state.
-  void OnTestEnd(const ::testing::TestInfo&) override {
-    if (!runtime_override_.empty()) {
-      disable_ ? Runtime::RuntimeFeaturesPeer::enableFeature(runtime_override_)
-               : Runtime::RuntimeFeaturesPeer::disableFeature(runtime_override_);
-    }
-  }
   std::string runtime_override_;
   // This marks whether the runtime feature was enabled by default and needs to be overridden to
   // false.
   bool disable_;
 };
 
+bool isDeathTestChild(int argc, char** argv) {
+  for (int i = 0; i < argc; ++i) {
+    if (absl::StartsWith(argv[i], "--gtest_internal_run_death_test")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
-int TestRunner::RunTests(int argc, char** argv) {
-  Thread::TestThread test_thread;
-
+int TestRunner::runTests(int argc, char** argv) {
+  const bool is_death_test_child = isDeathTestChild(argc, argv);
   ::testing::InitGoogleMock(&argc, argv);
   // We hold on to process_wide to provide RAII cleanup of process-wide
   // state.
-  ProcessWide process_wide;
+  ProcessWide process_wide(false);
+
+  // Use the recommended, but not default, "threadsafe" style for the Death Tests.
+  // See: https://github.com/google/googletest/commit/84ec2e0365d791e4ebc7ec249f09078fb5ab6caa
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+
   // Add a test-listener so we can call a hook where we can do a quiescence
   // check after each method. See
   // https://github.com/google/googletest/blob/master/googletest/docs/advanced.md
   // for details.
   ::testing::TestEventListeners& listeners = ::testing::UnitTest::GetInstance()->listeners();
   listeners.Append(new TestListener);
-
-  // Use the recommended, but not default, "threadsafe" style for the Death Tests.
-  // See: https://github.com/google/googletest/commit/84ec2e0365d791e4ebc7ec249f09078fb5ab6caa
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
 
   // Set gtest properties
   // (https://github.com/google/googletest/blob/master/googletest/docs/advanced.md#logging-additional-information),
@@ -148,13 +196,22 @@ int TestRunner::RunTests(int argc, char** argv) {
   std::unique_ptr<Logger::FileSinkDelegate> file_logger;
 
   // Redirect all logs to fake file when --log-path arg is specified in command line.
-  if (!TestEnvironment::getOptions().logPath().empty()) {
-    file_logger = std::make_unique<Logger::FileSinkDelegate>(
+  // However do not redirect to file from death test children as the parent typically
+  // looks for specific output in stderr
+  if (!TestEnvironment::getOptions().logPath().empty() && !is_death_test_child) {
+    file_logger = *Logger::FileSinkDelegate::create(
         TestEnvironment::getOptions().logPath(), access_log_manager, Logger::Registry::getSink());
   }
 
   // Reset all ENVOY_BUG counters.
   Envoy::Assert::resetEnvoyBugCountersForTest();
+
+  // Initialize log recording sink.
+  LogRecordingSink* recorder;
+  if (std::getenv("ENVOY_NO_LOG_SINK") == nullptr) {
+    recorder = absl::IgnoreLeak(new LogRecordingSink(Logger::Registry::getSink()));
+    Logger::Registry::getSink()->recorder_test_only_ = recorder;
+  }
 
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
   // Fuzz tests may run Envoy tests in fuzzing mode to generate corpora. In this case, we do not

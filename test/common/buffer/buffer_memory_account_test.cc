@@ -7,6 +7,7 @@
 
 #include "test/integration/tracked_watermark_buffer.h"
 #include "test/mocks/http/stream_reset_handler.h"
+#include "test/test_common/logging.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -311,6 +312,27 @@ TEST_F(BufferMemoryAccountTest, ExtractingSliceWithExistingStorageCreditsAccount
   buffer_account->clearDownstream();
 }
 
+TEST_F(BufferMemoryAccountTest, ExtractingImmutableSliceCreditsAccountOnSliceDestruction) {
+  auto buffer_account = factory_.createAccount(mock_reset_handler_);
+  Buffer::OwnedImpl buffer(buffer_account);
+  ASSERT_EQ(getBalance(buffer_account), 0);
+
+  buffer.appendSliceForTest("Slice 1");
+  buffer.appendSliceForTest("Slice 2");
+  EXPECT_EQ(getBalance(buffer_account), 8192);
+
+  // Unlike extractMutableFrontSlice(), the charge stays attached to the extracted
+  // slice and the account is credited only when the slice is destroyed.
+  {
+    auto slice = buffer.extractImmutableFrontSlice();
+    EXPECT_EQ(getBalance(buffer_account), 8192);
+  }
+
+  EXPECT_EQ(getBalance(buffer_account), 4096);
+
+  buffer_account->clearDownstream();
+}
+
 TEST_F(BufferMemoryAccountTest, NewReservationSlicesOnlyChargedAfterCommit) {
   auto buffer_account = factory_.createAccount(mock_reset_handler_);
   Buffer::OwnedImpl buffer(buffer_account);
@@ -526,7 +548,10 @@ TEST(WatermarkBufferFactoryTest, ShouldOnlyResetAllStreamsGreatThanOrEqualToProv
 
   EXPECT_CALL(stream_that_should_not_be_reset, resetStream(_)).Times(0);
   // Should call resetStream on all streams in bucket >= 1.
-  EXPECT_EQ(factory.resetAccountsGivenPressure(0.85), 2);
+  EXPECT_LOG_CONTAINS("warn", "resetting 2 streams in 2 buckets, 5 empty buckets",
+                      EXPECT_EQ(factory.resetAccountsGivenPressure(0.85), 2));
+  EXPECT_LOG_NOT_CONTAINS("warn", "resetting",
+                          EXPECT_EQ(factory.resetAccountsGivenPressure(0.85), 0));
 
   account_to_not_reset->credit(kMinimumBalanceToTrack);
   account_to_not_reset->clearDownstream();

@@ -15,18 +15,18 @@ namespace Extensions {
 namespace HttpFilters {
 namespace BufferFilter {
 
-Http::FilterFactoryCb BufferFilterFactory::createFilterFactoryFromProtoTyped(
-    const envoy::extensions::filters::http::buffer::v3::Buffer& proto_config, const std::string&,
-    Server::Configuration::FactoryContext&) {
+absl::StatusOr<Envoy::Http::FilterFactoryCb>
+BufferFilterFactory::createHttpFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::http::buffer::v3::Buffer& proto_config,
+    Server::Configuration::ServerFactoryContext&, Server::Configuration::ExtraFactoryContext&) {
   ASSERT(proto_config.has_max_request_bytes());
-
   BufferFilterConfigSharedPtr filter_config(new BufferFilterConfig(proto_config));
   return [filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamDecoderFilter(std::make_shared<BufferFilter>(filter_config));
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 BufferFilterFactory::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::buffer::v3::BufferPerRoute& proto_config,
     Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
@@ -36,8 +36,10 @@ BufferFilterFactory::createRouteSpecificFilterConfigTyped(
 /**
  * Static registration for the buffer filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(BufferFilterFactory,
-                 Server::Configuration::NamedHttpFilterConfigFactory){"envoy.buffer"};
+LEGACY_REGISTER_FACTORY(BufferFilterFactory, Server::Configuration::NamedHttpFilterConfigFactory,
+                        "envoy.buffer");
+LEGACY_REGISTER_FACTORY(UpstreamBufferFilterFactory,
+                        Server::Configuration::UpstreamHttpFilterConfigFactory, "envoy.buffer");
 
 } // namespace BufferFilter
 } // namespace HttpFilters

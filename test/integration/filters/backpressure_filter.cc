@@ -7,11 +7,13 @@
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/extensions/filters/http/common/empty_http_filter_config.h"
+#include "test/integration/filters/test_filters.pb.h"
 
 namespace Envoy {
 
-// A filter that buffers the entire request/response, then doubles
-// the content of the filter buffer.
+// A filter triggers above watermark when it receives request headers from
+// the downstream, and triggers below watermark when the response body has
+// passed through the filter or when the filter is being destroyed.
 class BackpressureFilter : public Http::PassThroughFilter {
 public:
   void onDestroy() override {
@@ -37,19 +39,22 @@ private:
   bool below_write_buffer_low_watermark_called_{false};
 };
 
-class BackpressureConfig : public Extensions::HttpFilters::Common::EmptyHttpFilterConfig {
+class BackpressureConfig : public Extensions::HttpFilters::Common::UniqueEmptyHttpFilterConfig<
+                               test::integration::filters::BackpressureFilterConfig> {
 public:
-  BackpressureConfig() : EmptyHttpFilterConfig("backpressure-filter") {}
+  BackpressureConfig()
+      : UniqueEmptyHttpFilterConfig<test::integration::filters::BackpressureFilterConfig>(
+            "backpressure-filter") {}
 
-  Http::FilterFactoryCb createFilter(const std::string&,
-                                     Server::Configuration::FactoryContext&) override {
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilter(const std::string&, Server::Configuration::FactoryContext&) override {
     return [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       callbacks.addStreamFilter(std::make_shared<::Envoy::BackpressureFilter>());
     };
   }
 };
 
-// perform static registration
+// Perform static registration
 static Registry::RegisterFactory<BackpressureConfig,
                                  Server::Configuration::NamedHttpFilterConfigFactory>
     register_;

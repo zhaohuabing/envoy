@@ -2,15 +2,47 @@
 
 #include <iterator>
 #include <memory>
+#include <optional>
+#include <type_traits>
+#include <utility>
+
+#include "envoy/event/dispatcher.h"
 
 #include "source/common/common/assert.h"
-#include "source/common/quic/envoy_quic_proof_source.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/scope_tracker.h"
+#include "source/common/http/session_idle_list_interface.h"
+#include "source/common/quic/envoy_quic_connection_debug_visitor_factory_interface.h"
+#include "source/common/quic/envoy_quic_server_connection.h"
 #include "source/common/quic/envoy_quic_server_stream.h"
+#include "source/common/quic/quic_filter_manager_connection_impl.h"
+#include "source/common/quic/quic_server_transport_socket_factory.h"
+#include "source/common/runtime/runtime_features.h"
 
-#include "quic_filter_manager_connection_impl.h"
+#include "quiche/quic/core/quic_config.h"
+#include "quiche/quic/core/quic_error_codes.h"
+#include "quiche/quic/core/quic_stream.h"
+#include "quiche/quic/core/quic_types.h"
+#include "quiche/quic/core/quic_versions.h"
 
 namespace Envoy {
 namespace Quic {
+
+namespace {
+class EnvoyQuicConnectionContextListener : public quic::QuicConnectionContextListener {
+public:
+  EnvoyQuicConnectionContextListener(const ScopeTrackedObject* object, Event::ScopeTracker& tracker)
+      : object_(object), tracker_(tracker) {}
+
+private:
+  void Activate() override { state_.emplace(object_, tracker_); }
+  void Deactivate() override { state_.reset(); }
+
+  const ScopeTrackedObject* object_;
+  Event::ScopeTracker& tracker_;
+  std::optional<ScopeTrackerScopeState> state_;
+};
+} // namespace
 
 EnvoyQuicServerSession::EnvoyQuicServerSession(
     const quic::QuicConfig& config, const quic::ParsedQuicVersionVector& supported_versions,
@@ -18,20 +50,53 @@ EnvoyQuicServerSession::EnvoyQuicServerSession(
     quic::QuicCryptoServerStream::Helper* helper, const quic::QuicCryptoServerConfig* crypto_config,
     quic::QuicCompressedCertsCache* compressed_certs_cache, Event::Dispatcher& dispatcher,
     uint32_t send_buffer_limit, QuicStatNames& quic_stat_names, Stats::Scope& listener_scope,
-    EnvoyQuicCryptoServerStreamFactoryInterface& crypto_server_stream_factory)
+    EnvoyQuicCryptoServerStreamFactoryInterface& crypto_server_stream_factory,
+    std::unique_ptr<StreamInfo::StreamInfo>&& stream_info, QuicConnectionStats& connection_stats,
+    EnvoyQuicConnectionDebugVisitorFactoryInterfaceOptRef debug_visitor_factory,
+    Http::SessionIdleListInterface* session_idle_list)
     : quic::QuicServerSessionBase(config, supported_versions, connection.get(), visitor, helper,
                                   crypto_config, compressed_certs_cache),
       QuicFilterManagerConnectionImpl(*connection, connection->connection_id(), dispatcher,
-                                      send_buffer_limit),
-      quic_connection_(std::move(connection)), quic_stat_names_(quic_stat_names),
-      listener_scope_(listener_scope), crypto_server_stream_factory_(crypto_server_stream_factory) {
-  quic_ssl_info_ = std::make_shared<QuicSslConnectionInfo>(*this);
+                                      send_buffer_limit,
+                                      std::make_shared<QuicSslConnectionInfo>(*this),
+                                      std::move(stream_info), quic_stat_names, listener_scope),
+      quic_connection_(std::move(connection)),
+      crypto_server_stream_factory_(crypto_server_stream_factory),
+      connection_stats_(connection_stats), session_idle_list_(session_idle_list) {
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+  http_datagram_support_ = quic::HttpDatagramSupport::kRfc;
+#endif
+  // If a factory is available, create a debug visitor and attach it to the connection.
+  if (debug_visitor_factory.has_value()) {
+    debug_visitor_ =
+        debug_visitor_factory->createQuicConnectionDebugVisitor(dispatcher, *this, streamInfo());
+    quic_connection_->set_debug_visitor(debug_visitor_.get());
+  }
+  quic_connection_->set_context_listener(
+      std::make_unique<EnvoyQuicConnectionContextListener>(this, dispatcher));
 }
 
 EnvoyQuicServerSession::~EnvoyQuicServerSession() {
   ASSERT(!quic_connection_->connected());
+  // Session is destroyed, remove from idle list.
+  MaybeRemoveSessionFromIdleList();
   QuicFilterManagerConnectionImpl::network_connection_ = nullptr;
 }
+
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+quic::WebTransportHttp3VersionSet
+EnvoyQuicServerSession::LocallySupportedWebTransportVersions() const {
+  if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.quic_support_web_transport")) {
+    return {};
+  }
+  if (!http3_options_.has_value() || !http3_options_->allow_extended_connect()) {
+    // WebTransport requires extended CONNECT, so only advertise it when extended CONNECT is
+    // enabled.
+    return {};
+  }
+  return quic::kDefaultSupportedWebTransportVersions;
+}
+#endif
 
 absl::string_view EnvoyQuicServerSession::requestedServerName() const {
   return {GetCryptoStream()->crypto_negotiated_params().sni};
@@ -65,23 +130,24 @@ quic::QuicSpdyStream* EnvoyQuicServerSession::CreateIncomingStream(quic::QuicStr
   if (aboveHighWatermark()) {
     stream->runHighWatermarkCallbacks();
   }
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+  // On a WebTransport-capable session an incoming bidirectional stream may turn out to be a
+  // WebTransport data stream (first frame WEBTRANSPORT_STREAM) rather than an HTTP request. Defer
+  // setting up the request decoder until real request headers arrive
+  // (EnvoyQuicServerStream::OnInitialHeadersComplete); data streams never reach there and so never
+  // become HCM streams, which would otherwise dangle during connection teardown. Non-WebTransport
+  // sessions keep the original eager behavior.
+  if (SupportsWebTransport()) {
+    return stream;
+  }
+#endif
   setUpRequestDecoder(*stream);
   return stream;
 }
 
-quic::QuicSpdyStream*
-EnvoyQuicServerSession::CreateIncomingStream(quic::PendingStream* /*pending*/) {
-  // Only client side server push stream should trigger this call.
-  NOT_REACHED_GCOVR_EXCL_LINE;
-}
-
 quic::QuicSpdyStream* EnvoyQuicServerSession::CreateOutgoingBidirectionalStream() {
-  // Disallow server initiated stream.
-  NOT_REACHED_GCOVR_EXCL_LINE;
-}
-
-quic::QuicSpdyStream* EnvoyQuicServerSession::CreateOutgoingUnidirectionalStream() {
-  NOT_REACHED_GCOVR_EXCL_LINE;
+  IS_ENVOY_BUG("Unexpected disallowed server initiated stream");
+  return nullptr;
 }
 
 void EnvoyQuicServerSession::setUpRequestDecoder(EnvoyQuicServerStream& stream) {
@@ -93,6 +159,10 @@ void EnvoyQuicServerSession::setUpRequestDecoder(EnvoyQuicServerStream& stream) 
 void EnvoyQuicServerSession::OnConnectionClosed(const quic::QuicConnectionCloseFrame& frame,
                                                 quic::ConnectionCloseSource source) {
   quic::QuicServerSessionBase::OnConnectionClosed(frame, source);
+  MaybeRemoveSessionFromIdleList();
+  if (source == quic::ConnectionCloseSource::FROM_SELF) {
+    setLocalCloseReason(frame.error_details);
+  }
   onConnectionCloseEvent(frame, source, version());
   if (position_.has_value()) {
     // Remove this connection from the map.
@@ -105,19 +175,28 @@ void EnvoyQuicServerSession::OnConnectionClosed(const quic::QuicConnectionCloseF
     }
     position_.reset();
   }
+  on_connection_closed_called_ = true;
 }
 
 void EnvoyQuicServerSession::Initialize() {
+  if (Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.quic_enable_reset_ssl_after_handshake")) {
+    enable_reset_ssl_after_handshake();
+  }
   quic::QuicServerSessionBase::Initialize();
+
   initialized_ = true;
-  quic_connection_->setEnvoyConnection(*this);
+  MaybeAddSessionToIdleList();
+  quic_connection_->setEnvoyConnection(*this, *this);
 }
 
 void EnvoyQuicServerSession::OnCanWrite() {
+  uint64_t old_bytes_to_send = bytesToSend();
   quic::QuicServerSessionBase::OnCanWrite();
-  // Do not update delay close state according to connection level packet egress because that is
+  // Do not update delay close timer according to connection level packet egress because that is
   // equivalent to TCP transport layer egress. But only do so if the session gets chance to write.
-  maybeApplyDelayClosePolicy();
+  const bool has_sent_any_data = bytesToSend() != old_bytes_to_send;
+  maybeUpdateDelayCloseTimer(has_sent_any_data);
 }
 
 bool EnvoyQuicServerSession::hasDataToWrite() { return HasDataToWrite(); }
@@ -132,21 +211,25 @@ quic::QuicConnection* EnvoyQuicServerSession::quicConnection() {
 
 void EnvoyQuicServerSession::OnTlsHandshakeComplete() {
   quic::QuicServerSessionBase::OnTlsHandshakeComplete();
+  // The client certificate is already validated by `EnvoyTlsServerHandshaker` before this hook
+  // runs. Surface the validated state to downstream consumers, but only when the matched chain
+  // sets `requiresClientCertificate()`, so a certificate presented to a chain that does not
+  // require one is not marked as validated.
+  if (position_.has_value() && quic_ssl_info_->peerCertificatePresented()) {
+    const auto& transport_socket_factory = dynamic_cast<const QuicServerTransportSocketFactory&>(
+        position_->filter_chain_.transportSocketFactory());
+    if (transport_socket_factory.requiresClientCertificate()) {
+      quic_ssl_info_->onCertValidated();
+    }
+  }
+  streamInfo().downstreamTiming().onDownstreamHandshakeComplete(dispatcher_.timeSource());
   raiseConnectionEvent(Network::ConnectionEvent::Connected);
-}
-
-void EnvoyQuicServerSession::MaybeSendRstStreamFrame(quic::QuicStreamId id,
-                                                     quic::QuicResetStreamError error,
-                                                     quic::QuicStreamOffset bytes_written) {
-  QuicServerSessionBase::MaybeSendRstStreamFrame(id, error, bytes_written);
-  quic_stat_names_.chargeQuicResetStreamErrorStats(listener_scope_, error, /*from_self*/ true,
-                                                   /*is_upstream*/ false);
 }
 
 void EnvoyQuicServerSession::OnRstStream(const quic::QuicRstStreamFrame& frame) {
   QuicServerSessionBase::OnRstStream(frame);
-  quic_stat_names_.chargeQuicResetStreamErrorStats(listener_scope_, frame.error(),
-                                                   /*from_self*/ false, /*is_upstream*/ false);
+  incrementSentQuicResetStreamErrorStats(frame.error(),
+                                         /*from_self*/ false, /*is_upstream*/ false);
 }
 
 void EnvoyQuicServerSession::setHttp3Options(
@@ -159,14 +242,28 @@ void EnvoyQuicServerSession::setHttp3Options(
     const uint64_t max_interval =
         PROTOBUF_GET_MS_OR_DEFAULT(http3_options_->quic_protocol_options().connection_keepalive(),
                                    max_interval, quic::kPingTimeoutSecs);
-    if (max_interval == 0) {
-      return;
+    if (max_interval != 0) {
+      if (initial_interval > 0) {
+        connection()->set_keep_alive_ping_timeout(
+            quic::QuicTime::Delta::FromMilliseconds(max_interval));
+        connection()->set_initial_retransmittable_on_wire_timeout(
+            quic::QuicTime::Delta::FromMilliseconds(initial_interval));
+      }
     }
-    if (initial_interval > 0) {
-      connection()->set_ping_timeout(quic::QuicTime::Delta::FromMilliseconds(max_interval));
-      connection()->set_initial_retransmittable_on_wire_timeout(
-          quic::QuicTime::Delta::FromMilliseconds(initial_interval));
+  }
+  if (http3_options.has_quic_protocol_options()) {
+    const uint64_t memory_reduction_timeout_ms = PROTOBUF_GET_MS_OR_DEFAULT(
+        http3_options.quic_protocol_options(), memory_reduction_timeout, 0);
+    if (memory_reduction_timeout_ms > 0) {
+      connection()->SetMemoryReductionTimeout(
+          quic::QuicTime::Delta::FromMilliseconds(memory_reduction_timeout_ms));
     }
+  }
+  set_allow_extended_connect(http3_options_->allow_extended_connect());
+  if (http3_options_->disable_qpack()) {
+    DisableHuffmanEncoding();
+    DisableCookieCrumbling();
+    set_qpack_maximum_dynamic_table_capacity(0);
   }
 }
 
@@ -174,6 +271,133 @@ void EnvoyQuicServerSession::storeConnectionMapPosition(FilterChainToConnectionM
                                                         const Network::FilterChain& filter_chain,
                                                         ConnectionMapIter position) {
   position_.emplace(connection_map, filter_chain, position);
+}
+
+quic::QuicSSLConfig EnvoyQuicServerSession::GetSSLConfig() const {
+  quic::QuicSSLConfig config = quic::QuicServerSessionBase::GetSSLConfig();
+  if (position_.has_value()) {
+    const auto& transport_socket_factory = dynamic_cast<const QuicServerTransportSocketFactory&>(
+        position_->filter_chain_.transportSocketFactory());
+    config.client_cert_mode = transport_socket_factory.requiresClientCertificate()
+                                  ? quic::ClientCertMode::kRequire
+                                  : quic::ClientCertMode::kNone;
+    // 0-RTT is disabled when a client certificate is required because early data is replayable and
+    // would bypass client certificate validation.
+    config.early_data_enabled = transport_socket_factory.earlyDataEnabled() &&
+                                config.client_cert_mode == quic::ClientCertMode::kNone;
+    config.disable_ticket_support = !transport_socket_factory.resumptionEnabled();
+  } else {
+    config.early_data_enabled = true;
+    config.client_cert_mode = quic::ClientCertMode::kNone;
+    config.disable_ticket_support = false;
+  }
+  return config;
+}
+
+void EnvoyQuicServerSession::ProcessUdpPacket(const quic::QuicSocketAddress& self_address,
+                                              const quic::QuicSocketAddress& peer_address,
+                                              const quic::QuicReceivedPacket& packet) {
+  // The first packet processed by the server session carries the client's initial ClientHello,
+  // so record its arrival as the downstream handshake start. The setter only keeps the first
+  // value, so subsequent packets don't overwrite it.
+  streamInfo().downstreamTiming().onDownstreamHandshakeStart(dispatcher_.timeSource());
+
+  // If L4 filters causes the connection to be closed early during initialization, now
+  // is the time to actually close the connection.
+  maybeHandleCloseDuringInitialize();
+
+  if (should_send_go_away_and_close_on_dispatch_ != nullptr &&
+      should_send_go_away_and_close_on_dispatch_->shouldShedLoad()) {
+    ENVOY_LOG_EVERY_POW_2(info, "EnvoyQuicServerSession::ProcessUdpPacket: "
+                                "sending GOAWAY and close on dispatch");
+    SendHttp3GoAway(quic::QUIC_PEER_GOING_AWAY, "Server overloaded");
+    closeConnectionImmediately();
+  } else if (should_send_go_away_on_dispatch_ != nullptr &&
+             should_send_go_away_on_dispatch_->shouldShedLoad() && !h3_go_away_sent_) {
+    ENVOY_LOG_EVERY_POW_2(info, "EnvoyQuicServerSession::ProcessUdpPacket: "
+                                "sending GOAWAY on dispatch");
+    SendHttp3GoAway(quic::QUIC_PEER_GOING_AWAY, "Server overloaded");
+    h3_go_away_sent_ = true;
+  }
+
+  quic::QuicServerSessionBase::ProcessUdpPacket(self_address, peer_address, packet);
+  if (connection()->expected_server_preferred_address().IsInitialized() &&
+      self_address == connection()->expected_server_preferred_address()) {
+    connection_stats_.num_packets_rx_on_preferred_address_.inc();
+  }
+  maybeApplyDelayedClose();
+}
+
+std::vector<absl::string_view>::const_iterator
+EnvoyQuicServerSession::SelectAlpn(const std::vector<absl::string_view>& alpns) const {
+  if (!position_.has_value()) {
+    return quic::QuicServerSessionBase::SelectAlpn(alpns);
+  }
+  const std::vector<absl::string_view>& configured_alpns =
+      dynamic_cast<const QuicServerTransportSocketFactory&>(
+          position_->filter_chain_.transportSocketFactory())
+          .supportedAlpnProtocols();
+  if (configured_alpns.empty()) {
+    return quic::QuicServerSessionBase::SelectAlpn(alpns);
+  }
+
+  for (absl::string_view configured_alpn : configured_alpns) {
+    auto it = absl::c_find(alpns, configured_alpn);
+    if (it != alpns.end()) {
+      return it;
+    }
+  }
+  return alpns.end();
+}
+
+void EnvoyQuicServerSession::ActivateStream(std::unique_ptr<quic::QuicStream> stream) {
+  bool streams_was_empty = !HasActiveRequestStreams();
+  QuicServerSessionBase::ActivateStream(std::move(stream));
+  if (streams_was_empty && HasActiveRequestStreams()) {
+    MaybeRemoveSessionFromIdleList();
+  }
+}
+
+void EnvoyQuicServerSession::OnStreamClosed(quic::QuicStreamId id) {
+  bool streams_was_empty = !HasActiveRequestStreams();
+
+  QuicServerSessionBase::OnStreamClosed(id);
+  if (on_connection_closed_called_) {
+    return;
+  }
+
+  if (!streams_was_empty && !HasActiveRequestStreams()) {
+    OnLastActiveStreamClosed();
+  }
+}
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+void EnvoyQuicServerSession::TerminateIdleSession() {
+  ENVOY_BUG(!on_connection_closed_called_,
+            "TerminateIdleSession called after session on close called.");
+  connection()->CloseConnection(quic::QUIC_NETWORK_IDLE_TIMEOUT, "Server overload",
+                                quic::ConnectionCloseBehavior::SEND_CONNECTION_CLOSE_PACKET);
+}
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+void EnvoyQuicServerSession::OnLastActiveStreamClosed() { MaybeAddSessionToIdleList(); }
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+void EnvoyQuicServerSession::MaybeAddSessionToIdleList() {
+  if (session_idle_list_ == nullptr || is_in_idle_list_) {
+    return;
+  }
+  is_in_idle_list_ = true;
+  session_idle_list_->AddSession(*this);
+}
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+void EnvoyQuicServerSession::MaybeRemoveSessionFromIdleList() {
+  if (session_idle_list_ == nullptr || !is_in_idle_list_) {
+    return;
+  }
+  is_in_idle_list_ = false;
+  session_idle_list_->RemoveSession(*this);
 }
 
 } // namespace Quic

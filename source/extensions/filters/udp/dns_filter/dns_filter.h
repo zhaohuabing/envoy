@@ -1,23 +1,30 @@
 #pragma once
 
+#include "envoy/access_log/access_log.h"
 #include "envoy/event/file_event.h"
 #include "envoy/extensions/filters/udp/dns_filter/v3/dns_filter.pb.h"
 #include "envoy/network/dns.h"
 #include "envoy/network/filter.h"
 
+#include "source/common/access_log/access_log_impl.h"
 #include "source/common/buffer/buffer_impl.h"
-#include "source/common/common/utility.h"
+#include "source/common/common/radix_tree.h"
 #include "source/common/config/config_provider_impl.h"
+#include "source/common/network/socket_impl.h"
 #include "source/common/network/utility.h"
+#include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/udp/dns_filter/dns_filter_resolver.h"
 #include "source/extensions/filters/udp/dns_filter/dns_parser.h"
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/strings/ascii.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace UdpFilters {
 namespace DnsFilter {
+
+inline constexpr absl::string_view DnsFilterName = "envoy.filters.udp.dns_filter";
 
 /**
  * All DNS Filter stats. @see stats_macros.h
@@ -50,6 +57,8 @@ namespace DnsFilter {
   COUNTER(downstream_tx_responses)                                                                 \
   COUNTER(query_buffer_underflow)                                                                  \
   COUNTER(query_parsing_failure)                                                                   \
+  COUNTER(queries_with_additional_rrs)                                                             \
+  COUNTER(queries_with_ans_or_authority_rrs)                                                       \
   COUNTER(record_name_overflow)                                                                    \
   HISTOGRAM(downstream_rx_bytes, Bytes)                                                            \
   HISTOGRAM(downstream_rx_query_latency, Milliseconds)                                             \
@@ -63,9 +72,9 @@ struct DnsFilterStats {
 };
 
 struct DnsEndpointConfig {
-  absl::optional<AddressConstPtrVec> address_list;
-  absl::optional<std::string> cluster_name;
-  absl::optional<DnsSrvRecordPtr> service_list;
+  std::optional<AddressConstPtrVec> address_list;
+  std::optional<std::string> cluster_name;
+  std::optional<DnsSrvRecordPtr> service_list;
 };
 
 using DnsVirtualDomainConfig = absl::flat_hash_map<std::string, DnsEndpointConfig>;
@@ -95,9 +104,9 @@ public:
   }
   const Network::DnsResolverFactory& dnsResolverFactory() const { return *dns_resolver_factory_; }
   Api::Api& api() const { return api_; }
-  const TrieLookupTable<DnsVirtualDomainConfigSharedPtr>& getDnsTrie() const {
-    return dns_lookup_trie_;
-  }
+  const RadixTree<DnsVirtualDomainConfigSharedPtr>& getDnsTrie() const { return dns_lookup_trie_; }
+  const AccessLog::InstanceSharedPtrVector& accessLogs() const { return access_logs_; }
+  bool caseInsensitive() const { return case_insensitive_; }
 
 private:
   static DnsFilterStats generateStats(const std::string& stat_prefix, Stats::Scope& scope) {
@@ -121,15 +130,17 @@ private:
 
   mutable DnsFilterStats stats_;
 
-  TrieLookupTable<DnsVirtualDomainConfigSharedPtr> dns_lookup_trie_;
+  RadixTree<DnsVirtualDomainConfigSharedPtr> dns_lookup_trie_;
   absl::flat_hash_map<std::string, std::chrono::seconds> domain_ttl_;
   bool forward_queries_;
+  bool case_insensitive_;
   uint64_t retry_count_;
   std::chrono::milliseconds resolver_timeout_;
   Random::RandomGenerator& random_;
   uint64_t max_pending_lookups_;
   envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config_;
   Network::DnsResolverFactory* dns_resolver_factory_;
+  AccessLog::InstanceSharedPtrVector access_logs_;
 };
 
 using DnsFilterEnvoyConfigSharedPtr = std::shared_ptr<const DnsFilterEnvoyConfig>;
@@ -349,6 +360,18 @@ private:
     }
   }
 
+  // Populates lookup_name_ with a lowercase copy for case-insensitive matching; a no-op (no
+  // allocation) on the default case-sensitive path.
+  void maybeNormalizeQuery(DnsQueryRecord& query) const {
+    if (!config_->caseInsensitive()) {
+      return;
+    }
+    std::string lower = absl::AsciiStrToLower(query.name_);
+    if (lower != query.name_) {
+      query.lookup_name_ = std::move(lower);
+    }
+  }
+
   /**
    * @brief Helper function to retrieve the Endpoint configuration for a requested domain
    */
@@ -368,6 +391,13 @@ private:
    * @brief Helper function to retrieve a cluster name that a domain may be redirected towards
    */
   const absl::string_view getClusterNameForDomain(const absl::string_view domain);
+
+  /**
+   * @brief Logs the DNS query to configured access loggers
+   *
+   * @param context object containing the query context
+   */
+  void logQuery(const DnsQueryContextPtr& context);
 
   const DnsFilterEnvoyConfigSharedPtr config_;
   Network::UdpListener& listener_;

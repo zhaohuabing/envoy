@@ -5,6 +5,17 @@
 
 namespace Envoy {
 namespace Stats {
+
+bool operator==(const ParentHistogram::Bucket& a, const ParentHistogram::Bucket& b) {
+  return a.count_ == b.count_ && std::abs(a.lower_bound_ - b.lower_bound_) < 0.001 &&
+         std::abs(a.width_ - b.width_) < 0.001;
+}
+
+std::ostream& operator<<(std::ostream& out, const ParentHistogram::Bucket& bucket) {
+  return out << "(min_value=" << bucket.lower_bound_ << ", width=" << bucket.width_
+             << ", count=" << bucket.count_ << ")";
+}
+
 namespace TestUtil {
 
 void forEachSampleStat(int num_clusters, bool include_other_stats,
@@ -22,7 +33,6 @@ void forEachSampleStat(int num_clusters, bool include_other_stats,
                                         "lb_subsets_selected",
                                         "lb_zone_cluster_too_small",
                                         "lb_zone_no_capacity_left",
-                                        "lb_zone_number_differs",
                                         "lb_zone_routing_all_directly",
                                         "lb_zone_routing_cross_zone",
                                         "lb_zone_routing_sampled",
@@ -103,116 +113,125 @@ void forEachSampleStat(int num_clusters, bool include_other_stats,
   }
 }
 
-MemoryTest::Mode MemoryTest::mode() {
-#if !(defined(TCMALLOC) || defined(GPERFTOOLS_TCMALLOC)) || defined(ENVOY_MEMORY_DEBUG_ENABLED)
-  // We can only test absolute memory usage if the malloc library is a known
-  // quantity. This decision is centralized here. As the preferred malloc
-  // library for Envoy is TCMALLOC that's what we test for here. If we switch
-  // to a different malloc library than we'd have to re-evaluate all the
-  // thresholds in the tests referencing MemoryTest.
-  return Mode::Disabled;
-#else
-  // Even when using TCMALLOC is defined, it appears that
-  // Memory::Stats::totalCurrentlyAllocated() does not work as expected
-  // on some platforms, so try to force-allocate some heap memory
-  // and determine whether we can measure it.
-  const size_t start_mem = Memory::Stats::totalCurrentlyAllocated();
-  volatile std::unique_ptr<std::string> long_string = std::make_unique<std::string>(
-      "more than 22 chars to exceed libc++ short-string optimization");
-  const size_t end_mem = Memory::Stats::totalCurrentlyAllocated();
-  bool can_measure_memory = end_mem > start_mem;
+TestScope::TestScope(const std::string& prefix, TestStore& store)
+    : IsolatedScopeImpl(prefix, store), store_(store), prefix_str_(addDot(prefix)) {}
+TestScope::TestScope(StatName prefix, TestStore& store)
+    : IsolatedScopeImpl(prefix, store), store_(store),
+      prefix_str_(addDot(store.symbolTable().toString(prefix))) {}
 
-  // As of Oct 8, 2020, tcmalloc has changed such that Memory::Stats::totalCurrentlyAllocated
-  // is not deterministic, even with single-threaded tests. When possible, this should be fixed,
-  // and the following block of code uncommented. This affects approximate comparisons, not
-  // just exact ones.
-#if 0
-  if (getenv("ENVOY_MEMORY_TEST_EXACT") != nullptr) { // Set in "ci/do_ci.sh" for 'release' tests.
-    RELEASE_ASSERT(can_measure_memory,
-                   "$ENVOY_MEMORY_TEST_EXACT is set for canonical memory measurements, "
-                   "but memory measurement looks broken");
-    return Mode::Canonical;
-  }
-#endif
+TestScope::TestScope(StatName prefix, TestStore& store, StatsMatcherSharedPtr matcher)
+    : IsolatedScopeImpl(prefix, store, std::move(matcher)), store_(store),
+      prefix_str_(addDot(store.symbolTable().toString(prefix))) {}
 
-  // Different versions of STL and other compiler/architecture differences may
-  // also impact memory usage, so when not compiling with MEMORY_TEST_EXACT,
-  // memory comparisons must be given some slack. There have recently emerged
-  // some memory-allocation differences between development and Envoy CI and
-  // Bazel CI (which compiles Envoy as a test of Bazel).
-  return can_measure_memory ? Mode::Approximate : Mode::Disabled;
-#endif
-}
-
-Counter& TestStore::counterFromString(const std::string& name) {
-  Counter*& counter_ref = counter_map_[name];
+// Override the Stats::Store methods for name-based lookup of stats, to use
+// and update the string-maps in this class. Note that IsolatedStoreImpl
+// does not support deletion of stats, so we only have to track additions
+// to keep the maps up-to-date.
+//
+// Stats::Scope
+Counter& TestScope::counterFromString(const std::string& leaf_name) {
+  std::string name = prefix_str_ + leaf_name;
+  Counter*& counter_ref = store_.counter_map_[name];
   if (counter_ref == nullptr) {
-    counter_ref = &IsolatedStoreImpl::counterFromString(name);
+    counter_ref = &IsolatedScopeImpl::counterFromString(leaf_name);
   }
   return *counter_ref;
 }
 
-Counter& TestStore::counterFromStatNameWithTags(const StatName& stat_name,
-                                                StatNameTagVectorOptConstRef tags) {
-  std::string name = symbolTable().toString(stat_name);
-  Counter*& counter_ref = counter_map_[name];
+Gauge& TestScope::gaugeFromString(const std::string& leaf_name, Gauge::ImportMode import_mode) {
+  std::string name = prefix_str_ + leaf_name;
+  Gauge*& gauge_ref = store_.gauge_map_[name];
+  if (gauge_ref == nullptr) {
+    gauge_ref = &IsolatedScopeImpl::gaugeFromString(leaf_name, import_mode);
+  }
+  return *gauge_ref;
+}
+
+Histogram& TestScope::histogramFromString(const std::string& leaf_name, Histogram::Unit unit) {
+  std::string name = prefix_str_ + leaf_name;
+  Histogram*& histogram_ref = store_.histogram_map_[name];
+  if (histogram_ref == nullptr) {
+    histogram_ref = &IsolatedScopeImpl::histogramFromString(leaf_name, unit);
+  }
+  return *histogram_ref;
+}
+
+std::string TestScope::statNameWithTags(StatName base_name,
+                                        std::optional<StatNameTagSpan> name_tags,
+                                        StatName tagged_name) {
+  // Use the same joiner construction as IsolatedScopeImpl so the map key here matches the flat
+  // name IsolatedScopeImpl actually creates -- including when the caller supplies a non-empty
+  // tagged_name to override the joiner's tag-interleaving.
+  TagUtility::TagStatNameJoiner joiner(prefix(), {}, prefix(), base_name,
+                                       name_tags.value_or(StatNameTagSpan{}), tagged_name,
+                                       symbolTable());
+  return symbolTable().toString(joiner.nameWithTags());
+}
+
+void TestScope::verifyConsistency(StatName ref_stat_name, StatName base_name,
+                                  std::optional<StatNameTagSpan> name_tags, StatName tagged_name) {
+  // Ensures StatNames with the same string representation are specified
+  // consistently using symbolic/dynamic components on every access.
+  TagUtility::TagStatNameJoiner joiner(prefix(), {}, prefix(), base_name,
+                                       name_tags.value_or(StatNameTagSpan{}), tagged_name,
+                                       symbolTable());
+  StatName joined_stat_name = joiner.nameWithTags();
+  ASSERT(ref_stat_name == joined_stat_name,
+         absl::StrCat("Inconsistent dynamic vs symbolic stat name specification: ref_stat_name=",
+                      symbolTable().toString(ref_stat_name),
+                      " stat_name=", symbolTable().toString(joined_stat_name)));
+}
+
+Counter& TestScope::counterFromTaggedName(StatName base_name,
+                                          std::optional<StatNameTagSpan> name_tags,
+                                          StatName tagged_name) {
+  std::string flat_name = statNameWithTags(base_name, name_tags, tagged_name);
+  Counter*& counter_ref = store_.counter_map_[flat_name];
   if (counter_ref == nullptr) {
-    counter_ref = &IsolatedStoreImpl::counterFromStatNameWithTags(stat_name, tags);
+    counter_ref = &IsolatedScopeImpl::counterFromTaggedName(base_name, name_tags, tagged_name);
   } else {
-    // Ensures StatNames with the same string representation are specified
-    // consistently using symbolic/dynamic components on every access.
-    ASSERT(counter_ref->statName() == stat_name, "Inconsistent dynamic vs symbolic "
-                                                 "stat name specification");
+    verifyConsistency(counter_ref->statName(), base_name, name_tags, tagged_name);
   }
   return *counter_ref;
 }
 
-Gauge& TestStore::gaugeFromString(const std::string& name, Gauge::ImportMode mode) {
-  Gauge*& gauge_ref = gauge_map_[name];
+Gauge& TestScope::gaugeFromTaggedName(StatName base_name, std::optional<StatNameTagSpan> name_tags,
+                                      StatName tagged_name, Gauge::ImportMode import_mode) {
+  std::string flat_name = statNameWithTags(base_name, name_tags, tagged_name);
+  Gauge*& gauge_ref = store_.gauge_map_[flat_name];
   if (gauge_ref == nullptr) {
-    gauge_ref = &IsolatedStoreImpl::gaugeFromString(name, mode);
+    gauge_ref =
+        &IsolatedScopeImpl::gaugeFromTaggedName(base_name, name_tags, tagged_name, import_mode);
+  } else {
+    verifyConsistency(gauge_ref->statName(), base_name, name_tags, tagged_name);
   }
   return *gauge_ref;
 }
 
-Gauge& TestStore::gaugeFromStatNameWithTags(const StatName& stat_name,
-                                            StatNameTagVectorOptConstRef tags,
-                                            Gauge::ImportMode mode) {
-  std::string name = symbolTable().toString(stat_name);
-  Gauge*& gauge_ref = gauge_map_[name];
-  if (gauge_ref == nullptr) {
-    gauge_ref = &IsolatedStoreImpl::gaugeFromStatNameWithTags(stat_name, tags, mode);
-  } else {
-    ASSERT(gauge_ref->statName() == stat_name, "Inconsistent dynamic vs symbolic "
-                                               "stat name specification");
-  }
-  return *gauge_ref;
-}
-
-Histogram& TestStore::histogramFromString(const std::string& name, Histogram::Unit unit) {
-  Histogram*& histogram_ref = histogram_map_[name];
+Histogram& TestScope::histogramFromTaggedName(StatName base_name,
+                                              std::optional<StatNameTagSpan> name_tags,
+                                              StatName tagged_name, Histogram::Unit unit) {
+  std::string flat_name = statNameWithTags(base_name, name_tags, tagged_name);
+  Histogram*& histogram_ref = store_.histogram_map_[flat_name];
   if (histogram_ref == nullptr) {
-    histogram_ref = &IsolatedStoreImpl::histogramFromString(name, unit);
+    histogram_ref =
+        &IsolatedScopeImpl::histogramFromTaggedName(base_name, name_tags, tagged_name, unit);
+  } else {
+    verifyConsistency(histogram_ref->statName(), base_name, name_tags, tagged_name);
   }
   return *histogram_ref;
 }
 
-Histogram& TestStore::histogramFromStatNameWithTags(const StatName& stat_name,
-                                                    StatNameTagVectorOptConstRef tags,
-                                                    Histogram::Unit unit) {
-  std::string name = symbolTable().toString(stat_name);
-  Histogram*& histogram_ref = histogram_map_[name];
-  if (histogram_ref == nullptr) {
-    histogram_ref = &IsolatedStoreImpl::histogramFromStatNameWithTags(stat_name, tags, unit);
-  } else {
-    ASSERT(histogram_ref->statName() == stat_name, "Inconsistent dynamic vs symbolic "
-                                                   "stat name specification");
-  }
-  return *histogram_ref;
+ScopeSharedPtr TestStore::makeScope(StatName name, StatsMatcherSharedPtr matcher) {
+  return std::make_shared<TestScope>(name, *this, std::move(matcher));
 }
+
+TestStore::TestStore() : IsolatedStoreImpl(*global_symbol_table_) {}
+
+TestStore::TestStore(SymbolTable& symbol_table) : IsolatedStoreImpl(symbol_table) {}
 
 template <class StatType>
-using StatTypeOptConstRef = absl::optional<std::reference_wrapper<const StatType>>;
+using StatTypeOptConstRef = std::optional<std::reference_wrapper<const StatType>>;
 
 template <class StatType>
 static StatTypeOptConstRef<StatType>
@@ -237,6 +256,20 @@ HistogramOptConstRef TestStore::findHistogramByString(const std::string& name) c
   return findByString<Histogram>(name, histogram_map_);
 }
 
+std::vector<uint64_t> TestStore::histogramValues(const std::string& name, bool clear) {
+  auto it = histogram_values_map_.find(name);
+  ASSERT(it != histogram_values_map_.end(), absl::StrCat("Couldn't find histogram ", name));
+  std::vector<uint64_t> copy = it->second;
+  if (clear) {
+    it->second.clear();
+  }
+  return copy;
+}
+
+bool TestStore::histogramRecordedValues(const std::string& name) const {
+  return histogram_values_map_.contains(name);
+}
+
 // TODO(jmarantz): this utility is intended to be used both for unit tests
 // and fuzz tests. But those have different checking macros, e.g. EXPECT_EQ vs
 // FUZZ_ASSERT.
@@ -250,7 +283,7 @@ std::vector<uint8_t> serializeDeserializeNumber(uint64_t number) {
                                                        block_size, " num_bytes=", num_bytes));
   absl::Span<uint8_t> span = mem_block.span();
   RELEASE_ASSERT(number == SymbolTableImpl::Encoding::decodeNumber(span.data()).first, "");
-  return std::vector<uint8_t>(span.data(), span.data() + span.size());
+  return {span.data(), span.data() + span.size()};
 }
 
 void serializeDeserializeString(absl::string_view in) {

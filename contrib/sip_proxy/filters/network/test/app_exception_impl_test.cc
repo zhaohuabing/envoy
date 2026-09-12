@@ -1,7 +1,6 @@
 #include "source/common/buffer/buffer_impl.h"
 
 #include "contrib/sip_proxy/filters/network/source/app_exception_impl.h"
-#include "contrib/sip_proxy/filters/network/test/mocks.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -12,10 +11,18 @@ namespace SipProxy {
 
 TEST(AppExceptionImplTest, CopyConstructor) {
   AppException app_ex(AppExceptionType::InternalError, "msg");
+  // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
   AppException copy(app_ex);
 
   EXPECT_EQ(app_ex.type_, copy.type_);
   EXPECT_STREQ("msg", copy.what());
+}
+
+TEST(AppExceptionImplTest, EncodeWithoutNecessaryHeaders) {
+  AppException app_ex(AppExceptionType::InternalError, "msg");
+  MessageMetadata metadata;
+  Buffer::OwnedImpl buffer;
+  app_ex.encode(metadata, buffer);
 }
 
 } // namespace SipProxy

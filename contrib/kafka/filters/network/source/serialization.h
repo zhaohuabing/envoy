@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -364,7 +366,7 @@ public:
 
   bool ready() const override { return ready_; }
 
-  std::string get() const override { return std::string(data_buf_.begin(), data_buf_.end()); }
+  std::string get() const override { return {data_buf_.begin(), data_buf_.end()}; }
 
 private:
   Int16Deserializer length_buf_;
@@ -390,7 +392,7 @@ public:
 
   bool ready() const override { return ready_; }
 
-  std::string get() const override { return std::string(data_buf_.begin(), data_buf_.end()); }
+  std::string get() const override { return {data_buf_.begin(), data_buf_.end()}; }
 
 private:
   VarUInt32Deserializer length_buf_;
@@ -423,8 +425,8 @@ public:
   bool ready() const override { return ready_; }
 
   NullableString get() const override {
-    return required_ >= 0 ? absl::make_optional(std::string(data_buf_.begin(), data_buf_.end()))
-                          : absl::nullopt;
+    return required_ >= 0 ? std::make_optional(std::string(data_buf_.begin(), data_buf_.end()))
+                          : std::nullopt;
   }
 
 private:
@@ -540,7 +542,7 @@ public:
   bool ready() const override { return ready_; }
 
   NullableBytes get() const override {
-    return required_ >= 0 ? absl::make_optional(data_buf_) : absl::nullopt;
+    return required_ >= 0 ? std::make_optional(data_buf_) : std::nullopt;
   }
 
 private:
@@ -780,7 +782,7 @@ public:
       }
       if (required_ < NULL_ARRAY_LENGTH) {
         ExceptionUtil::throwEnvoyException(
-            fmt::format("invalid NULLABLE_ARRAY length: {}", required_));
+            std::format("invalid NULLABLE_ARRAY length: {}", required_));
       }
 
       length_consumed_ = true;
@@ -816,7 +818,7 @@ public:
       }
       return result;
     } else {
-      return absl::nullopt;
+      return std::nullopt;
     }
   }
 
@@ -904,7 +906,7 @@ public:
       }
       return result;
     } else {
-      return absl::nullopt;
+      return std::nullopt;
     }
   }
 
@@ -916,6 +918,72 @@ private:
   std::vector<DeserializerType> children_;
   bool children_setup_{false};
   bool ready_{false};
+};
+
+/**
+ * Nullable objects are sent as single byte and following data.
+ * Reference: https://issues.apache.org/jira/browse/KAFKA-14425
+ */
+template <typename DeserializerType>
+class NullableStructDeserializer
+    : public Deserializer<std::optional<typename DeserializerType::result_type>> {
+public:
+  using ResponseType = std::optional<typename DeserializerType::result_type>;
+
+  uint32_t feed(absl::string_view& data) override {
+
+    if (data.empty()) {
+      return 0;
+    }
+
+    uint32_t bytes_read = 0;
+
+    if (!marker_consumed_) {
+      // Read marker byte from input.
+      int8_t marker;
+      safeMemcpy(&marker, data.data());
+      data = {data.data() + 1, data.size() - 1};
+      bytes_read += 1;
+      marker_consumed_ = true;
+
+      if (marker >= 0) {
+        data_buf_ = std::make_optional(DeserializerType());
+      } else {
+        return bytes_read;
+      }
+    }
+
+    if (data_buf_) {
+      bytes_read += data_buf_->feed(data);
+    }
+
+    return bytes_read;
+  }
+
+  bool ready() const override {
+    if (marker_consumed_) {
+      if (data_buf_) {
+        return data_buf_->ready();
+      } else {
+        return true; // It's an empty optional.
+      }
+    } else {
+      return false;
+    }
+  }
+
+  ResponseType get() const override {
+    if (data_buf_) {
+      const typename ResponseType::value_type deserialized_form = data_buf_->get();
+      return std::make_optional(deserialized_form);
+    } else {
+      return std::nullopt;
+    }
+  }
+
+private:
+  bool marker_consumed_{false};
+  std::optional<DeserializerType> data_buf_; // Present if marker was consumed and was 0 or more.
 };
 
 /**
@@ -942,6 +1010,28 @@ private:
   Int64Deserializer high_bytes_deserializer_;
   Int64Deserializer low_bytes_deserializer_;
 };
+
+// Variable length encoding utilities.
+namespace VarlenUtils {
+
+/**
+ * Writes given unsigned int in variable-length encoding.
+ * Ref: org.apache.kafka.common.utils.ByteUtils.writeUnsignedVarint(int, ByteBuffer)
+ */
+uint32_t writeUnsignedVarint(const uint32_t arg, Bytes& dst);
+
+/**
+ * Writes given signed int in variable-length zig-zag encoding.
+ * Ref: org.apache.kafka.common.utils.ByteUtils.writeVarint(int, ByteBuffer)
+ */
+uint32_t writeVarint(const int32_t arg, Bytes& dst);
+
+/**
+ * Writes given long in variable-length zig-zag encoding.
+ * Ref: org.apache.kafka.common.utils.ByteUtils.writeVarlong(long, ByteBuffer)
+ */
+uint32_t writeVarlong(const int64_t arg, Bytes& dst);
+} // namespace VarlenUtils
 
 /**
  * Encodes provided argument in Kafka format.
@@ -973,6 +1063,12 @@ public:
    * @return serialized size of argument.
    */
   template <typename T> uint32_t computeSize(const NullableArray<T>& arg) const;
+
+  /**
+   * Compute size of given nullable object, if it were to be encoded.
+   * @return serialized size of argument.
+   */
+  template <typename T> uint32_t computeSize(const std::optional<T>& arg) const;
 
   /**
    * Compute size of given reference, if it were to be compactly encoded.
@@ -1009,6 +1105,12 @@ public:
    * @return bytes written
    */
   template <typename T> uint32_t encode(const NullableArray<T>& arg, Buffer::Instance& dst);
+
+  /**
+   * Encode given nullable object in a buffer.
+   * @return bytes written
+   */
+  template <typename T> uint32_t encode(const std::optional<T>& arg, Buffer::Instance& dst);
 
   /**
    * Compactly encode given reference in a buffer.
@@ -1114,10 +1216,62 @@ inline uint32_t EncodingContext::computeSize(const NullableArray<T>& arg) const 
 }
 
 /**
+ * Template overload for nullable T.
+ * The size of nullable object is 1 (for market byte) and the size of real object (if any).
+ */
+template <typename T>
+inline uint32_t EncodingContext::computeSize(const std::optional<T>& arg) const {
+  return 1 + (arg ? computeSize(*arg) : 0);
+}
+
+/**
  * Template overload for Uuid.
  */
 template <> inline uint32_t EncodingContext::computeSize(const Uuid&) const {
   return 2 * sizeof(uint64_t);
+}
+
+// Specializations for primitive types that don't have compact encoding
+// These must be declared before the generic template
+
+/**
+ * Template overload for int8_t.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const int8_t& arg) const {
+  return computeSize(arg);
+}
+
+/**
+ * Template overload for int16_t.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const int16_t& arg) const {
+  return computeSize(arg);
+}
+
+/**
+ * Template overload for uint16_t.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const uint16_t& arg) const {
+  return computeSize(arg);
+}
+
+/**
+ * Template overload for bool.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const bool& arg) const {
+  return computeSize(arg);
+}
+
+/**
+ * Template overload for double.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const double& arg) const {
+  return computeSize(arg);
 }
 
 /**
@@ -1129,10 +1283,26 @@ template <typename T> inline uint32_t EncodingContext::computeCompactSize(const 
 }
 
 /**
+ * Template overload for Uuid.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const Uuid& arg) const {
+  return computeSize(arg);
+}
+
+/**
  * Template overload for int32_t.
  * This data type is not compacted, so we just point to non-compact implementation.
  */
 template <> inline uint32_t EncodingContext::computeCompactSize(const int32_t& arg) const {
+  return computeSize(arg);
+}
+
+/**
+ * Template overload for int64_t.
+ * This data type is not compacted, so we just point to non-compact implementation.
+ */
+template <> inline uint32_t EncodingContext::computeCompactSize(const int64_t& arg) const {
   return computeSize(arg);
 }
 
@@ -1351,6 +1521,23 @@ uint32_t EncodingContext::encode(const NullableArray<T>& arg, Buffer::Instance& 
 }
 
 /**
+ * Encode nullable object as marker byte (1 if present, -1 otherwise), then if object is present,
+ * have it to serialize itself.
+ */
+template <typename T>
+uint32_t EncodingContext::encode(const std::optional<T>& arg, Buffer::Instance& dst) {
+  if (arg) {
+    const int8_t marker = 1;
+    encode(marker, dst);
+    const uint32_t written = encode(*arg, dst);
+    return 1 + written;
+  } else {
+    const int8_t marker = -1;
+    return encode(marker, dst);
+  }
+}
+
+/**
  * Template overload for Uuid.
  */
 template <> inline uint32_t EncodingContext::encode(const Uuid& arg, Buffer::Instance& dst) {
@@ -1370,10 +1557,64 @@ inline uint32_t EncodingContext::encodeCompact(const T& arg, Buffer::Instance& d
 }
 
 /**
+ * Uuid is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <> inline uint32_t EncodingContext::encodeCompact(const Uuid& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
  * int32_t is not encoded in compact fashion, so we just delegate to normal implementation.
  */
 template <>
 inline uint32_t EncodingContext::encodeCompact(const int32_t& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
+ * int64_t is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <>
+inline uint32_t EncodingContext::encodeCompact(const int64_t& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
+ * int8_t is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <>
+inline uint32_t EncodingContext::encodeCompact(const int8_t& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
+ * int16_t is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <>
+inline uint32_t EncodingContext::encodeCompact(const int16_t& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
+ * uint16_t is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <>
+inline uint32_t EncodingContext::encodeCompact(const uint16_t& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
+ * bool is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <> inline uint32_t EncodingContext::encodeCompact(const bool& arg, Buffer::Instance& dst) {
+  return encode(arg, dst);
+}
+
+/**
+ * double is not encoded in compact fashion, so we just delegate to normal implementation.
+ */
+template <>
+inline uint32_t EncodingContext::encodeCompact(const double& arg, Buffer::Instance& dst) {
   return encode(arg, dst);
 }
 
@@ -1385,23 +1626,10 @@ inline uint32_t EncodingContext::encodeCompact(const int32_t& arg, Buffer::Insta
  */
 template <>
 inline uint32_t EncodingContext::encodeCompact(const uint32_t& arg, Buffer::Instance& dst) {
-  uint32_t value = arg;
-
-  uint32_t elements_with_1 = 0;
-  // As long as there are bits set on indexes 8 or higher (counting from 1).
-  while ((value & ~(0x7f)) != 0) {
-    // Save next 7-bit batch with highest bit set.
-    const uint8_t el = (value & 0x7f) | 0x80;
-    dst.add(&el, sizeof(uint8_t));
-    value >>= 7;
-    elements_with_1++;
-  }
-
-  // After the loop has finished, we are certain that bit 8 = 0, so we can just add final element.
-  const uint8_t el = value;
-  dst.add(&el, sizeof(uint8_t));
-
-  return elements_with_1 + 1;
+  std::vector<unsigned char> tmp;
+  const uint32_t written = VarlenUtils::writeUnsignedVarint(arg, tmp);
+  dst.add(tmp.data(), written);
+  return written;
 }
 
 /**

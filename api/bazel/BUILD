@@ -1,24 +1,38 @@
-load("@io_bazel_rules_go//proto:compiler.bzl", "go_proto_compiler")
-load("//:utils.bzl", "json_data")
-load(":repository_locations.bzl", "REPOSITORY_LOCATIONS_SPEC")
+load("@aspect_bazel_lib//lib:jq.bzl", "jq")
+load("@envoy_toolshed//:macros.bzl", "json_data")
+load("@rules_go//proto:compiler.bzl", "go_proto_compiler")
+load(
+    ":external_proto_deps.bzl",
+    "EXTERNAL_PROTO_CC_BAZEL_DEP_MAP",
+    "EXTERNAL_PROTO_GO_BAZEL_DEP_MAP",
+    "EXTERNAL_PROTO_IMPORT_BAZEL_DEP_MAP",
+)
 
 licenses(["notice"])  # Apache 2
 
 exports_files([
-    "repository_locations.bzl",
-    "repository_locations_utils.bzl",
+    "extensions.bzl",
+    "utils.bzl",
+    "deps.yaml",
 ])
 
 go_proto_compiler(
-    name = "pgv_plugin_go",
-    options = ["lang=go"],
-    plugin = "@com_envoyproxy_protoc_gen_validate//:protoc-gen-validate",
-    suffix = ".pb.validate.go",
+    name = "vtprotobuf_plugin_go",
+    options = [
+        "features=marshal_strict+size",
+        "buildTag=vtprotobuf",
+    ],
+    plugin = "@com_github_planetscale_vtprotobuf//cmd/protoc-gen-go-vtproto",
+    suffix = "_vtproto.pb.go",
     valid_archive = False,
     visibility = ["//visibility:public"],
 )
 
 json_data(
-    name = "repository_locations",
-    data = REPOSITORY_LOCATIONS_SPEC,
+    name = "external_proto_deps",
+    data = dict(
+        cc = EXTERNAL_PROTO_CC_BAZEL_DEP_MAP,
+        go = EXTERNAL_PROTO_GO_BAZEL_DEP_MAP,
+        imports = EXTERNAL_PROTO_IMPORT_BAZEL_DEP_MAP,
+    ),
 )

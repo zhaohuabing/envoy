@@ -23,6 +23,22 @@ protected:
   }
 };
 
+// Set options directly
+TEST_F(AddrFamilyAwareSocketOptionImplTest, SetSocketOptionsDirectly) {
+  AddrFamilyAwareSocketOptionImpl socket_option(
+      std::make_unique<SocketOptionImpl>(envoy::config::core::v3::SocketOption::STATE_PREBIND,
+                                         ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10), 1),
+      std::make_unique<SocketOptionImpl>(envoy::config::core::v3::SocketOption::STATE_PREBIND,
+                                         ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10), 2));
+
+  EXPECT_CALL(socket_, ipVersion()).WillRepeatedly(testing::Return(Address::IpVersion::v4));
+  testSetSocketOptionSuccess(socket_option, ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10), 1,
+                             {envoy::config::core::v3::SocketOption::STATE_PREBIND});
+  EXPECT_CALL(socket_, ipVersion()).WillRepeatedly(testing::Return(Address::IpVersion::v6));
+  testSetSocketOptionSuccess(socket_option, ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10), 2,
+                             {envoy::config::core::v3::SocketOption::STATE_PREBIND});
+}
+
 // Different values for v4 and v6
 TEST_F(AddrFamilyAwareSocketOptionImplTest, DifferentV4AndV6OptionValue) {
   AddrFamilyAwareSocketOptionImpl socket_option{
@@ -41,6 +57,7 @@ TEST_F(AddrFamilyAwareSocketOptionImplTest, DifferentV4AndV6OptionData) {
   AddrFamilyAwareSocketOptionImpl socket_option{
       envoy::config::core::v3::SocketOption::STATE_PREBIND, ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10),
       "hello", ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10), "world"};
+  EXPECT_TRUE(socket_option.isSupported());
   EXPECT_CALL(socket_, ipVersion()).WillRepeatedly(testing::Return(Address::IpVersion::v4));
   EXPECT_EQ(
       "hello",
@@ -55,7 +72,7 @@ TEST_F(AddrFamilyAwareSocketOptionImplTest, DifferentV4AndV6OptionData) {
 
 // We fail to set the option when the underlying setsockopt syscall fails.
 TEST_F(AddrFamilyAwareSocketOptionImplTest, SetOptionFailure) {
-  EXPECT_CALL(socket_, ipVersion).WillRepeatedly(testing::Return(absl::nullopt));
+  EXPECT_CALL(socket_, ipVersion).WillRepeatedly(testing::Return(std::nullopt));
   AddrFamilyAwareSocketOptionImpl socket_option{
       envoy::config::core::v3::SocketOption::STATE_PREBIND,
       ENVOY_MAKE_SOCKET_OPTION_NAME(5, 10),
@@ -186,7 +203,7 @@ TEST_F(AddrFamilyAwareSocketOptionImplTest, GetSocketOptionCannotDetermineVersio
       ENVOY_MAKE_SOCKET_OPTION_NAME(6, 11), 5};
 
   IoHandlePtr io_handle = std::make_unique<IoSocketHandleImpl>();
-  EXPECT_CALL(socket_, ipVersion).WillOnce(testing::Return(absl::nullopt));
+  EXPECT_CALL(socket_, ipVersion).WillOnce(testing::Return(std::nullopt));
   auto result =
       socket_option.getOptionDetails(socket_, envoy::config::core::v3::SocketOption::STATE_PREBIND);
   EXPECT_FALSE(result.has_value());

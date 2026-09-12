@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
-TEST_CERTS="${TEST_SRCDIR}"/envoy/test/config/integration/certs
+TEST_CERTS="${TEST_SRCDIR}/${TEST_WORKSPACE}/test/config/integration/certs"
 
 ROOT="${TEST_TMPDIR}"/root
 SERVER_KEYCERT="${ROOT}"/server

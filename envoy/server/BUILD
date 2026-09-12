@@ -9,41 +9,41 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
-    name = "access_log_config_interface",
-    hdrs = ["access_log_config.h"],
-    deps = [
-        ":filter_config_interface",
-        "//envoy/access_log:access_log_interface",
-        "//source/common/protobuf",
-    ],
-)
-
-envoy_cc_library(
     name = "admin_interface",
     hdrs = ["admin.h"],
     deps = [
         ":config_tracker_interface",
+        "//envoy/access_log:access_log_interface",
         "//envoy/buffer:buffer_interface",
+        "//envoy/common:pure_lib",
+        "//envoy/http:codec_interface",
+        "//envoy/http:codes_interface",
         "//envoy/http:filter_interface",
         "//envoy/http:header_map_interface",
         "//envoy/http:query_params_interface",
-        "//envoy/network:listen_socket_interface",
+        "//envoy/network:address_interface",
+        "//envoy/network:connection_handler_interface",
+        "//envoy/network:socket_interface",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
 envoy_cc_library(
     name = "api_listener_interface",
     hdrs = ["api_listener.h"],
-    deps = ["//envoy/http:api_listener_interface"],
+    deps = [
+        "//envoy/config:typed_config_interface",
+        "//envoy/http:api_listener_interface",
+        "@envoy_api//envoy/config/listener/v3:pkg_cc_proto",
+    ],
 )
 
 envoy_cc_library(
     name = "configuration_interface",
     hdrs = ["configuration.h"],
-    external_deps = ["abseil_optional"],
     deps = [
         "//envoy/http:context_interface",
-        "//envoy/ratelimit:ratelimit_interface",
+        "//envoy/stats:sink_interface",
         "//envoy/upstream:cluster_manager_interface",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
     ],
@@ -96,6 +96,7 @@ envoy_cc_library(
     name = "health_checker_config_interface",
     hdrs = ["health_checker_config.h"],
     deps = [
+        ":factory_context_interface",
         "//envoy/common:random_generator_interface",
         "//envoy/config:typed_config_interface",
         "//envoy/upstream:health_checker_interface",
@@ -107,9 +108,16 @@ envoy_cc_library(
     name = "hot_restart_interface",
     hdrs = ["hot_restart.h"],
     deps = [
+        "//envoy/common:exception_lib",
+        "//envoy/common:optref_lib",
+        "//envoy/common:pure_lib",
         "//envoy/event:dispatcher_interface",
+        "//envoy/network:address_interface",
+        "//envoy/network:listener_interface",
+        "//envoy/network:socket_interface",
+        "//envoy/stats:stats_interface",
         "//envoy/thread:thread_interface",
-        "//source/server:hot_restart_cc_proto",
+        "@abseil-cpp//absl/strings",
     ],
 )
 
@@ -120,33 +128,51 @@ envoy_cc_library(
         ":admin_interface",
         ":configuration_interface",
         ":drain_manager_interface",
+        ":factory_context_interface",
         ":hot_restart_interface",
         ":lifecycle_notifier_interface",
         ":listener_manager_interface",
         ":options_interface",
+        ":process_context_interface",
         "//envoy/access_log:access_log_interface",
         "//envoy/api:api_interface",
         "//envoy/common:mutex_tracer",
+        "//envoy/common:optref_lib",
+        "//envoy/common:pure_lib",
+        "//envoy/common:time_interface",
+        "//envoy/config:xds_manager_interface",
         "//envoy/event:timer_interface",
         "//envoy/http:context_interface",
         "//envoy/http:query_params_interface",
         "//envoy/init:manager_interface",
         "//envoy/local_info:local_info_interface",
+        "//envoy/network:connection_handler_interface",
+        "//envoy/network:dns_interface",
+        "//envoy/protobuf:message_validator_interface",
+        "//envoy/router:context_interface",
         "//envoy/runtime:runtime_interface",
         "//envoy/secret:secret_manager_interface",
         "//envoy/server/overload:overload_manager_interface",
+        "//envoy/singleton:manager_interface",
         "//envoy/ssl:context_manager_interface",
+        "//envoy/ssl/private_key:private_key_interface",
+        "//envoy/stats:stats_interface",
         "//envoy/thread_local:thread_local_interface",
-        "//envoy/tracing:http_tracer_interface",
         "//envoy/upstream:cluster_manager_interface",
         "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
     ],
 )
 
 envoy_cc_library(
+    name = "drain_strategy_interface",
+    hdrs = ["drain_strategy.h"],
+)
+
+envoy_cc_library(
     name = "options_interface",
     hdrs = ["options.h"],
     deps = [
+        ":drain_strategy_interface",
         "//envoy/network:address_interface",
         "//envoy/stats:stats_interface",
         "@envoy_api//envoy/admin/v3:pkg_cc_proto",
@@ -158,8 +184,16 @@ envoy_cc_library(
     name = "worker_interface",
     hdrs = ["worker.h"],
     deps = [
+        "//envoy/common:optref_lib",
+        "//envoy/common:pure_lib",
+        "//envoy/common:random_generator_interface",
+        "//envoy/network:connection_handler_interface",
+        "//envoy/network:filter_interface",
+        "//envoy/network:listener_interface",
+        "//envoy/runtime:runtime_interface",
         "//envoy/server:guarddog_interface",
         "//envoy/server/overload:overload_manager_interface",
+        "//envoy/stats:stats_interface",
     ],
 )
 
@@ -167,6 +201,7 @@ envoy_cc_library(
     name = "watchdog_interface",
     hdrs = ["watchdog.h"],
     deps = [
+        "//envoy/common:base_includes",
         "//envoy/thread:thread_interface",
     ],
 )
@@ -185,10 +220,12 @@ envoy_cc_library(
         "//envoy/api:api_interface",
         "//envoy/config:typed_config_interface",
         "//envoy/config:typed_metadata_interface",
+        "//envoy/config:xds_manager_interface",
         "//envoy/grpc:context_interface",
         "//envoy/http:codes_interface",
         "//envoy/http:context_interface",
         "//envoy/http:filter_interface",
+        "//envoy/http:http_server_properties_cache_interface",
         "//envoy/init:manager_interface",
         "//envoy/local_info:local_info_interface",
         "//envoy/network:drain_decision_interface",
@@ -197,11 +234,12 @@ envoy_cc_library(
         "//envoy/server/overload:overload_manager_interface",
         "//envoy/singleton:manager_interface",
         "//envoy/thread_local:thread_local_interface",
-        "//envoy/tracing:http_tracer_interface",
+        "//envoy/tracing:tracer_interface",
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:macros",
         "//source/common/protobuf",
+        "//source/common/singleton:threadsafe_singleton",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )
@@ -218,11 +256,12 @@ envoy_cc_library(
         "//envoy/config:typed_config_interface",
         "//envoy/http:codes_interface",
         "//envoy/http:filter_interface",
+        "//envoy/init:manager_interface",
         "//envoy/server:transport_socket_config_interface",
         "//envoy/server/overload:overload_manager_interface",
         "//envoy/singleton:manager_interface",
         "//envoy/thread_local:thread_local_interface",
-        "//envoy/tracing:http_tracer_interface",
+        "//envoy/tracing:tracer_interface",
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:macros",
@@ -245,12 +284,19 @@ envoy_cc_library(
     deps = [
         ":api_listener_interface",
         ":drain_manager_interface",
-        ":filter_config_interface",
+        ":factory_context_interface",
         ":guarddog_interface",
+        "//envoy/common:pure_lib",
+        "//envoy/filter:config_provider_manager_interface",
+        "//envoy/network:address_interface",
+        "//envoy/network:connection_handler_interface",
+        "//envoy/network:drain_decision_interface",
         "//envoy/network:filter_interface",
-        "//envoy/network:listen_socket_interface",
-        "//envoy/ssl:context_interface",
+        "//envoy/network:socket_interface",
+        "//envoy/network:socket_interface_interface",
         "//source/common/protobuf",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/admin/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/listener/v3:pkg_cc_proto",
@@ -294,6 +340,14 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "proactive_resource_monitor_interface",
+    hdrs = ["proactive_resource_monitor.h"],
+    deps = [
+        "//source/common/stats:symbol_table_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "request_id_extension_config_interface",
     hdrs = ["request_id_extension_config.h"],
     deps = [
@@ -308,6 +362,7 @@ envoy_cc_library(
     hdrs = ["resource_monitor_config.h"],
     deps = [
         ":options_interface",
+        ":proactive_resource_monitor_interface",
         ":resource_monitor_interface",
         "//envoy/api:api_interface",
         "//envoy/event:dispatcher_interface",
@@ -331,6 +386,7 @@ envoy_cc_library(
     deps = [
         ":factory_context_interface",
         "//envoy/config:typed_config_interface",
+        "//envoy/server:instance_interface",
     ],
 )
 

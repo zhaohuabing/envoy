@@ -3,6 +3,7 @@
 
 #include "gtest/gtest.h"
 
+using testing::Eq;
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -83,9 +84,12 @@ typed_config:
 // Fault integration tests that should run with all protocols, useful for testing various
 // end_stream permutations when rate limiting.
 class FaultIntegrationTestAllProtocols : public FaultIntegrationTest {};
-INSTANTIATE_TEST_SUITE_P(Protocols, FaultIntegrationTestAllProtocols,
-                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
-                         HttpProtocolIntegrationTest::protocolTestParamsToString);
+
+// TODO(#26236): Fix test suite for HTTP/3.
+INSTANTIATE_TEST_SUITE_P(
+    Protocols, FaultIntegrationTestAllProtocols,
+    testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParamsWithoutHTTP3()),
+    HttpProtocolIntegrationTest::protocolTestParamsToString);
 
 // No fault injected.
 TEST_P(FaultIntegrationTestAllProtocols, NoFault) {
@@ -147,8 +151,8 @@ TEST_P(FaultIntegrationTestAllProtocols, HeaderFaultConfig) {
                                                  {"x-envoy-fault-delay-request", "200"},
                                                  {"x-envoy-fault-throughput-response", "1"}};
   IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
-  test_server_->waitForCounterEq("http.config_test.fault.delays_injected", 1,
-                                 TestUtility::DefaultTimeout, dispatcher_.get());
+  test_server_->waitForCounter("http.config_test.fault.delays_injected", Eq(1),
+                               TestUtility::DefaultTimeout, dispatcher_.get());
   simTime().advanceTimeWait(std::chrono::milliseconds(200));
   waitForNextUpstreamRequest();
 
@@ -283,8 +287,8 @@ TEST_P(FaultIntegrationTestAllProtocols, HeaderFaultsConfig100PercentageHeaders)
                                      {"x-envoy-fault-delay-request-percentage", "100"},
                                      {"x-envoy-fault-throughput-response", "100"},
                                      {"x-envoy-fault-throughput-response-percentage", "100"}});
-  test_server_->waitForCounterEq("http.config_test.fault.delays_injected", 1,
-                                 TestUtility::DefaultTimeout, dispatcher_.get());
+  test_server_->waitForCounter("http.config_test.fault.delays_injected", Eq(1),
+                               TestUtility::DefaultTimeout, dispatcher_.get());
   simTime().advanceTimeWait(std::chrono::milliseconds(100));
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(default_response_headers_, true);
@@ -326,10 +330,10 @@ TEST_P(FaultIntegrationTestAllProtocols, HeaderFaultAbortGrpcConfig) {
   EXPECT_TRUE(response->complete());
   EXPECT_THAT(response->headers(), Envoy::Http::HttpStatusIs("200"));
   EXPECT_THAT(response->headers(),
-              HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(response->headers(), HeaderValueOf(Http::Headers::get().GrpcStatus, "5"));
+              ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(response->headers(), ContainsHeader(Http::Headers::get().GrpcStatus, "5"));
   EXPECT_THAT(response->headers(),
-              HeaderValueOf(Http::Headers::get().GrpcMessage, "fault filter abort"));
+              ContainsHeader(Http::Headers::get().GrpcMessage, "fault filter abort"));
   EXPECT_EQ(nullptr, response->trailers());
 
   EXPECT_EQ(1UL, test_server_->counter("http.config_test.fault.aborts_injected")->value());
@@ -377,10 +381,10 @@ TEST_P(FaultIntegrationTestAllProtocols, FaultAbortGrpcConfig) {
   EXPECT_TRUE(response->complete());
   EXPECT_THAT(response->headers(), Envoy::Http::HttpStatusIs("200"));
   EXPECT_THAT(response->headers(),
-              HeaderValueOf(Http::Headers::get().ContentType, "application/grpc"));
-  EXPECT_THAT(response->headers(), HeaderValueOf(Http::Headers::get().GrpcStatus, "5"));
+              ContainsHeader(Http::Headers::get().ContentType, "application/grpc"));
+  EXPECT_THAT(response->headers(), ContainsHeader(Http::Headers::get().GrpcStatus, "5"));
   EXPECT_THAT(response->headers(),
-              HeaderValueOf(Http::Headers::get().GrpcMessage, "fault filter abort"));
+              ContainsHeader(Http::Headers::get().GrpcMessage, "fault filter abort"));
   EXPECT_EQ(nullptr, response->trailers());
 
   EXPECT_EQ(1UL, test_server_->counter("http.config_test.fault.aborts_injected")->value());

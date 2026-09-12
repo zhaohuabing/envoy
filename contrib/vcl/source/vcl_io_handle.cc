@@ -1,5 +1,8 @@
 #include "contrib/vcl/source/vcl_io_handle.h"
 
+#include <format>
+#include <optional>
+
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/network/address_impl.h"
 
@@ -48,13 +51,13 @@ void vclEndptCopy(sockaddr* addr, socklen_t* addrlen, const vppcom_endpt_t& ep) 
   if (ep.is_ip4) {
     sockaddr_in* addr4 = reinterpret_cast<sockaddr_in*>(addr);
     addr4->sin_family = AF_INET;
-    *addrlen = std::min(static_cast<unsigned int>(sizeof(struct sockaddr_in)), *addrlen);
+    *addrlen = std::min(static_cast<unsigned int>(sizeof(struct in_addr)), *addrlen);
     memcpy(&addr4->sin_addr, ep.ip, *addrlen); // NOLINT(safe-memcpy)
     addr4->sin_port = ep.port;
   } else {
     sockaddr_in6* addr6 = reinterpret_cast<sockaddr_in6*>(addr);
     addr6->sin6_family = AF_INET6;
-    *addrlen = std::min(static_cast<unsigned int>(sizeof(struct sockaddr_in6)), *addrlen);
+    *addrlen = std::min(static_cast<unsigned int>(sizeof(struct in6_addr)), *addrlen);
     memcpy(&addr6->sin6_addr, ep.ip, *addrlen); // NOLINT(safe-memcpy)
     addr6->sin6_port = ep.port;
   }
@@ -67,13 +70,13 @@ Envoy::Network::Address::InstanceConstSharedPtr vclEndptToAddress(const vppcom_e
 
   if (ep.is_ip4) {
     addr.ss_family = AF_INET;
-    len = sizeof(struct sockaddr_in);
+    len = sizeof(struct in_addr);
     auto in4 = reinterpret_cast<struct sockaddr_in*>(&addr);
     memcpy(&in4->sin_addr, ep.ip, len); // NOLINT(safe-memcpy)
     in4->sin_port = ep.port;
   } else {
     addr.ss_family = AF_INET6;
-    len = sizeof(struct sockaddr_in6);
+    len = sizeof(struct in6_addr);
     auto in6 = reinterpret_cast<struct sockaddr_in6*>(&addr);
     memcpy(&in6->sin6_addr, ep.ip, len); // NOLINT(safe-memcpy)
     in6->sin6_port = ep.port;
@@ -90,13 +93,12 @@ Envoy::Network::Address::InstanceConstSharedPtr vclEndptToAddress(const vppcom_e
     // used to create socket. Wrong knowledge of dual stack support won't hurt.
     return *Envoy::Network::Address::addressFromSockAddr(addr, len, /*v6only=*/false);
   } catch (const EnvoyException& e) {
-    PANIC(fmt::format("Invalid remote address for fd: {}, error: {}", sh, e.what()));
+    PANIC(std::format("Invalid remote address for fd: {}, error: {}", sh, e.what()));
   }
 }
 
 void vclEndptFromAddress(vppcom_endpt_t& endpt,
                          Envoy::Network::Address::InstanceConstSharedPtr address) {
-  endpt.is_cut_thru = 0;
   if (address->ip()->version() == Envoy::Network::Address::IpVersion::v4) {
     const sockaddr_in* in = reinterpret_cast<const sockaddr_in*>(address->sockAddr());
     endpt.is_ip4 = 1;
@@ -114,17 +116,13 @@ void vclEndptFromAddress(vppcom_endpt_t& endpt,
 Api::IoCallUint64Result vclCallResultToIoCallResult(const int32_t result) {
   if (result >= 0) {
     // Return nullptr as IoError upon success.
-    return Api::IoCallUint64Result(
-        result, Api::IoErrorPtr(nullptr, Envoy::Network::IoSocketError::deleteIoError));
+    return {static_cast<unsigned long>(result), Api::IoError::none()};
   }
   RELEASE_ASSERT(result != VPPCOM_EINVAL, "Invalid argument passed in.");
-  return Api::IoCallUint64Result(
-      /*rc=*/0, (result == VPPCOM_EAGAIN
-                     // EAGAIN is frequent enough that its memory allocation should be avoided.
-                     ? Api::IoErrorPtr(Envoy::Network::IoSocketError::getIoSocketEagainInstance(),
-                                       Envoy::Network::IoSocketError::deleteIoError)
-                     : Api::IoErrorPtr(new Envoy::Network::IoSocketError(-result),
-                                       Envoy::Network::IoSocketError::deleteIoError)));
+  return {/*rc=*/0, (result == VPPCOM_EAGAIN
+                         // EAGAIN is frequent enough that its memory allocation should be avoided.
+                         ? Envoy::Network::IoSocketError::getIoSocketEagainError()
+                         : Envoy::Network::IoSocketError::create(-result))};
 }
 
 } // namespace
@@ -136,16 +134,24 @@ VclIoHandle::~VclIoHandle() {
 }
 
 Api::IoCallUint64Result VclIoHandle::close() {
-  VCL_LOG("closing sh {:x}", sh_);
-  RELEASE_ASSERT(VCL_SH_VALID(sh_), "sh must be valid");
+  int wrk_index = vclWrkIndexOrRegister();
   int rc = 0;
 
-  int wrk_index = vclWrkIndexOrRegister();
+  VCL_LOG("closing sh {:x}", sh_);
+
+  if (!VCL_SH_VALID(sh_)) {
+    ENVOY_LOG_MISC(info, "[{}] sh {:x} already closed is_listener {} isWrkListener{}", wrk_index,
+                   sh_, is_listener_, isWrkListener());
+    return {static_cast<unsigned long>(rc), Api::IoError::none()};
+  }
 
   if (is_listener_) {
+    ENVOY_LOG_MISC(info, "[{}] destroying listener sh {}", wrk_index, sh_);
     if (wrk_index) {
-      uint32_t sh = wrk_listener_->sh();
-      RELEASE_ASSERT(wrk_index == vppcom_session_worker(sh), "listener close on wrong thread");
+      if (wrk_listener_ != nullptr) {
+        uint32_t sh = wrk_listener_->sh();
+        RELEASE_ASSERT(wrk_index == vppcom_session_worker(sh), "listener close on wrong thread");
+      }
       clearChildWrkListener();
       // sh_ not invalidated yet, waiting for destructor on main to call `vppcom_session_close`
     } else {
@@ -158,11 +164,12 @@ Api::IoCallUint64Result VclIoHandle::close() {
     VCL_SET_SH_INVALID(sh_);
   }
 
-  return Api::IoCallUint64Result(
-      rc, Api::IoErrorPtr(nullptr, Envoy::Network::IoSocketError::deleteIoError));
+  return {static_cast<unsigned long>(rc), Api::IoError::none()};
 }
 
 bool VclIoHandle::isOpen() const { return VCL_SH_VALID(sh_); }
+
+bool VclIoHandle::wasConnected() const { return false; }
 
 Api::IoCallUint64Result VclIoHandle::readv(uint64_t max_length, Buffer::RawSlice* slices,
                                            uint64_t num_slice) {
@@ -183,7 +190,7 @@ Api::IoCallUint64Result VclIoHandle::readv(uint64_t max_length, Buffer::RawSlice
       break;
     }
     num_bytes_read += rv;
-    if (num_bytes_read == max_length) {
+    if (static_cast<size_t>(rv) < slice_length || num_bytes_read == max_length) {
       break;
     }
   }
@@ -193,7 +200,7 @@ Api::IoCallUint64Result VclIoHandle::readv(uint64_t max_length, Buffer::RawSlice
 }
 
 #if VCL_RX_ZC
-Api::IoCallUint64Result VclIoHandle::read(Buffer::Instance& buffer, absl::optional<uint64_t>) {
+Api::IoCallUint64Result VclIoHandle::read(Buffer::Instance& buffer, std::optional<uint64_t>) {
   vppcom_data_segment_t ds[16];
   int32_t rv;
 
@@ -223,7 +230,7 @@ Api::IoCallUint64Result VclIoHandle::read(Buffer::Instance& buffer, absl::option
 }
 #else
 Api::IoCallUint64Result VclIoHandle::read(Buffer::Instance& buffer,
-                                          absl::optional<uint64_t> max_length_opt) {
+                                          std::optional<uint64_t> max_length_opt) {
   uint64_t max_length = max_length_opt.value_or(UINT64_MAX);
   if (max_length == 0) {
     return Api::ioCallUint64ResultNoError();
@@ -271,6 +278,11 @@ Api::IoCallUint64Result VclIoHandle::write(Buffer::Instance& buffer) {
   return result;
 }
 
+Api::IoCallUint64Result VclIoHandle::send(const void* buffer, size_t length) {
+  Buffer::RawSlice slice{const_cast<void*>(buffer), length};
+  return writev(&slice, 1);
+}
+
 Api::IoCallUint64Result VclIoHandle::recv(void* buffer, size_t length, int flags) {
   VCL_LOG("recv on sh {:x}", sh_);
   int rv = vppcom_session_recvfrom(sh_, buffer, length, flags, nullptr);
@@ -297,7 +309,8 @@ Api::IoCallUint64Result VclIoHandle::sendmsg(const Buffer::RawSlice* slices, uin
     }
   }
   if (num_slices_to_write == 0) {
-    return Api::ioCallUint64ResultNoError();
+    uint8_t empty_payload = 0;
+    return vclCallResultToIoCallResult(vppcom_session_write_msg(sh_, &empty_payload, /*n=*/0));
   }
 
   // VCL has no sendmsg semantics- Treat as a session write followed by a flush
@@ -325,7 +338,8 @@ Api::IoCallUint64Result VclIoHandle::sendmsg(const Buffer::RawSlice* slices, uin
 }
 
 Api::IoCallUint64Result VclIoHandle::recvmsg(Buffer::RawSlice* slices, const uint64_t num_slice,
-                                             uint32_t self_port, RecvMsgOutput& output) {
+                                             uint32_t self_port, const UdpSaveCmsgConfig&,
+                                             RecvMsgOutput& output) {
   if (!VCL_SH_VALID(sh_)) {
     return vclCallResultToIoCallResult(VPPCOM_EBADFD);
   }
@@ -371,8 +385,9 @@ Api::IoCallUint64Result VclIoHandle::recvmsg(Buffer::RawSlice* slices, const uin
   return vclCallResultToIoCallResult(result);
 }
 
-Api::IoCallUint64Result VclIoHandle::recvmmsg(RawSliceArrays&, uint32_t, RecvMsgOutput&) {
-  NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
+Api::IoCallUint64Result VclIoHandle::recvmmsg(RawSliceArrays&, uint32_t, const UdpSaveCmsgConfig&,
+                                              RecvMsgOutput&) {
+  PANIC("not implemented");
 }
 
 bool VclIoHandle::supportsMmsg() const { return false; }
@@ -614,12 +629,12 @@ Api::SysCallIntResult VclIoHandle::setBlocking(bool) {
   return {rv < 0 ? -1 : 0, -rv};
 }
 
-absl::optional<int> VclIoHandle::domain() {
+std::optional<int> VclIoHandle::domain() {
   VCL_LOG("grabbing domain sh {:x}", sh_);
   return {AF_INET};
 };
 
-Envoy::Network::Address::InstanceConstSharedPtr VclIoHandle::localAddress() {
+absl::StatusOr<Envoy::Network::Address::InstanceConstSharedPtr> VclIoHandle::localAddress() {
   vppcom_endpt_t ep;
   uint32_t eplen = sizeof(ep);
   uint8_t addr_buf[sizeof(struct sockaddr_in6)];
@@ -630,7 +645,7 @@ Envoy::Network::Address::InstanceConstSharedPtr VclIoHandle::localAddress() {
   return vclEndptToAddress(ep, sh_);
 }
 
-Envoy::Network::Address::InstanceConstSharedPtr VclIoHandle::peerAddress() {
+absl::StatusOr<Envoy::Network::Address::InstanceConstSharedPtr> VclIoHandle::peerAddress() {
   VCL_LOG("grabbing peer address sh {:x}", sh_);
   vppcom_endpt_t ep;
   uint32_t eplen = sizeof(ep);
@@ -763,7 +778,9 @@ IoHandlePtr VclIoHandle::duplicate() {
   return io_handle;
 }
 
-absl::optional<std::chrono::milliseconds> VclIoHandle::lastRoundTripTime() { return {}; }
+std::optional<std::chrono::milliseconds> VclIoHandle::lastRoundTripTime() { return {}; }
+
+std::optional<uint64_t> VclIoHandle::congestionWindowInBytes() const { return {}; }
 
 } // namespace Vcl
 } // namespace Network

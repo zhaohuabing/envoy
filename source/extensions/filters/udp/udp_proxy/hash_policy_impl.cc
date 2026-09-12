@@ -1,5 +1,7 @@
 #include "source/extensions/filters/udp/udp_proxy/hash_policy_impl.h"
 
+#include "envoy/common/exception.h"
+
 #include "source/common/common/assert.h"
 #include "source/common/common/macros.h"
 
@@ -10,14 +12,14 @@ namespace UdpProxy {
 
 class SourceIpHashMethod : public HashPolicyImpl::HashMethod {
 public:
-  absl::optional<uint64_t>
+  std::optional<uint64_t>
   evaluate(const Network::Address::Instance& downstream_addr) const override {
     if (downstream_addr.ip()) {
       ASSERT(!downstream_addr.ip()->addressAsString().empty());
       return HashUtil::xxHash64(downstream_addr.ip()->addressAsString());
     }
 
-    return absl::nullopt;
+    return std::nullopt;
   }
 };
 
@@ -27,7 +29,7 @@ public:
     ASSERT(!key.empty());
   }
 
-  absl::optional<uint64_t>
+  std::optional<uint64_t>
   evaluate(const Network::Address::Instance& downstream_addr) const override {
     UNREFERENCED_PARAMETER(downstream_addr);
     return hash_;
@@ -47,12 +49,12 @@ HashPolicyImpl::HashPolicyImpl(
   case UdpProxyConfig::HashPolicy::PolicySpecifierCase::kKey:
     hash_impl_ = std::make_unique<KeyHashMethod>(hash_policies[0]->key());
     break;
-  default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+  case UdpProxyConfig::HashPolicy::PolicySpecifierCase::POLICY_SPECIFIER_NOT_SET:
+    PANIC_DUE_TO_CORRUPT_ENUM;
   }
 }
 
-absl::optional<uint64_t>
+std::optional<uint64_t>
 HashPolicyImpl::generateHash(const Network::Address::Instance& downstream_addr) const {
   return hash_impl_->evaluate(downstream_addr);
 }

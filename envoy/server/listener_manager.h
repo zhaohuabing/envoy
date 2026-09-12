@@ -1,23 +1,74 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "envoy/admin/v3/config_dump.pb.h"
+#include "envoy/common/pure.h"
 #include "envoy/config/core/v3/config_source.pb.h"
 #include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/listener/v3/listener_components.pb.h"
+#include "envoy/filter/config_provider_manager.h"
+#include "envoy/network/address.h"
+#include "envoy/network/connection_handler.h"
+#include "envoy/network/drain_decision.h"
 #include "envoy/network/filter.h"
-#include "envoy/network/listen_socket.h"
 #include "envoy/network/listener.h"
+#include "envoy/network/socket.h"
+#include "envoy/network/socket_interface.h"
 #include "envoy/server/api_listener.h"
 #include "envoy/server/drain_manager.h"
-#include "envoy/server/filter_config.h"
+#include "envoy/server/factory_context.h"
 #include "envoy/server/guarddog.h"
 
 #include "source/common/protobuf/protobuf.h"
 
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+
 namespace Envoy {
+namespace Filter {
+class TcpListenerFilterConfigProviderManagerImpl;
+} // namespace Filter
+
 namespace Server {
+
+/**
+ * ListenerUpdateCallbacks provide a way to expose Listener lifecycle events in the
+ * ListenerManager.
+ */
+class ListenerUpdateCallbacks {
+public:
+  virtual ~ListenerUpdateCallbacks() = default;
+
+  /**
+   * onListenerAddOrUpdate is called when a new listener is added or an existing listener
+   * is updated in the ListenerManager.
+   * @param listener_name the name of the changed listener.
+   * @param listener_config the ListenerConfig that represents the updated listener.
+   */
+  virtual void onListenerAddOrUpdate(absl::string_view listener_name,
+                                     const Network::ListenerConfig& listener_config) PURE;
+  /**
+   * onListenerRemoval is called when a listener is removed; the argument is the listener name.
+   * @param listener_name is the name of the removed listener.
+   */
+  virtual void onListenerRemoval(const std::string& listener_name) PURE;
+};
+
+/**
+ * ListenerUpdateCallbacksHandle is a RAII wrapper for a ListenerUpdateCallbacks. Deleting
+ * the ListenerUpdateCallbacksHandle will remove the callbacks from ListenerManager in O(1).
+ */
+class ListenerUpdateCallbacksHandle {
+public:
+  virtual ~ListenerUpdateCallbacksHandle() = default;
+};
+
+using ListenerUpdateCallbacksHandlePtr = std::unique_ptr<ListenerUpdateCallbacksHandle>;
 
 /**
  * Interface for an LDS API provider.
@@ -64,22 +115,23 @@ public:
    * @param socket_type the type of socket (stream or datagram) to create.
    * @param options to be set on the created socket just before calling 'bind()'.
    * @param bind_type supplies the bind type of the listen socket.
+   * @param creation_options additional options for how to create the socket.
    * @param worker_index supplies the socket/worker index of the new socket.
-   * @return Network::SocketSharedPtr an initialized and potentially bound socket.
+   * @return Network::SocketSharedPtr an initialized and potentially bound socket or error status.
    */
-  virtual Network::SocketSharedPtr
-  createListenSocket(Network::Address::InstanceConstSharedPtr address,
-                     Network::Socket::Type socket_type,
-                     const Network::Socket::OptionsSharedPtr& options, BindType bind_type,
-                     uint32_t worker_index) PURE;
+  virtual absl::StatusOr<Network::SocketSharedPtr> createListenSocket(
+      Network::Address::InstanceConstSharedPtr address, Network::Socket::Type socket_type,
+      const Network::Socket::OptionsSharedPtr& options, BindType bind_type,
+      const Network::SocketCreationOptions& creation_options, uint32_t worker_index) PURE;
 
   /**
    * Creates a list of filter factories.
    * @param filters supplies the proto configuration.
    * @param context supplies the factory creation context.
-   * @return std::vector<Network::FilterFactoryCb> the list of filter factories.
+   * @return Filter::NetworkFilterFactoriesList the list of filter factories or
+   * error status.
    */
-  virtual std::vector<Network::FilterFactoryCb> createNetworkFilterFactoryList(
+  virtual absl::StatusOr<Filter::NetworkFilterFactoriesList> createNetworkFilterFactoryList(
       const Protobuf::RepeatedPtrField<envoy::config::listener::v3::Filter>& filters,
       Server::Configuration::FilterChainFactoryContext& filter_chain_factory_context) PURE;
 
@@ -87,9 +139,9 @@ public:
    * Creates a list of listener filter factories.
    * @param filters supplies the JSON configuration.
    * @param context supplies the factory creation context.
-   * @return std::vector<Network::ListenerFilterFactoryCb> the list of filter factories.
+   * @return Filter::ListenerFilterFactoriesList the list of filter factories.
    */
-  virtual std::vector<Network::ListenerFilterFactoryCb> createListenerFilterFactoryList(
+  virtual absl::StatusOr<Filter::ListenerFilterFactoriesList> createListenerFilterFactoryList(
       const Protobuf::RepeatedPtrField<envoy::config::listener::v3::ListenerFilter>& filters,
       Configuration::ListenerFactoryContext& context) PURE;
 
@@ -99,7 +151,19 @@ public:
    * @param context supplies the factory creation context.
    * @return std::vector<Network::UdpListenerFilterFactoryCb> the list of filter factories.
    */
-  virtual std::vector<Network::UdpListenerFilterFactoryCb> createUdpListenerFilterFactoryList(
+  virtual absl::StatusOr<std::vector<Network::UdpListenerFilterFactoryCb>>
+  createUdpListenerFilterFactoryList(
+      const Protobuf::RepeatedPtrField<envoy::config::listener::v3::ListenerFilter>& filters,
+      Configuration::ListenerFactoryContext& context) PURE;
+
+  /**
+   * Creates a list of QUIC listener filter factories.
+   * @param filters supplies the JSON configuration.
+   * @param context supplies the factory creation context.
+   * @return Filter::ListenerFilterFactoriesList the list of filter factories.
+   */
+  virtual absl::StatusOr<Filter::QuicListenerFilterFactoriesList>
+  createQuicListenerFilterFactoryList(
       const Protobuf::RepeatedPtrField<envoy::config::listener::v3::ListenerFilter>& filters,
       Configuration::ListenerFactoryContext& context) PURE;
 
@@ -114,6 +178,13 @@ public:
    * @return uint64_t a listener tag usable for connection handler tracking.
    */
   virtual uint64_t nextListenerTag() PURE;
+
+  /**
+   * @return Filter::TcpListenerFilterConfigProviderManagerImpl* the pointer of the TCP listener
+   * config provider manager.
+   */
+  virtual Filter::TcpListenerFilterConfigProviderManagerImpl*
+  getTcpListenerConfigProviderManager() PURE;
 };
 
 /**
@@ -153,11 +224,13 @@ public:
    *        listener is not modifiable, future calls to this function or removeListener() on behalf
    *        of this listener will return false.
    * @return TRUE if a listener was added or FALSE if the listener was not updated because it is
-   *         a duplicate of the existing listener. This routine will throw an EnvoyException if
-   *         there is a fundamental error preventing the listener from being added or updated.
+   *         a duplicate of the existing listener. This routine will return
+   *         absl::InvalidArgumentError if there is a fundamental error preventing the listener
+   *         from being added or updated.
    */
-  virtual bool addOrUpdateListener(const envoy::config::listener::v3::Listener& config,
-                                   const std::string& version_info, bool modifiable) PURE;
+  virtual absl::StatusOr<bool>
+  addOrUpdateListener(const envoy::config::listener::v3::Listener& config,
+                      const std::string& version_info, bool modifiable) PURE;
 
   /**
    * Instruct the listener manager to create an LDS API provider. This is a separate operation
@@ -196,18 +269,36 @@ public:
 
   /**
    * Start all workers accepting new connections on all added listeners.
-   * @param guard_dog supplies the guard dog to use for thread watching.
+   * @param guard_dog supplies the optional guard dog to use for thread watching.
    * @param callback supplies the callback to complete server initialization.
+   * @return a status indicating if the operation succeeded.
    */
-  virtual void startWorkers(GuardDog& guard_dog, std::function<void()> callback) PURE;
+  virtual absl::Status startWorkers(OptRef<GuardDog> guard_dog,
+                                    std::function<void()> callback) PURE;
 
   /**
    * Stop all listeners from accepting new connections without actually removing any of them. This
    * is used for server draining and /drain_listeners admin endpoint. This method directly stops the
    * listeners on workers. Once a listener is stopped, any listener modifications are not allowed.
    * @param stop_listeners_type indicates listeners to stop.
+   * @param options additional options passed through to shutdownListener.
    */
-  virtual void stopListeners(StopListenersType stop_listeners_type) PURE;
+  virtual void stopListeners(StopListenersType stop_listeners_type,
+                             const Network::ExtraShutdownListenerOptions& options) PURE;
+
+  /**
+   * Notify the connections of active listeners that a server-wide drain sequence has begun, so that
+   * connection-level drain logic (Network::Connection::onDrain()) can react. Only listeners whose
+   * traffic direction is covered by the drain direction are notified: an InboundOnly drain notifies
+   * only inbound listeners, while an All drain notifies every listener. Does not stop listeners or
+   * close connections.
+   * @param direction the direction of the server drain.
+   * @param drain_event the drain sequence to notify the connections of. The caller supplies it so
+   *        that every connection covered by one drain shares a single, consistent timeline, and so
+   *        that a caller which drains on terms of its own.
+   */
+  virtual void onServerDrainStart(Network::DrainDirection direction,
+                                  Network::ConnectionDrainEvent drain_event) PURE;
 
   /**
    * Stop all threaded workers from running. When this routine returns all worker threads will
@@ -225,7 +316,7 @@ public:
    * Inform the listener manager that the update has completed, and informs the listener of any
    * errors handled by the reload source.
    */
-  using FailureStates = std::vector<std::unique_ptr<envoy::admin::v3::UpdateFailureState>>;
+  using FailureStates = std::vector<envoy::admin::v3::UpdateFailureState>;
   virtual void endListenerUpdate(FailureStates&& failure_states) PURE;
 
   // TODO(junr03): once ApiListeners support warming and draining, this function should return a
@@ -236,16 +327,35 @@ public:
    */
   virtual ApiListenerOptRef apiListener() PURE;
 
+  /**
+   * @return the server's API Listener by name if it exists, nullopt if it does
+   * not.
+   */
+  virtual ApiListenerOptRef apiListener(absl::string_view) { return apiListener(); }
+
   /*
    * @return TRUE if the worker has started or FALSE if not.
    */
   virtual bool isWorkerStarted() PURE;
+
+  /**
+   * This method allows to register callbacks for listener lifecycle events in the
+   * ListenerManager.
+   *
+   * @param callbacks are the ListenerUpdateCallbacks to add or remove to the listener manager.
+   * @return ListenerUpdateCallbacksHandlePtr a RAII that needs to be deleted to
+   * unregister the callback.
+   */
+  virtual ListenerUpdateCallbacksHandlePtr
+  addListenerUpdateCallbacks(ListenerUpdateCallbacks& callbacks) PURE;
 };
 
 // overload operator| to allow ListenerManager::listeners(ListenerState) to be called using a
 // combination of flags, such as listeners(ListenerState::WARMING|ListenerState::ACTIVE)
 constexpr ListenerManager::ListenerState operator|(const ListenerManager::ListenerState lhs,
                                                    const ListenerManager::ListenerState rhs) {
+  // Bitmask combinations intentionally produce intermediate values that are not named enumerators.
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   return static_cast<ListenerManager::ListenerState>(static_cast<uint8_t>(lhs) |
                                                      static_cast<uint8_t>(rhs));
 }

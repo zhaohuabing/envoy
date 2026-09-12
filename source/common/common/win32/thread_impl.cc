@@ -1,7 +1,8 @@
+#include "source/common/common/thread_impl.h"
+
 #include <process.h>
 
 #include "source/common/common/assert.h"
-#include "source/common/common/thread_impl.h"
 
 namespace Envoy {
 namespace Thread {
@@ -22,6 +23,9 @@ ThreadImplWin32::ThreadImplWin32(std::function<void()> thread_routine, OptionsOp
         return 0;
       },
       this, 0, nullptr));
+  if (options && options->priority_ && !SetThreadPriority(thread_handle_, *options->priority_)) {
+    ENVOY_LOG_MISC(warn, "Could not set the thread priority to {}", *options->priority_);
+  }
   RELEASE_ASSERT(thread_handle_ != 0, "");
 }
 
@@ -37,7 +41,7 @@ ThreadPtr ThreadFactoryImplWin32::createThread(std::function<void()> thread_rout
   return std::make_unique<ThreadImplWin32>(thread_routine, options);
 }
 
-ThreadId ThreadFactoryImplWin32::currentThreadId() {
+ThreadId ThreadFactoryImplWin32::currentThreadId() const {
   // TODO(mhoran): test this in windows please.
   return ThreadId(static_cast<int64_t>(::GetCurrentThreadId()));
 }

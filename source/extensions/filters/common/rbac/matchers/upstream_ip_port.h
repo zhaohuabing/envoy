@@ -26,8 +26,8 @@ public:
                const StreamInfo::StreamInfo&) const override;
 
 private:
-  absl::optional<Envoy::Network::Address::CidrRange> cidr_;
-  absl::optional<envoy::type::v3::Int64Range> port_;
+  std::optional<Envoy::Network::Address::CidrRange> cidr_;
+  std::optional<envoy::type::v3::Int64Range> port_;
 };
 
 // Extension factory for UpstreamIpPortMatcher.
@@ -36,7 +36,7 @@ class UpstreamIpPortMatcherFactory
           UpstreamIpPortMatcher,
           envoy::extensions::rbac::matchers::upstream_ip_port::v3::UpstreamIpPortMatcher> {
 public:
-  std::string name() const override { return "envoy.rbac.matchers.upstream.upstream_ip_port"; }
+  std::string name() const override { return "envoy.rbac.matchers.upstream_ip_port"; }
 };
 
 } // namespace Matchers

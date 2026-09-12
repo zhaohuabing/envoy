@@ -28,6 +28,19 @@ upstreams and control plane xDS clusters.
   active_clusters, Gauge, Number of currently active (warmed) clusters
   warming_clusters, Gauge, Number of currently warming (not active) clusters
 
+
+In addition to the cluster manager stats, there are per worker thread local
+cluster manager statistics tree rooted at
+*thread_local_cluster_manager.<worker_id>.* with the following statistics.
+
+.. csv-table::
+  :header: Name, Type, Description
+  :widths: 1, 1, 2
+
+  clusters_inflated, Gauge, Number of clusters the worker has initialized. If using cluster deferral this number should be <= (cluster_added - clusters_removed).
+
+.. _config_cluster_stats:
+
 Every cluster has a statistics tree rooted at *cluster.<name>.* with the following statistics:
 
 .. csv-table::
@@ -41,6 +54,7 @@ Every cluster has a statistics tree rooted at *cluster.<name>.* with the followi
   upstream_cx_http3_total, Counter, Total HTTP/3 connections
   upstream_cx_connect_fail, Counter, Total connection failures
   upstream_cx_connect_timeout, Counter, Total connection connect timeouts
+  upstream_cx_connect_with_0_rtt, Counter, Total connections able to send 0-rtt requests (early data).
   upstream_cx_idle_timeout, Counter, Total connection idle timeouts
   upstream_cx_max_duration_reached, Counter, Total connections closed due to max duration reached
   upstream_cx_connect_attempts_exceeded, Counter, Total consecutive connection failures exceeding configured connection attempts
@@ -59,21 +73,25 @@ Every cluster has a statistics tree rooted at *cluster.<name>.* with the followi
   upstream_cx_tx_bytes_total, Counter, Total sent connection bytes
   upstream_cx_tx_bytes_buffered, Gauge, Send connection bytes currently buffered
   upstream_cx_pool_overflow, Counter, Total times that the cluster's connection pool circuit breaker overflowed
+  upstream_cx_preconnect_skipped, Counter, Total anticipatory connections not opened because the host was ineligible for preconnect
   upstream_cx_protocol_error, Counter, Total connection protocol errors
   upstream_cx_max_requests, Counter, Total connections closed due to maximum requests
   upstream_cx_none_healthy, Counter, Total times connection not established due to no healthy hosts
   upstream_rq_total, Counter, Total requests
   upstream_rq_active, Gauge, Total active requests
   upstream_rq_pending_total, Counter, Total requests pending a connection pool connection
+  upstream_rq_active_overflow, Counter, Total requests rejected because the ``max_requests`` circuit breaker was exhausted while attaching to a ready upstream connection (see ``envoy.reloadable_features.skip_pending_overflow_count_on_active_rq``)
   upstream_rq_pending_overflow, Counter, Total requests that overflowed connection pool or requests (mainly for HTTP/2 and above) circuit breaking and were failed
   upstream_rq_pending_failure_eject, Counter, Total requests that were failed due to a connection pool connection failure or remote connection termination
   upstream_rq_pending_active, Gauge, Total active requests pending a connection pool connection
+  upstream_rq_per_cx, Histogram, Number of requests handled per upstream connection for all HTTP protocols
   upstream_rq_cancelled, Counter, Total requests cancelled before obtaining a connection pool connection
   upstream_rq_maintenance_mode, Counter, Total requests that resulted in an immediate 503 due to :ref:`maintenance mode<config_http_filters_router_runtime_maintenance_mode>`
   upstream_rq_timeout, Counter, Total requests that timed out waiting for a response
   upstream_rq_max_duration_reached, Counter, Total requests closed due to max duration reached
   upstream_rq_per_try_timeout, Counter, Total requests that hit the per try timeout (except when request hedging is enabled)
-  upstream_rq_rx_reset, Counter, Total requests that were reset remotely
+  upstream_rq_rx_reset, Counter, Total requests that were reset remotely with an error
+  upstream_rq_rx_reset_no_error, Counter, Total requests that were reset remotely with no error
   upstream_rq_tx_reset, Counter, Total requests that were reset locally
   upstream_rq_retry, Counter, Total request retries
   upstream_rq_retry_backoff_exponential, Counter, Total retries using the exponential backoff strategy
@@ -97,10 +115,11 @@ Every cluster has a statistics tree rooted at *cluster.<name>.* with the followi
   update_attempt, Counter, Total attempted cluster membership updates by service discovery
   update_success, Counter, Total successful cluster membership updates by service discovery
   update_failure, Counter, Total failed cluster membership updates by service discovery
-  update_duration, Histogram, Amount of time spent updating configs
+  update_duration, Histogram, Amount of time in milliseconds spent updating configs
   update_empty, Counter, Total cluster membership updates ending with empty cluster load assignment and continuing with previous config
   update_no_rebuild, Counter, Total successful cluster membership updates that didn't result in any cluster load balancing structure rebuilds
   version, Gauge, Hash of the contents from the last successful API fetch
+  warming_state, Gauge, Current cluster warming state
   max_host_weight, Gauge, Maximum weight of any host in the cluster
   bind_errors, Counter, Total errors binding the socket to the configured source address
   assignment_timeout_received, Counter, Total assignments received with endpoint lease information.
@@ -190,6 +209,12 @@ Circuit breakers statistics will be rooted at *cluster.<name>.circuit_breakers.<
   remaining_rq, Gauge, Number of remaining requests until the circuit breaker reaches its concurrency limit
   remaining_retries, Gauge, Number of remaining retries until the circuit breaker reaches its concurrency limit
 
+.. note::
+  Metrics starting with prefix ``remaining_`` are not generated by default.
+  To track the number of resources remaining until a circuit breaker opens, set the parameter
+  :ref:`track_remaining <envoy_v3_api_field_config.cluster.v3.CircuitBreakers.Thresholds.track_remaining>`
+  to true in circuit breaker configuration.
+
 .. _config_cluster_manager_cluster_stats_timeout_budgets:
 
 Timeout budget statistics
@@ -236,6 +261,39 @@ are rooted at *cluster.<name>.* and contain the following statistics:
   external.upstream_rq_<\*>, Counter, External origin specific HTTP response codes
   external.upstream_rq_time, Histogram, External origin request time milliseconds
 
+.. note::
+   The ``upstream_rq_<*xx>`` and ``upstream_rq_<*>`` counters only count **final** responses
+   sent to the downstream client. Responses that trigger a retry are counted in
+   ``retry.upstream_rq_<*xx>`` and ``retry.upstream_rq_<*>`` instead (see
+   :ref:`retry statistics <config_cluster_manager_cluster_stats_retry>` below).
+
+   For example, if a request receives ``503`` → ``503`` → ``200`` (two retries before success):
+
+   * ``retry.upstream_rq_503`` = 2 (the two ``503`` responses that were retried)
+   * ``upstream_rq_503`` = 0 (no 503 was sent downstream)
+   * ``upstream_rq_200`` = 1 (the final successful response)
+
+.. _config_cluster_manager_cluster_stats_retry:
+
+Retry statistics
+----------------
+
+When retries are enabled and a response triggers a retry, the following dynamic HTTP statistics
+are emitted. These are rooted at ``cluster.<name>.retry.`` and track responses that were **not**
+sent to the downstream client because they triggered a retry:
+
+.. csv-table::
+  :header: Name, Type, Description
+  :widths: 1, 1, 2
+
+  ``upstream_rq_<\*xx>``, Counter, "Aggregate HTTP response codes that triggered retry (e.g., 5xx)"
+  ``upstream_rq_<\*>``, Counter, "Specific HTTP response codes that triggered retry (e.g., ``503``)"
+
+.. note::
+   These counters are incremented when a response triggers a retry and is **not** forwarded
+   downstream. The corresponding ``upstream_rq_<*>`` counters (without the ``retry.`` prefix)
+   only count final responses that were actually sent to the client.
+
 .. _config_cluster_manager_cluster_stats_tls:
 
 TLS statistics
@@ -244,6 +302,15 @@ TLS statistics
 If TLS is used by the cluster the following statistics are rooted at *cluster.<name>.ssl.*:
 
 .. include:: ../../../_include/ssl_stats.rst
+
+.. _config_cluster_manager_cluster_stats_certs:
+
+TLS and CA certificates
+-----------------------
+
+TLS and CA certificate statistics are rooted in the ``cluster.<name>.ssl.certificate.<cert_name>.``:
+
+.. include:: ../../../_include/cert_stats.rst
 
 .. _config_cluster_manager_cluster_stats_tcp:
 
@@ -299,7 +366,6 @@ the following statistics:
   lb_zone_routing_sampled, Counter, Sending some requests to the same zone
   lb_zone_routing_cross_zone, Counter, Zone aware routing mode but have to send cross zone
   lb_local_cluster_not_ok, Counter, Local host set is not set or it is panic mode for local cluster
-  lb_zone_number_differs, Counter, Number of zones in local and upstream cluster different
   lb_zone_no_capacity_left, Counter, Total number of times ended with random zone selection due to rounding error
   original_dst_host_invalid, Counter, Total number of invalid hosts passed to original destination load balancer
 
@@ -369,6 +435,8 @@ statistics will be added to *cluster.<name>* and contain the following:
    :widths: 1, 1, 2
 
    upstream_rq_headers_size, Histogram, Request headers size in bytes per upstream
+   upstream_rq_headers_count, Histogram, Request header count per upstream
    upstream_rq_body_size, Histogram, Request body size in bytes per upstream
    upstream_rs_headers_size, Histogram, Response headers size in bytes per upstream
+   upstream_rs_headers_count, Histogram, Response header count per upstream
    upstream_rs_body_size, Histogram, Response body size in bytes per upstream

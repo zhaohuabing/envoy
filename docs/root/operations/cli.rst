@@ -3,14 +3,14 @@
 Command line options
 ====================
 
-Envoy is driven both by a JSON configuration file as well as a set of command line options. The
+Envoy is driven both by a configuration file as well as a set of command line options. The
 following are the command line options that Envoy supports.
 
 .. option:: -c <path string>, --config-path <path string>
 
-  *(optional)* The path to the v2 :ref:`JSON/YAML/proto3 configuration
+  *(optional)* The path to the :ref:`JSON/YAML/proto3 configuration
   file <config>`. If this flag is missing, :option:`--config-yaml` is required.
-  This will be parsed as a :ref:`v2 bootstrap configuration file
+  This will be parsed as a :ref:`bootstrap configuration file
   <config_overview_bootstrap>`.
   Valid extensions are ``.json``, ``.yaml``, ``.pb`` and ``.pb_text``, which indicate
   JSON, YAML, `binary proto3
@@ -67,6 +67,25 @@ following are the command line options that Envoy supports.
   :option:`--restart-epoch` is non-zero. Instead, for subsequent hot restarts, set
   :option:`--base-id` option with the selected base ID. See :option:`--base-id-path`.
 
+.. option:: --skip-hot-restart-on-no-parent
+
+  *(optional)* In conjunction with :option:`--restart-epoch`, this flag allows for a failing hot
+  restart to fall back to normal startup behavior. When this flag is false, if the parent instance
+  was terminated, the child instance will also terminate during startup.
+
+  This only impacts if the parent instance was terminated before the new instance is initialized -
+  an unexpected parent termination after interprocess communication is established will still cause
+  the child instance to terminate due to failing communication.
+
+.. option:: --skip-hot-restart-parent-stats
+
+  *(optional)* In conjunction with :option:`--restart-epoch`, this flag allows for hot restart
+  to proceed without duplicating stats from the parent instance. Transferring stats can be an
+  expensive operation; skipping it can prevent overloading the main thread with this work, or
+  potentially dramatically increased memory load.
+
+  Has no effect if hot restarting is not in use.
+
 .. option:: --base-id-path <path_string>
 
   *(optional)* Writes the base ID to the given path. While this option is compatible with
@@ -76,8 +95,12 @@ following are the command line options that Envoy supports.
 .. option:: --concurrency <integer>
 
   *(optional)* The number of :ref:`worker threads <arch_overview_threading>` to run. If not
-  specified defaults to the number of hardware threads on the machine. If set to zero, Envoy will
-  still run one worker thread.
+  specified, defaults to the minimum of the number of hardware threads, the CPU affinity (cpuset)
+  size, and the cgroup CPU limit on Linux-based systems; on other platforms it defaults to the
+  number of hardware threads. This makes Envoy respect container CPU limits (for example a
+  Kubernetes ``resources.limits.cpu`` or Docker ``--cpus``) by default. The cgroup component of
+  this detection can be disabled by setting the ``ENVOY_CGROUP_CPU_DETECTION`` environment variable
+  to ``false``. If set to zero, Envoy will still run one worker thread.
 
 .. option:: -l <string>, --log-level <string>
 
@@ -90,13 +113,14 @@ following are the command line options that Envoy supports.
   never set this option. For example, if you want ``upstream`` component to run at ``debug`` level and
   ``connection`` component to run at ``trace`` level, you should pass ``upstream:debug,connection:trace`` to
   this flag. See ``ALL_LOGGER_IDS`` in :repo:`/source/common/common/logger.h` for a list of components.
+  This option is incompatible with :option:`--enable-fine-grain-logging`.
 
 .. option:: --cpuset-threads
 
-   *(optional)* This flag is used to control the number of worker threads if :option:`--concurrency` is
-   not set. If enabled, the assigned cpuset size is used to determine the number of worker threads on
-   Linux-based systems. Otherwise the number of worker threads is set to the number of hardware threads
-   on the machine. You can read more about cpusets in the
+   *(optional)* This flag is no longer required and is retained for backwards compatibility. When
+   :option:`--concurrency` is not set, the assigned cpuset (CPU affinity) size is already used as one
+   of the inputs to the default worker thread count, so passing this flag has no additional effect.
+   You can read more about cpusets in the
    `kernel documentation <https://www.kernel.org/doc/Documentation/cgroup-v1/cpusets.txt>`_.
 
 .. option:: --log-path <path string>
@@ -118,6 +142,7 @@ following are the command line options that Envoy supports.
    :%v:	The actual message to log ("some user text")
    :%_:	The actual message to log, but with escaped newlines (from (if using ``%v``) "some user text\nbelow", to "some user text\\nbelow")
    :%j:	The actual message to log as JSON escaped string (https://tools.ietf.org/html/rfc7159#page-8).
+   :%N:	The Envoy version string: ``{revision}/{version}/{status}/{build_type}/{ssl_version}`` (e.g. "c93f9f6c1e5adddd10a3e3646c7e049c649ae177/1.38.0/Clean/RELEASE/BoringSSL"), matching the output of :option:`--version`.
    :%t:	Thread id ("1232")
    :%P:	Process id ("3456")
    :%n:	Logger's name ("filter")
@@ -157,7 +182,7 @@ following are the command line options that Envoy supports.
   *(optional)* This flag enables application log sanitization to escape C-style escape sequences.
   This can be used to prevent a single log line from spanning multiple lines in the underlying log.
   This sanitizes all escape sequences in `this list <https://en.cppreference.com/w/cpp/language/escape>`_.
-  Note that each line's trailing whitespace characters (such as EOL characters) will not be escaped.
+  Note that each line's final EOL character will not be escaped to preserve line format.
 
 .. option:: --restart-epoch <integer>
 
@@ -168,13 +193,19 @@ following are the command line options that Envoy supports.
   The :ref:`hot restart wrapper <operations_hot_restarter>` sets the *RESTART_EPOCH* environment
   variable which should be passed to this option in most cases.
 
+.. option:: --log-stacktrace-single-entry
+
+  *(optional)* Emit the entire stack trace in a single log entry instead of one log call per frame.
+  Frames are still newline-delimited within the message. This is useful for log aggregation systems
+  where each log call produces a separate entry (e.g. JSON logging).
+
 .. option:: --enable-fine-grain-logging
 
   *(optional)* Enables fine-grain logger with file level log control and runtime update at administration
   interface. If enabled, main log macros including ``ENVOY_LOG``, ``ENVOY_CONN_LOG``, ``ENVOY_STREAM_LOG`` and
   ``ENVOY_FLUSH_LOG`` will use a per-file logger, and the usage doesn't need ``Envoy::Logger::Loggable`` any
   more. The administration interface usage is similar. Please see :ref:`Administration interface
-  <operations_admin_interface>` for more detail.
+  <operations_admin_interface>` for more detail. This option is incompatible with :option:`--component-log-level`.
 
 .. option:: --socket-path <path string>
 
@@ -254,6 +285,15 @@ following are the command line options that Envoy supports.
   when tailing :ref:`access logs <arch_overview_access_logs>` in order to
   get more (or less) immediate flushing.
 
+.. option:: --file-flush-min-size-kb <integer>
+
+  *(optional)* The minimum size in kilobytes for file flushing. Defaults to 64.
+  This setting is used during file creation to determine the minimum buffer size
+  before flushing to files. The buffer will flush every time it gets full, or every time
+  the interval has elapsed, whichever comes first. Adjusting this setting is useful
+  when tailing :ref:`access logs <arch_overview_access_logs>` in order to
+  get more (or less) immediate flushing.
+
 .. option:: --drain-time-s <integer>
 
   *(optional)* The time in seconds that Envoy will drain connections during
@@ -328,6 +368,13 @@ following are the command line options that Envoy supports.
     small portion of the fleet (staging, canary, etc.) in order to monitor for unknown,
     deprecated, or work-in-progress usage.
 
+.. option:: --skip-deprecated-logs
+
+  *(optional)* This option disables the logging of deprecated field warnings during Protobuf message validation.
+  When enabled, deprecated fields will be silently ignored without generating log messages, which can be useful
+  for reducing log verbosity in production environments. By default, deprecated warnings are logged. The suppression
+  of these warnings is only activated when this CLI option is explicitly used.
+
 .. option:: --disable-extensions <extension list>
 
   *(optional)* This flag disabled the provided list of comma-separated extension names. Disabled
@@ -351,7 +398,7 @@ following are the command line options that Envoy supports.
 
   * build mode - either ``RELEASE`` or ``DEBUG``,
 
-  * TLS library - either ``BoringSSL`` or ``BoringSSL-FIPS``.
+  * TLS library - ``BoringSSL``, ``BoringSSL-FIPS``, or ``OpenSSL``.
 
 .. option:: --enable-core-dump
 
@@ -359,3 +406,9 @@ following are the command line options that Envoy supports.
   It enables core dumps by invoking `prctl <https://man7.org/linux/man-pages/man2/prctl.2.html>`_ using the
   PR_SET_DUMPABLE option. This is useful for container environments when using capabilities, given that when
   Envoy has more capabilities than its base environment core dumping will be disabled by the kernel.
+
+.. option:: --stats-tag
+
+  *(optional)* This flag provides a universal tag for all stats generated by Envoy. The format is ``tag:value``. Only
+  alphanumeric values are allowed for tag names. For tag values all characters are permitted except for '.' (dot).
+  This flag can be repeated multiple times to set multiple universal tags. Multiple values for the same tag name are not allowed.

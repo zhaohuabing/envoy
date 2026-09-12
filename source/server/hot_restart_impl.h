@@ -12,7 +12,7 @@
 #include "envoy/server/hot_restart.h"
 
 #include "source/common/common/assert.h"
-#include "source/common/stats/allocator_impl.h"
+#include "source/common/stats/allocator.h"
 #include "source/server/hot_restarting_child.h"
 #include "source/server/hot_restarting_parent.h"
 
@@ -98,13 +98,19 @@ private:
 class HotRestartImpl : public HotRestart {
 public:
   HotRestartImpl(uint32_t base_id, uint32_t restart_epoch, const std::string& socket_path,
-                 mode_t socket_mode);
+                 mode_t socket_mode, bool skip_hot_restart_on_no_parent, bool skip_parent_stats);
 
   // Server::HotRestart
   void drainParentListeners() override;
-  int duplicateParentListenSocket(const std::string& address, uint32_t worker_index) override;
+  bool parentStopAcceptingRequested() override;
+  int duplicateParentListenSocket(const std::string& address, uint32_t worker_index,
+                                  absl::string_view network_namespace) override;
+  void registerUdpForwardingListener(
+      Network::Address::InstanceConstSharedPtr address,
+      std::shared_ptr<Network::UdpListenerConfig> listener_config) override;
+  OptRef<Network::ParentDrainedCallbackRegistrar> parentDrainedCallbackRegistrar() override;
   void initialize(Event::Dispatcher& dispatcher, Server::Instance& server) override;
-  absl::optional<AdminShutdownResponse> sendParentAdminShutdownRequest() override;
+  std::optional<AdminShutdownResponse> sendParentAdminShutdownRequest() override;
   void sendParentTerminateRequest() override;
   ServerStatsFromParent mergeParentStatsIfAny(Stats::StoreRoot& stats_store) override;
   void shutdown() override;
@@ -112,6 +118,7 @@ public:
   std::string version() override;
   Thread::BasicLockable& logLock() override { return log_lock_; }
   Thread::BasicLockable& accessLogLock() override { return access_log_lock_; }
+  bool isInitializing() const override;
 
   /**
    * envoy --hot_restart_version doesn't initialize Envoy, but computes the version string
@@ -120,6 +127,7 @@ public:
   static std::string hotRestartVersion();
 
 private:
+  friend class HotRestartUdpForwardingTestHelper;
   uint32_t base_id_;
   uint32_t scaled_base_id_;
   HotRestartingChild as_child_;

@@ -1,4 +1,6 @@
-#include "redis_cluster_lb.h"
+#include "source/extensions/clusters/redis/redis_cluster_lb.h"
+
+#include <string>
 
 namespace Envoy {
 namespace Extensions {
@@ -17,7 +19,7 @@ bool ClusterSlot::operator==(const Envoy::Extensions::Clusters::Redis::ClusterSl
 }
 
 // RedisClusterLoadBalancerFactory
-bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsPtr&& slots,
+bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsSharedPtr&& slots,
                                                           Envoy::Upstream::HostMap& all_hosts) {
   // The slots is sorted, allowing for a quick comparison to make sure we need to update the slot
   // array sort based on start and end to enable efficient comparison
@@ -56,8 +58,8 @@ bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsPtr&& slot
         primary_and_replicas->push_back(replica_host->second);
       }
 
-      shard_vector->emplace_back(
-          std::make_shared<RedisShard>(primary_host->second, replicas, primary_and_replicas));
+      shard_vector->emplace_back(std::make_shared<RedisShard>(primary_host->second, replicas,
+                                                              primary_and_replicas, random_));
     }
 
     for (auto i = slot.start(); i <= slot.end(); ++i) {
@@ -66,7 +68,7 @@ bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsPtr&& slot
   }
 
   {
-    absl::WriterMutexLock lock(&mutex_);
+    absl::WriterMutexLock lock(mutex_);
     current_cluster_slot_ = std::move(slots);
     slot_array_ = std::move(updated_slots);
     shard_vector_ = std::move(shard_vector);
@@ -77,7 +79,7 @@ bool RedisClusterLoadBalancerFactory::onClusterSlotUpdate(ClusterSlotsPtr&& slot
 void RedisClusterLoadBalancerFactory::onHostHealthUpdate() {
   ShardVectorSharedPtr current_shard_vector;
   {
-    absl::ReaderMutexLock lock(&mutex_);
+    absl::ReaderMutexLock lock(mutex_);
     current_shard_vector = shard_vector_;
   }
 
@@ -90,18 +92,33 @@ void RedisClusterLoadBalancerFactory::onHostHealthUpdate() {
 
   for (auto const& shard : *current_shard_vector) {
     shard_vector->emplace_back(std::make_shared<RedisShard>(
-        shard->primary(), shard->replicas().hostsPtr(), shard->allHosts().hostsPtr()));
+        shard->primary(), shard->replicas().hostsPtr(), shard->allHosts().hostsPtr(), random_));
   }
 
   {
-    absl::WriterMutexLock lock(&mutex_);
+    absl::WriterMutexLock lock(mutex_);
     shard_vector_ = std::move(shard_vector);
   }
 }
 
-Upstream::LoadBalancerPtr RedisClusterLoadBalancerFactory::create() {
-  absl::ReaderMutexLock lock(&mutex_);
-  return std::make_unique<RedisClusterLoadBalancer>(slot_array_, shard_vector_, random_);
+Upstream::LoadBalancerPtr
+RedisClusterLoadBalancerFactory::create(Upstream::LoadBalancerParams params) {
+  return std::make_unique<RedisClusterLoadBalancer>(shared_from_this(), params.priority_set);
+}
+
+RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::RedisClusterLoadBalancer(
+    std::shared_ptr<RedisClusterLoadBalancerFactory> factory,
+    const Upstream::PrioritySet& priority_set)
+    : factory_(factory), random_(factory->random_) {
+  refresh();
+  member_update_cb_ = priority_set.addMemberUpdateCb(
+      [this](const Upstream::HostVector&, const Upstream::HostVector&) { refresh(); });
+}
+
+void RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::refresh() {
+  absl::ReaderMutexLock lock(factory_->mutex_);
+  slot_array_ = factory_->slot_array_;
+  shard_vector_ = factory_->shard_vector_;
 }
 
 namespace {
@@ -122,24 +139,35 @@ Upstream::HostConstSharedPtr chooseRandomHost(const Upstream::HostSetImpl& host_
     return nullptr;
   }
 }
+
 } // namespace
 
-Upstream::HostConstSharedPtr RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
+Upstream::HostSelectionResponse
+RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
     Envoy::Upstream::LoadBalancerContext* context) {
   if (!slot_array_) {
-    return nullptr;
+    return {nullptr};
   }
-  absl::optional<uint64_t> hash;
+  std::optional<uint64_t> hash;
   if (context) {
     hash = context->computeHashKey();
   }
 
   if (!hash) {
-    return nullptr;
+    return {nullptr};
   }
 
-  auto shard = shard_vector_->at(
-      slot_array_->at(hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot));
+  RedisShardSharedPtr shard;
+  if (dynamic_cast<const RedisSpecifyShardContextImpl*>(context)) {
+    if (hash.value() < shard_vector_->size()) {
+      shard = shard_vector_->at(hash.value());
+    } else {
+      return {nullptr};
+    }
+  } else {
+    shard = shard_vector_->at(
+        slot_array_->at(hash.value() % Envoy::Extensions::Clusters::Redis::MaxSlot));
+  }
 
   auto redis_context = dynamic_cast<RedisLoadBalancerContext*>(context);
   if (redis_context && redis_context->isReadCommand()) {
@@ -147,7 +175,7 @@ Upstream::HostConstSharedPtr RedisClusterLoadBalancerFactory::RedisClusterLoadBa
     case NetworkFilters::Common::Redis::Client::ReadPolicy::Primary:
       return shard->primary();
     case NetworkFilters::Common::Redis::Client::ReadPolicy::PreferPrimary:
-      if (shard->primary()->health() == Upstream::Host::Health::Healthy) {
+      if (shard->primary()->coarseHealth() == Upstream::Host::Health::Healthy) {
         return shard->primary();
       } else {
         return chooseRandomHost(shard->allHosts(), random_);
@@ -162,6 +190,50 @@ Upstream::HostConstSharedPtr RedisClusterLoadBalancerFactory::RedisClusterLoadBa
       }
     case NetworkFilters::Common::Redis::Client::ReadPolicy::Any:
       return chooseRandomHost(shard->allHosts(), random_);
+    case NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity: {
+      // Spread read requests between replicas in the same zone in round robin.
+      // Falls back to other replicas or primary if needed.
+      const std::string& client_zone = redis_context->clientZone();
+      if (!client_zone.empty()) {
+        const auto& local_replicas = shard->replicasInZone(client_zone);
+        if (local_replicas) {
+          auto host = chooseRandomHost(*local_replicas, random_);
+          if (host) {
+            return host;
+          }
+        }
+      }
+      // Fall back to any replica, then primary
+      if (!shard->replicas().hosts().empty()) {
+        return chooseRandomHost(shard->replicas(), random_);
+      }
+      return shard->primary();
+    }
+    case NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary: {
+      // Spread read requests among nodes within the client's zone in round robin,
+      // prioritizing: local replicas → local primary → any replica → primary.
+      const std::string& client_zone = redis_context->clientZone();
+      if (!client_zone.empty()) {
+        // Try local replicas first
+        const auto& local_replicas = shard->replicasInZone(client_zone);
+        if (local_replicas) {
+          auto host = chooseRandomHost(*local_replicas, random_);
+          if (host) {
+            return host;
+          }
+        }
+        // Try local primary
+        if (shard->primaryZone() == client_zone &&
+            shard->primary()->coarseHealth() == Upstream::Host::Health::Healthy) {
+          return shard->primary();
+        }
+      }
+      // Fall back to any replica, then primary
+      if (!shard->replicas().hosts().empty()) {
+        return chooseRandomHost(shard->replicas(), random_);
+      }
+      return shard->primary();
+    }
     }
   }
   return shard->primary();
@@ -189,10 +261,10 @@ bool RedisLoadBalancerContextImpl::isReadRequest(
 RedisLoadBalancerContextImpl::RedisLoadBalancerContextImpl(
     const std::string& key, bool enabled_hashtagging, bool is_redis_cluster,
     const NetworkFilters::Common::Redis::RespValue& request,
-    NetworkFilters::Common::Redis::Client::ReadPolicy read_policy)
+    NetworkFilters::Common::Redis::Client::ReadPolicy read_policy, const std::string& client_zone)
     : hash_key_(is_redis_cluster ? Crc16::crc16(hashtag(key, true))
                                  : MurmurHash::murmurHash2(hashtag(key, enabled_hashtagging))),
-      is_read_(isReadRequest(request)), read_policy_(read_policy) {}
+      is_read_(isReadRequest(request)), read_policy_(read_policy), client_zone_(client_zone) {}
 
 // Inspired by the redis-cluster hashtagging algorithm
 // https://redis.io/topics/cluster-spec#keys-hash-tags
@@ -213,6 +285,13 @@ absl::string_view RedisLoadBalancerContextImpl::hashtag(absl::string_view v, boo
 
   return v.substr(start + 1, end - start - 1);
 }
+RedisSpecifyShardContextImpl::RedisSpecifyShardContextImpl(
+    uint64_t shard_index, const NetworkFilters::Common::Redis::RespValue& request,
+    NetworkFilters::Common::Redis::Client::ReadPolicy read_policy, const std::string& client_zone)
+    : RedisLoadBalancerContextImpl(std::to_string(shard_index), true, true, request, read_policy,
+                                   client_zone),
+      shard_index_(shard_index) {}
+
 } // namespace Redis
 } // namespace Clusters
 } // namespace Extensions

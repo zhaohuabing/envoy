@@ -16,6 +16,15 @@ ConnectionImplBase::ConnectionImplBase(Event::Dispatcher& dispatcher, uint64_t i
 
 void ConnectionImplBase::addConnectionCallbacks(ConnectionCallbacks& cb) {
   callbacks_.push_back(&cb);
+  // The drain notification is one-shot, so a callback registered after the connection was notified
+  // would otherwise never learn that the connection is draining. This is not a corner case: the
+  // HTTP codec (and any wrapper around it) is created lazily on the first byte of data, so any
+  // connection that is idle when its listener starts draining registers callbacks afterwards.
+  // Implementations of onDrain() must therefore only record the event and must not assume that
+  // construction of their owner has completed.
+  if (drain_event_.has_value()) {
+    cb.onDrain(*drain_event_);
+  }
 }
 
 void ConnectionImplBase::removeConnectionCallbacks(ConnectionCallbacks& callbacks) {
@@ -26,6 +35,27 @@ void ConnectionImplBase::removeConnectionCallbacks(ConnectionCallbacks& callback
       return;
     }
   }
+}
+
+void ConnectionImplBase::onDrain(ConnectionDrainEvent drain_event) {
+  // The first event wins. A connection can be notified more than once (a server drain escalating
+  // from InboundOnly to All re-notifies inbound listeners, and a filter chain drain can follow a
+  // server drain), but a connection that is already draining stays on its original timeline rather
+  // than having the drain pushed back or restarted.
+  if (drain_event_.has_value()) {
+    return;
+  }
+  // Remember the event so that callbacks registered later are also notified.
+  drain_event_ = drain_event;
+  for (ConnectionCallbacks* callback : callbacks_) {
+    if (callback != nullptr) {
+      callback->onDrain(drain_event);
+    }
+  }
+}
+
+OptRef<const StreamInfo::StreamInfo> ConnectionImplBase::trackedStream() const {
+  return streamInfo();
 }
 
 void ConnectionImplBase::hashKey(std::vector<uint8_t>& hash) const { addIdToHashKey(hash, id()); }
@@ -50,8 +80,14 @@ void ConnectionImplBase::initializeDelayedCloseTimer() {
 
 void ConnectionImplBase::raiseConnectionEvent(ConnectionEvent event) {
   for (ConnectionCallbacks* callback : callbacks_) {
-    // TODO(mattklein123): If we close while raising a connected event we should not raise further
-    // connected events.
+    // If a previous connected callback closed the connection, don't raise any further connected
+    // events. There was already recursion raising closed events. We still raise closed events
+    // to further callbacks because such events are typically used for cleanup.
+    if (event != ConnectionEvent::LocalClose && event != ConnectionEvent::RemoteClose &&
+        state() != State::Open) {
+      return;
+    }
+
     if (callback != nullptr) {
       callback->onEvent(event);
     }
@@ -64,7 +100,31 @@ void ConnectionImplBase::onDelayedCloseTimeout() {
   if (connection_stats_ != nullptr && connection_stats_->delayed_close_timeouts_ != nullptr) {
     connection_stats_->delayed_close_timeouts_->inc();
   }
-  closeConnectionImmediately();
+  closeConnectionImmediatelyWithDetails(
+      StreamInfo::LocalCloseReasons::get().TriggeredDelayedCloseTimeout);
+}
+
+void ConnectionImplBase::onFilterAboveHighWatermark() {
+  ++above_high_watermark_count_;
+  if (above_high_watermark_count_ == 1) {
+    for (ConnectionCallbacks* callback : callbacks_) {
+      if (callback) {
+        callback->onAboveWriteBufferHighWatermark();
+      }
+    }
+  }
+}
+
+void ConnectionImplBase::onFilterBelowLowWatermark() {
+  ASSERT(above_high_watermark_count_ > 0);
+  --above_high_watermark_count_;
+  if (above_high_watermark_count_ == 0) {
+    for (ConnectionCallbacks* callback : callbacks_) {
+      if (callback) {
+        callback->onBelowWriteBufferLowWatermark();
+      }
+    }
+  }
 }
 
 } // namespace Network

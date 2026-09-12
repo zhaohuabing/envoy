@@ -4,14 +4,13 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/stats/sink.h"
 #include "envoy/upstream/cluster_manager.h"
-
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Server {
@@ -84,6 +83,16 @@ public:
    * @return bool indicator to flush stats on-demand via the admin interface instead of on a timer.
    */
   virtual bool flushOnAdmin() const PURE;
+
+  /**
+   * @return true if deferred creation of stats is enabled.
+   */
+  virtual bool enableDeferredCreationStats() const PURE;
+
+  /**
+   * @return uint32_t a multiple of the flush interval to perform stats eviction, or 0 if disabled.
+   */
+  virtual uint32_t evictOnFlush() const PURE;
 };
 
 /**
@@ -98,6 +107,12 @@ public:
    *         This will be nullptr if the cluster manager has not initialized yet.
    */
   virtual Upstream::ClusterManager* clusterManager() PURE;
+
+  /**
+   * @return const Upstream::ClusterManager* singleton for use by the entire server.
+   *         This will be nullptr if the cluster manager has not initialized yet.
+   */
+  virtual const Upstream::ClusterManager* clusterManager() const PURE;
 
   /**
    * @return const StatsConfig& the configuration of server stats.
@@ -125,7 +140,7 @@ public:
   /**
    * @return std::list<AccessLog::InstanceSharedPtr> the list of access loggers.
    */
-  virtual std::list<AccessLog::InstanceSharedPtr> accessLogs() const PURE;
+  virtual AccessLog::InstanceSharedPtrVector accessLogs() const PURE;
 
   /**
    * @return const std::string& profiler output path.
@@ -141,6 +156,12 @@ public:
    * @return Network::Address::OptionsSharedPtr the list of listener socket options.
    */
   virtual Network::Socket::OptionsSharedPtr socketOptions() PURE;
+
+  /**
+   * @return bool whether the listener should avoid blocking connections based on the globally set
+   * limit.
+   */
+  virtual bool ignoreGlobalConnLimit() const PURE;
 };
 
 /**
@@ -156,9 +177,9 @@ public:
   virtual Admin& admin() PURE;
 
   /**
-   * @return absl::optional<std::string> the path to look for flag files.
+   * @return std::optional<std::string> the path to look for flag files.
    */
-  virtual absl::optional<std::string> flagsPath() const PURE;
+  virtual std::optional<std::string> flagsPath() const PURE;
 
   /**
    * @return const envoy::config::bootstrap::v2::LayeredRuntime& runtime

@@ -12,15 +12,27 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_extension_cc_test(
+    name = "config_test",
+    srcs = ["config_test.cc"],
+    extension_names = ["envoy.filters.http.cors"],
+    deps = [
+        "//source/extensions/filters/http/cors:config",
+        "//test/mocks/server:factory_context_mocks",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "cors_filter_test",
     srcs = ["cors_filter_test.cc"],
     extension_names = ["envoy.filters.http.cors"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/http:header_map_lib",
         "//source/extensions/filters/http/cors:config",
         "//source/extensions/filters/http/cors:cors_filter_lib",
         "//test/mocks/buffer:buffer_mocks",
         "//test/mocks/http:http_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "@envoy_api//envoy/type/matcher/v3:pkg_cc_proto",
     ],
@@ -28,8 +40,10 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "cors_filter_integration_test",
+    size = "large",
     srcs = ["cors_filter_integration_test.cc"],
     extension_names = ["envoy.filters.http.cors"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/common/http:header_map_lib",

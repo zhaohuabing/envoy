@@ -1,10 +1,22 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <list>
+#include <memory>
+#include <optional>
+#include <string>
 
-#include "envoy/event/dispatcher.h"
+#include "envoy/common/optref.h"
+#include "envoy/common/pure.h"
+#include "envoy/common/random_generator.h"
+#include "envoy/network/connection_handler.h"
+#include "envoy/network/filter.h"
+#include "envoy/network/listener.h"
+#include "envoy/runtime/runtime.h"
 #include "envoy/server/guarddog.h"
 #include "envoy/server/overload/overload_manager.h"
+#include "envoy/stats/scope.h"
 
 namespace Envoy {
 namespace Server {
@@ -30,10 +42,12 @@ public:
    * @param listener supplies the listener to add.
    * @param completion supplies the completion to call when the listener has been added (or not) on
    *                   the worker.
+   * @param runtime, supplies the runtime for the server
+   * @param random, supplies a random number generator
    */
-  virtual void addListener(absl::optional<uint64_t> overridden_listener,
-                           Network::ListenerConfig& listener,
-                           AddListenerCompletion completion) PURE;
+  virtual void addListener(std::optional<uint64_t> overridden_listener,
+                           Network::ListenerConfig& listener, AddListenerCompletion completion,
+                           Runtime::Loader& runtime, Random::RandomGenerator& random) PURE;
 
   /**
    * @return uint64_t the number of connections across all listeners that the worker owns.
@@ -42,10 +56,12 @@ public:
 
   /**
    * Start the worker thread.
-   * @param guard_dog supplies the guard dog to use for thread watching.
+   * @param guard_dog supplies the optional guard dog to use for thread watching.
    * @param cb a callback to run when the worker thread starts running.
+   * @param cpu_id an optional CPU to pin the worker thread to for CPU locality.
    */
-  virtual void start(GuardDog& guard_dog, const Event::PostCb& cb) PURE;
+  virtual void start(OptRef<GuardDog> guard_dog, const std::function<void()>& cb,
+                     std::optional<uint32_t> cpu_id) PURE;
 
   /**
    * Initialize stats for this worker's dispatcher, if available. The worker will output
@@ -82,12 +98,40 @@ public:
   /**
    * Stop a listener from accepting new connections. This is used for server draining.
    * @param listener supplies the listener to stop.
+   * @param options additional options to be passed through to shutdownListener.
    * @param completion supplies the completion to be called when the listener has stopped
    * accepting new connections. This completion is called on the worker thread. No locking is
    * performed by the worker.
    */
   virtual void stopListener(Network::ListenerConfig& listener,
+                            const Network::ExtraShutdownListenerOptions& options,
                             std::function<void()> completion) PURE;
+
+  /**
+   * Notify all connections in the given filter chains of the listener that they are being
+   * drained. This is intended to be invoked at the start of a drain sequence (before the
+   * drain timer expires). Connections are not closed. This is a fire-and-forget operation
+   * that is posted to the worker's dispatcher.
+   * @param listener_tag supplies the tag passed to addListener().
+   * @param filter_chains supplies the filter chains whose connections should be notified.
+   * @param drain_event describes the drain sequence (start time and strategy), captured
+   *        once on the main thread so all connections share a consistent drain timeline.
+   */
+  virtual void onFilterChainDrain(uint64_t listener_tag,
+                                  const std::list<const Network::FilterChain*>& filter_chains,
+                                  Network::ConnectionDrainEvent drain_event) PURE;
+
+  /**
+   * Notify all connections of the given listener that they are being drained. Connections
+   * are not closed. This is a fire-and-forget operation that is posted to the worker's
+   * dispatcher.
+   * @param listener_tag supplies the tag passed to addListener() of the listener whose connections
+   *        should be notified.
+   * @param drain_event describes the drain sequence (start time and strategy), captured
+   *        once on the main thread so all connections share a consistent drain timeline.
+   */
+  virtual void onListenerDrain(uint64_t listener_tag,
+                               Network::ConnectionDrainEvent drain_event) PURE;
 };
 
 using WorkerPtr = std::unique_ptr<Worker>;
@@ -102,10 +146,13 @@ public:
   /**
    * @param index supplies the index of the worker, in the range of [0, concurrency).
    * @param overload_manager supplies the server's overload manager.
+   * @param null_overload_manager supplies the server's null overload manager for conditions where
+   * overload manager is disabled.
    * @param worker_name supplies the name of the worker, used for per-worker stats.
    * @return WorkerPtr a new worker.
    */
   virtual WorkerPtr createWorker(uint32_t index, OverloadManager& overload_manager,
+                                 OverloadManager& null_overload_manager,
                                  const std::string& worker_name) PURE;
 };
 

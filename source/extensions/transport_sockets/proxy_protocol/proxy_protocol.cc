@@ -3,24 +3,88 @@
 #include <sstream>
 
 #include "envoy/config/core/v3/proxy_protocol.pb.h"
+#include "envoy/extensions/transport_sockets/proxy_protocol/v3/upstream_proxy_protocol.pb.h"
+#include "envoy/extensions/transport_sockets/proxy_protocol/v3/upstream_proxy_protocol.pb.validate.h"
 #include "envoy/network/transport_socket.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/hex.h"
+#include "source/common/common/scalar_to_byte_vector.h"
+#include "source/common/common/utility.h"
+#include "source/common/config/well_known_names.h"
+#include "source/common/formatter/substitution_format_string.h"
 #include "source/common/network/address_impl.h"
+#include "source/common/protobuf/utility.h"
 #include "source/extensions/common/proxy_protocol/proxy_protocol_header.h"
 
+using envoy::config::core::v3::PerHostConfig;
 using envoy::config::core::v3::ProxyProtocolConfig;
 using envoy::config::core::v3::ProxyProtocolConfig_Version;
+using envoy::config::core::v3::ProxyProtocolPassThroughTLVs;
 
 namespace Envoy {
 namespace Extensions {
 namespace TransportSockets {
 namespace ProxyProtocol {
 
+absl::StatusOr<AddedTlvsConstSharedPtr>
+parseTLVs(const ProxyProtocolConfig& config,
+          Server::Configuration::TransportSocketFactoryContext& context) {
+  auto tlvs = std::make_shared<AddedTlvs>();
+  const bool format_string_enabled = Runtime::runtimeFeatureEnabled(
+      "envoy.reloadable_features.proxy_protocol_added_tlvs_format_string");
+  for (const auto& entry : config.added_tlvs()) {
+    if (format_string_enabled) {
+      const bool has_value = !entry.value().empty();
+      const bool has_format_string = entry.has_format_string();
+      if (has_value && has_format_string) {
+        return absl::InvalidArgumentError(
+            "Invalid TLV configuration: only one of 'value' or 'format_string' may be set.");
+      }
+      if (!has_value && !has_format_string) {
+        return absl::InvalidArgumentError(
+            "Invalid TLV configuration: one of 'value' or 'format_string' must be set.");
+      }
+      if (has_format_string) {
+        auto formatter_or_error = Formatter::SubstitutionFormatStringUtils::fromProtoConfig(
+            entry.format_string(), context);
+        if (!formatter_or_error.ok()) {
+          return absl::InvalidArgumentError(absl::StrCat("Failed to parse TLV format string: ",
+                                                         formatter_or_error.status().ToString()));
+        }
+        tlvs->dynamic_tlvs.push_back(TlvFormatter{static_cast<uint8_t>(entry.type()),
+                                                  std::move(formatter_or_error.value())});
+        continue;
+      }
+    }
+    // Static entry, taken by the value-only path and the legacy path where format_string is
+    // disabled.
+    tlvs->static_tlvs.push_back(Network::ProxyProtocolTLV{
+        static_cast<uint8_t>(entry.type()),
+        std::vector<unsigned char>(entry.value().begin(), entry.value().end())});
+  }
+  return tlvs;
+}
+
 UpstreamProxyProtocolSocket::UpstreamProxyProtocolSocket(
     Network::TransportSocketPtr&& transport_socket,
-    Network::TransportSocketOptionsConstSharedPtr options, ProxyProtocolConfig_Version version)
-    : PassthroughSocket(std::move(transport_socket)), options_(options), version_(version) {}
+    Network::TransportSocketOptionsConstSharedPtr options, ProxyProtocolConfig config,
+    const UpstreamProxyProtocolStats& stats, AddedTlvsConstSharedPtr tlvs)
+    : PassthroughSocket(std::move(transport_socket)), options_(options), version_(config.version()),
+      stats_(stats),
+      pass_all_tlvs_(config.has_pass_through_tlvs() ? config.pass_through_tlvs().match_type() ==
+                                                          ProxyProtocolPassThroughTLVs::INCLUDE_ALL
+                                                    : false),
+      tlvs_(std::move(tlvs)) {
+  // parseTLVs always supplies a valid pointer, relied on by buildCustomTLVs.
+  ASSERT(tlvs_ != nullptr);
+  if (config.has_pass_through_tlvs() &&
+      config.pass_through_tlvs().match_type() == ProxyProtocolPassThroughTLVs::INCLUDE) {
+    for (const auto& tlv_type : config.pass_through_tlvs().tlv_type()) {
+      pass_through_tlvs_.insert(0xFF & tlv_type);
+    }
+  }
+}
 
 void UpstreamProxyProtocolSocket::setTransportSocketCallbacks(
     Network::TransportSocketCallbacks& callbacks) {
@@ -64,13 +128,28 @@ void UpstreamProxyProtocolSocket::generateHeaderV1() {
   Common::ProxyProtocol::generateV1Header(*src_addr->ip(), *dst_addr->ip(), header_buffer_);
 }
 
+namespace {
+std::string toHex(Buffer::Instance& buffer) {
+  const uint8_t* data = static_cast<const uint8_t*>(buffer.linearize(buffer.length()));
+  return Hex::encode(absl::Span<const uint8_t>(data, buffer.length()));
+}
+} // namespace
+
 void UpstreamProxyProtocolSocket::generateHeaderV2() {
   if (!options_ || !options_->proxyProtocolOptions().has_value()) {
     Common::ProxyProtocol::generateV2LocalHeader(header_buffer_);
   } else {
+    std::vector<Envoy::Network::ProxyProtocolTLV> custom_tlvs = buildCustomTLVs();
+
     const auto options = options_->proxyProtocolOptions().value();
-    Common::ProxyProtocol::generateV2Header(*options.src_addr_->ip(), *options.dst_addr_->ip(),
-                                            header_buffer_);
+    if (!Common::ProxyProtocol::generateV2Header(options, header_buffer_, pass_all_tlvs_,
+                                                 pass_through_tlvs_, custom_tlvs)) {
+      // There is a warn log in generateV2Header method.
+      stats_.v2_tlvs_exceed_max_length_.inc();
+    }
+
+    ENVOY_LOG(trace, "generated proxy protocol v2 header, length: {}, buffer: {}",
+              header_buffer_.length(), toHex(header_buffer_));
   }
 }
 
@@ -106,21 +185,130 @@ void UpstreamProxyProtocolSocket::onConnected() {
 }
 
 UpstreamProxyProtocolSocketFactory::UpstreamProxyProtocolSocketFactory(
-    Network::TransportSocketFactoryPtr transport_socket_factory, ProxyProtocolConfig config)
-    : transport_socket_factory_(std::move(transport_socket_factory)), config_(config) {}
+    Network::UpstreamTransportSocketFactoryPtr transport_socket_factory, ProxyProtocolConfig config,
+    Stats::Scope& scope, AddedTlvsConstSharedPtr tlvs)
+    : PassthroughFactory(std::move(transport_socket_factory)), config_(config),
+      stats_(generateUpstreamProxyProtocolStats(scope)), tlvs_(std::move(tlvs)) {}
 
 Network::TransportSocketPtr UpstreamProxyProtocolSocketFactory::createTransportSocket(
-    Network::TransportSocketOptionsConstSharedPtr options) const {
-  auto inner_socket = transport_socket_factory_->createTransportSocket(options);
+    Network::TransportSocketOptionsConstSharedPtr options,
+    Upstream::HostDescriptionConstSharedPtr host) const {
+  auto inner_socket = transport_socket_factory_->createTransportSocket(options, host);
   if (inner_socket == nullptr) {
     return nullptr;
   }
-  return std::make_unique<UpstreamProxyProtocolSocket>(std::move(inner_socket), options,
-                                                       config_.version());
+  return std::make_unique<UpstreamProxyProtocolSocket>(std::move(inner_socket), options, config_,
+                                                       stats_, tlvs_);
 }
 
-bool UpstreamProxyProtocolSocketFactory::implementsSecureTransport() const {
-  return transport_socket_factory_->implementsSecureTransport();
+void UpstreamProxyProtocolSocketFactory::hashKey(
+    std::vector<uint8_t>& key, Network::TransportSocketOptionsConstSharedPtr options) const {
+  PassthroughFactory::hashKey(key, options);
+  // Proxy protocol options should only be included in the hash if the upstream
+  // socket intends to use them.
+  if (options) {
+    const auto& proxy_protocol_options = options->proxyProtocolOptions();
+    if (proxy_protocol_options.has_value()) {
+      pushScalarToByteVector(
+          StringUtil::CaseInsensitiveHash()(proxy_protocol_options.value().asStringForHash()), key);
+    }
+  }
+}
+
+std::vector<Envoy::Network::ProxyProtocolTLV> UpstreamProxyProtocolSocket::buildCustomTLVs() const {
+  std::vector<Envoy::Network::ProxyProtocolTLV> custom_tlvs;
+  absl::flat_hash_set<uint8_t> host_level_tlv_types;
+
+  const bool runtime_allow_duplicate_tlvs = Runtime::runtimeFeatureEnabled(
+      "envoy.reloadable_features.proxy_protocol_allow_duplicate_tlvs");
+
+  // Attempt to parse host-level TLVs first.
+  const auto& upstream_info = callbacks_->connection().streamInfo().upstreamInfo();
+  if (upstream_info && upstream_info->upstreamHost()) {
+    auto metadata = upstream_info->upstreamHost()->metadata();
+    if (metadata) {
+      const auto filter_it = metadata->typed_filter_metadata().find(
+          Envoy::Config::MetadataFilters::get().ENVOY_TRANSPORT_SOCKETS_PROXY_PROTOCOL);
+      if (filter_it != metadata->typed_filter_metadata().end()) {
+        PerHostConfig host_tlv_metadata;
+        auto status = MessageUtil::unpackTo(filter_it->second, host_tlv_metadata);
+        if (!status.ok()) {
+          ENVOY_LOG(warn,
+                    "Failed to unpack custom TLVs from upstream host metadata for host {}. "
+                    "Error: {}. Will still use config-level TLVs.",
+                    upstream_info->upstreamHost()->address()->asString(), status.message());
+        } else {
+          // Insert host-level TLVs.
+          if (runtime_allow_duplicate_tlvs) {
+            for (const auto& entry : host_tlv_metadata.added_tlvs()) {
+              custom_tlvs.push_back(Network::ProxyProtocolTLV{
+                  static_cast<uint8_t>(entry.type()),
+                  std::vector<unsigned char>(entry.value().begin(), entry.value().end())});
+              host_level_tlv_types.insert(entry.type());
+            }
+          } else {
+            for (const auto& entry : host_tlv_metadata.added_tlvs()) {
+              if (host_level_tlv_types.contains(entry.type())) {
+                ENVOY_LOG_EVERY_POW_2_MISC(
+                    info, "Skipping duplicate TLV type from host metadata {}", entry.type());
+                continue;
+              }
+              custom_tlvs.push_back(Network::ProxyProtocolTLV{
+                  static_cast<uint8_t>(entry.type()),
+                  std::vector<unsigned char>(entry.value().begin(), entry.value().end())});
+              host_level_tlv_types.insert(entry.type());
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Config-level TLVs are the static entries plus any dynamic entries evaluated from a format
+  // string against this connection's stream info. Configs without dynamic entries use the static
+  // list directly to avoid a copy.
+  const auto& static_tlvs = tlvs_->static_tlvs;
+  const auto& dynamic_tlvs = tlvs_->dynamic_tlvs;
+  std::vector<Network::ProxyProtocolTLV> combined_tlvs;
+  const std::vector<Network::ProxyProtocolTLV>* config_tlvs = &static_tlvs;
+  if (!dynamic_tlvs.empty()) {
+    combined_tlvs.reserve(static_tlvs.size() + dynamic_tlvs.size());
+    for (const auto& tlv : static_tlvs) {
+      combined_tlvs.push_back(tlv);
+    }
+    const auto& stream_info = callbacks_->connection().streamInfo();
+    for (const auto& tlv_formatter : dynamic_tlvs) {
+      const std::string value = tlv_formatter.formatter->format({}, stream_info);
+      // A TLV value must be at least one byte, so skip formatters that produce an empty string.
+      if (value.empty()) {
+        continue;
+      }
+      combined_tlvs.push_back(Network::ProxyProtocolTLV{
+          tlv_formatter.type, std::vector<unsigned char>(value.begin(), value.end())});
+    }
+    config_tlvs = &combined_tlvs;
+  }
+
+  // If host-level parse failed or was not present, we still read config-level TLVs.
+  if (runtime_allow_duplicate_tlvs) {
+    for (const auto& tlv : *config_tlvs) {
+      if (!host_level_tlv_types.contains(tlv.type)) {
+        custom_tlvs.push_back(tlv);
+      }
+    }
+  } else {
+    for (const auto& tlv : *config_tlvs) {
+      if (host_level_tlv_types.contains(tlv.type)) {
+        ENVOY_LOG_EVERY_POW_2_MISC(info, "Skipping duplicate TLV type from added_tlvs {}",
+                                   tlv.type);
+        continue;
+      }
+      custom_tlvs.push_back(tlv);
+      host_level_tlv_types.insert(tlv.type);
+    }
+  }
+
+  return custom_tlvs;
 }
 
 } // namespace ProxyProtocol

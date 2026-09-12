@@ -5,10 +5,14 @@
 #include "envoy/config/typed_config.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/protobuf/message_validator.h"
+#include "envoy/runtime/runtime.h"
 #include "envoy/server/options.h"
+#include "envoy/server/proactive_resource_monitor.h"
 #include "envoy/server/resource_monitor.h"
 
 #include "source/common/protobuf/protobuf.h"
+
+#include "absl/status/statusor.h"
 
 namespace Envoy {
 namespace Server {
@@ -39,6 +43,11 @@ public:
    *         messages.
    */
   virtual ProtobufMessage::ValidationVisitor& messageValidationVisitor() PURE;
+
+  /**
+   * @return Runtime::Loader& the runtime loader for runtime key overrides.
+   */
+  virtual Runtime::Loader& runtime() PURE;
 };
 
 /**
@@ -55,11 +64,30 @@ public:
    *        implementation.
    * @param context ResourceMonitorFactoryContext& supplies the resource monitor's context.
    * @return ResourceMonitorPtr the resource monitor instance. Should not be nullptr.
+   */
+  virtual absl::StatusOr<ResourceMonitorPtr>
+  createResourceMonitor(const Protobuf::Message& config,
+                        ResourceMonitorFactoryContext& context) PURE;
+
+  std::string category() const override { return "envoy.resource_monitors"; }
+};
+
+class ProactiveResourceMonitorFactory : public Config::TypedFactory {
+public:
+  ~ProactiveResourceMonitorFactory() override = default;
+
+  /**
+   * Create a particular proactive resource monitor implementation.
+   * @param config const ProtoBuf::Message& supplies the config for the proactive resource monitor
+   *        implementation.
+   * @param context ResourceMonitorFactoryContext& supplies the resource monitor's context.
+   * @return ProactiveResourceMonitorPtr the resource monitor instance. Should not be nullptr.
    * @throw EnvoyException if the implementation is unable to produce an instance with
    *        the provided parameters.
    */
-  virtual ResourceMonitorPtr createResourceMonitor(const Protobuf::Message& config,
-                                                   ResourceMonitorFactoryContext& context) PURE;
+  virtual ProactiveResourceMonitorPtr
+  createProactiveResourceMonitor(const Protobuf::Message& config,
+                                 ResourceMonitorFactoryContext& context) PURE;
 
   std::string category() const override { return "envoy.resource_monitors"; }
 };

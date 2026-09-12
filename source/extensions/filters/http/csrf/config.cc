@@ -11,28 +11,29 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Csrf {
 
-Http::FilterFactoryCb CsrfFilterFactory::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> CsrfFilterFactory::createHttpFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::csrf::v3::CsrfPolicy& policy,
-    const std::string& stats_prefix, Server::Configuration::FactoryContext& context) {
-  CsrfFilterConfigSharedPtr config =
-      std::make_shared<CsrfFilterConfig>(policy, stats_prefix, context.scope(), context.runtime());
+    Server::Configuration::ServerFactoryContext& context,
+    Server::Configuration::ExtraFactoryContext& extra_context) {
+  CsrfFilterConfigSharedPtr config = std::make_shared<CsrfFilterConfig>(
+      policy, extra_context.stats_prefix, extra_context.scopeOr(context), context);
   return [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamDecoderFilter(std::make_shared<CsrfFilter>(config));
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 CsrfFilterFactory::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::csrf::v3::CsrfPolicy& policy,
     Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&) {
-  return std::make_shared<const Csrf::CsrfPolicy>(policy, context.runtime());
+  return std::make_shared<const Csrf::CsrfPolicy>(policy, context);
 }
 
 /**
  * Static registration for the CSRF filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(CsrfFilterFactory,
-                 Server::Configuration::NamedHttpFilterConfigFactory){"envoy.csrf"};
+LEGACY_REGISTER_FACTORY(CsrfFilterFactory, Server::Configuration::NamedHttpFilterConfigFactory,
+                        "envoy.csrf");
 
 } // namespace Csrf
 } // namespace HttpFilters

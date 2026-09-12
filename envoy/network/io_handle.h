@@ -2,15 +2,19 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 
 #include "envoy/api/io_error.h"
+#include "envoy/api/os_sys_calls_common.h"
+#include "envoy/buffer/buffer.h"
 #include "envoy/common/platform.h"
 #include "envoy/common/pure.h"
 #include "envoy/event/file_event.h"
 #include "envoy/network/address.h"
 
+#include "source/common/buffer/buffer_impl.h"
+
 #include "absl/container/fixed_array.h"
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Buffer {
@@ -54,6 +58,11 @@ public:
   virtual os_fd_t fdDoNotUse() const PURE;
 
   /**
+   * Requests RST on a subsequent close().
+   */
+  virtual void setAbortiveClose() PURE;
+
+  /**
    * Clean up IoHandle resources
    */
   virtual Api::IoCallUint64Result close() PURE;
@@ -62,6 +71,12 @@ public:
    * Return true if close() hasn't been called.
    */
   virtual bool isOpen() const PURE;
+
+  /**
+   * Return true if the socket has had connect() successfully called on it.
+   * Use isOpen() to check if the socket is still connected or not.
+   */
+  virtual bool wasConnected() const PURE;
 
   /**
    * Read data into given slices.
@@ -77,13 +92,13 @@ public:
   /**
    * Read from a io handle directly into buffer.
    * @param buffer supplies the buffer to read into.
-   * @param max_length supplies the maximum length to read. A value of absl::nullopt means to read
+   * @param max_length supplies the maximum length to read. A value of std::nullopt means to read
    *   as much data as possible, within the constraints of available buffer size.
    * @return a IoCallUint64Result with err_ = nullptr and rc_ = the number of bytes
    * read if successful, or err_ = some IoError for failure. If call failed, rc_ shouldn't be used.
    */
   virtual Api::IoCallUint64Result read(Buffer::Instance& buffer,
-                                       absl::optional<uint64_t> max_length) PURE;
+                                       std::optional<uint64_t> max_length) PURE;
 
   /**
    * Write the data in slices out.
@@ -103,6 +118,16 @@ public:
    * shouldn't be used.
    */
   virtual Api::IoCallUint64Result write(Buffer::Instance& buffer) PURE;
+
+  /**
+   * Send data on a connected socket.
+   * @param buffer points to the data to be sent.
+   * @param length is the length of the data to be sent. A zero length is passed to the underlying
+   * socket operation and is not treated as a no-op.
+   * @return a Api::IoCallUint64Result with err_ = an Api::IoError instance or
+   * err_ = nullptr and rc_ = the bytes written for success.
+   */
+  virtual Api::IoCallUint64Result send(const void* buffer, size_t length) PURE;
 
   /**
    * Send a message to the address.
@@ -131,6 +156,10 @@ public:
     // If true indicates a successful syscall, but the packet was dropped due to truncation. We do
     // not support receiving truncated packets.
     bool truncated_and_dropped_{false};
+    // The contents of the TOS byte in the IP header.
+    uint8_t tos_{0};
+    // UDP control message specified by save_cmsg_config in QUIC config.
+    Buffer::OwnedImpl saved_cmsg_;
   };
 
   /**
@@ -157,6 +186,15 @@ public:
     absl::FixedArray<RecvMsgPerPacketInfo> msg_;
   };
 
+  // Struct representation of QuicProtocolOptions::SaveCmsgConfig config proto.
+  struct UdpSaveCmsgConfig {
+    std::optional<uint32_t> level;
+    std::optional<uint32_t> type;
+    uint32_t expected_size = 0;
+
+    bool hasConfig() const { return (level.has_value() && type.has_value()); }
+  };
+
   /**
    * Receive a message into given slices, output overflow, source/destination
    * addresses via passed-in parameters upon success.
@@ -164,12 +202,15 @@ public:
    * @param num_slice indicates number of slices |slices| contains.
    * @param self_port the port this handle is assigned to. This is used to populate
    * local_address because local port can't be retrieved from control message.
+   * @param save_cmsg_config config that determines whether cmsg is saved to output.
    * @param output modified upon each call to return fields requested in it.
    * @return a Api::IoCallUint64Result with err_ = an Api::IoError instance or
    * err_ = nullptr and rc_ = the bytes received for success.
    */
   virtual Api::IoCallUint64Result recvmsg(Buffer::RawSlice* slices, const uint64_t num_slice,
-                                          uint32_t self_port, RecvMsgOutput& output) PURE;
+                                          uint32_t self_port,
+                                          const UdpSaveCmsgConfig& save_cmsg_config,
+                                          RecvMsgOutput& output) PURE;
 
   /**
    * If the platform supports, receive multiple messages into given slices, output overflow,
@@ -177,9 +218,11 @@ public:
    * @param slices are the receive buffers for the messages. Each message
    * received are stored in an individual entry of |slices|.
    * @param self_port is the same as the one in recvmsg().
+   * @param save_cmsg_config config that determines whether cmsg is saved to output.
    * @param output is modified upon each call and each message received.
    */
   virtual Api::IoCallUint64Result recvmmsg(RawSliceArrays& slices, uint32_t self_port,
+                                           const UdpSaveCmsgConfig& save_cmsg_config,
                                            RecvMsgOutput& output) PURE;
 
   /**
@@ -263,19 +306,19 @@ public:
   /**
    * @return the domain used by underlying socket (see man 2 socket)
    */
-  virtual absl::optional<int> domain() PURE;
+  virtual std::optional<int> domain() PURE;
 
   /**
    * Get local address (ip:port pair)
-   * @return local address as @ref Address::InstanceConstSharedPtr
+   * @return local address as @ref Address::InstanceConstSharedPtr or error status.
    */
-  virtual Address::InstanceConstSharedPtr localAddress() PURE;
+  virtual absl::StatusOr<Address::InstanceConstSharedPtr> localAddress() PURE;
 
   /**
    * Get peer's address (ip:port pair)
-   * @return peer's address as @ref Address::InstanceConstSharedPtr
+   * @return peer's address as @ref Address::InstanceConstSharedPtr or error status.
    */
-  virtual Address::InstanceConstSharedPtr peerAddress() PURE;
+  virtual absl::StatusOr<Address::InstanceConstSharedPtr> peerAddress() PURE;
 
   /**
    * Duplicates the handle. This is intended to be used only on listener sockets. (see man dup)
@@ -320,11 +363,24 @@ public:
   virtual Api::SysCallIntResult shutdown(int how) PURE;
 
   /**
-   *  @return absl::optional<std::chrono::milliseconds> An optional of the most recent round-trip
+   *  @return std::optional<std::chrono::milliseconds> An optional of the most recent round-trip
    *  time of the connection. If the platform does not support this, then an empty optional is
    *  returned.
    */
-  virtual absl::optional<std::chrono::milliseconds> lastRoundTripTime() PURE;
+  virtual std::optional<std::chrono::milliseconds> lastRoundTripTime() PURE;
+
+  /**
+   * @return the current congestion window in bytes, or unset if not available or not
+   * congestion-controlled.
+   * @note some congestion controller's cwnd is measured in number of packets, in that case the
+   * return value is cwnd(in packets) times the connection's MSS.
+   */
+  virtual std::optional<uint64_t> congestionWindowInBytes() const PURE;
+
+  /**
+   * @return the interface name for the socket, if the OS supports it. Otherwise, std::nullopt.
+   */
+  virtual std::optional<std::string> interfaceName() PURE;
 };
 
 using IoHandlePtr = std::unique_ptr<IoHandle>;

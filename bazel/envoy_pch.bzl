@@ -1,7 +1,6 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
-
 # DO NOT LOAD THIS FILE. Load envoy_build_system.bzl instead.
 # Envoy library targets
+load("@rules_cc//cc:defs.bzl", "cc_library")
 load(
     ":envoy_internal.bzl",
     "envoy_copts",
@@ -9,6 +8,12 @@ load(
     "envoy_linkstatic",
 )
 load(":pch.bzl", "pch")
+
+def envoy_pch_deps(repository, target):
+    return select({
+        repository + "//bazel:clang_pch_build": [repository + target],
+        "//conditions:default": [],
+    })
 
 def envoy_pch_copts(repository, target):
     return select({
@@ -23,8 +28,8 @@ def envoy_pch_library(
         name,
         includes,
         deps,
-        external_deps,
         visibility,
+        external_deps = [],
         testonly = False,
         repository = ""):
     cc_library(

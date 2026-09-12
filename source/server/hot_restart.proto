@@ -8,6 +8,7 @@ message HotRestartMessage {
     message PassListenSocket {
       string address = 1;
       uint32 worker_index = 2;
+      string network_namespace = 3;
     }
     message ShutdownAdmin {
     }
@@ -17,12 +18,25 @@ message HotRestartMessage {
     }
     message Terminate {
     }
+    // A separate socket is established for forwarding undeliverable quic udp packets
+    // from the parent instance to the child instance.
+    message ForwardedUdpPacket {
+      string local_addr = 1;
+      string peer_addr = 2;
+      uint64 receive_time_epoch_microseconds = 3;
+      bytes payload = 4;
+      uint32 worker_index = 5;
+    }
+    message TestConnection {
+    }
     oneof request {
       PassListenSocket pass_listen_socket = 1;
       ShutdownAdmin shutdown_admin = 2;
       Stats stats = 3;
       DrainListeners drain_listeners = 4;
       Terminate terminate = 5;
+      ForwardedUdpPacket forwarded_udp_packet = 6;
+      TestConnection test_connection = 7;
     }
   }
 
@@ -64,6 +78,30 @@ message HotRestartMessage {
       // "a.b.c.d.e.f" to the span array [[0,0], [3,4]], where the [0,0] span
       // covers the "a", and the [3,4] span covers "d.e".
       map<string, RepeatedSpan> dynamics = 5;
+
+      // A single stat tag (name/value pair).
+      message Tag {
+        string name = 1;
+        string value = 2;
+      }
+      // Tag metadata for a stat created with programmatic tags (via *FromStatNameWithTags).
+      // Such stats inline their tag values into the fully qualified name, but the scope cannot
+      // recover the tag name/value pairs or the tag-extracted name from the name alone. Without
+      // this, the tags would be lost across hot restart: the merge re-creates the stat from the
+      // name with no tags, the tag values collapse into the metric name, and the labels go empty.
+      message MetricTags {
+        // The stat name with tag values removed; used as the metric name when exporting (e.g. to
+        // Prometheus).
+        string base_name = 1;
+        // The tag name/value pairs.
+        repeated Tag tags = 2;
+      }
+      // Tag metadata for counters/gauges that carry programmatic tags, keyed by the same fully
+      // qualified stat name used in counter_deltas / gauges. Entries are absent for stats whose
+      // tags (if any) are recoverable from the name via stats_tags regexes, so the maps stay
+      // empty for deployments that don't use programmatic tags.
+      map<string, MetricTags> counter_tags = 6;
+      map<string, MetricTags> gauge_tags = 7;
     }
     oneof reply {
       // When this oneof is of the PassListenSocketReply type, there is a special

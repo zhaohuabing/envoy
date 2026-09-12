@@ -18,8 +18,8 @@ namespace Secret {
 
 class SecretManagerImpl : public SecretManager {
 public:
-  SecretManagerImpl(Server::ConfigTracker& config_tracker);
-  void
+  SecretManagerImpl(OptRef<Server::ConfigTracker> config_tracker);
+  absl::Status
   addStaticSecret(const envoy::extensions::transport_sockets::tls::v3::Secret& secret) override;
 
   TlsCertificateConfigProviderSharedPtr
@@ -50,22 +50,28 @@ public:
   GenericSecretConfigProviderSharedPtr createInlineGenericSecretProvider(
       const envoy::extensions::transport_sockets::tls::v3::GenericSecret& generic_secret) override;
 
-  TlsCertificateConfigProviderSharedPtr findOrCreateTlsCertificateProvider(
-      const envoy::config::core::v3::ConfigSource& config_source, const std::string& config_name,
-      Server::Configuration::TransportSocketFactoryContext& secret_provider_context) override;
+  TlsCertificateConfigProviderSharedPtr
+  findOrCreateTlsCertificateProvider(const envoy::config::core::v3::ConfigSource& config_source,
+                                     const std::string& config_name,
+                                     Server::Configuration::ServerFactoryContext& server_context,
+                                     OptRef<Init::Manager> init_manager, bool warm) override;
 
   CertificateValidationContextConfigProviderSharedPtr
   findOrCreateCertificateValidationContextProvider(
       const envoy::config::core::v3::ConfigSource& config_source, const std::string& config_name,
-      Server::Configuration::TransportSocketFactoryContext& secret_provider_context) override;
+      Server::Configuration::ServerFactoryContext& server_context,
+      Init::Manager& init_manager) override;
 
   TlsSessionTicketKeysConfigProviderSharedPtr findOrCreateTlsSessionTicketKeysContextProvider(
       const envoy::config::core::v3::ConfigSource& config_source, const std::string& config_name,
-      Server::Configuration::TransportSocketFactoryContext& secret_provider_context) override;
+      Server::Configuration::ServerFactoryContext& server_context,
+      Init::Manager& init_manager) override;
 
-  GenericSecretConfigProviderSharedPtr findOrCreateGenericSecretProvider(
-      const envoy::config::core::v3::ConfigSource& config_source, const std::string& config_name,
-      Server::Configuration::TransportSocketFactoryContext& secret_provider_context) override;
+  GenericSecretConfigProviderSharedPtr
+  findOrCreateGenericSecretProvider(const envoy::config::core::v3::ConfigSource& config_source,
+                                    const std::string& config_name,
+                                    Server::Configuration::ServerFactoryContext& server_context,
+                                    OptRef<Init::Manager> init_manager) override;
 
 private:
   ProtobufTypes::MessagePtr dumpSecretConfigs(const Matchers::StringMatcher& name_matcher);
@@ -77,9 +83,12 @@ private:
     std::shared_ptr<SecretType>
     findOrCreate(const envoy::config::core::v3::ConfigSource& sds_config_source,
                  const std::string& config_name,
-                 Server::Configuration::TransportSocketFactoryContext& secret_provider_context) {
+                 Server::Configuration::ServerFactoryContext& server_context,
+                 OptRef<Init::Manager> init_manager, bool warm) {
+      // Warming and non-warming providers have different init targets: the warming
+      // target only fires after a secret is fetched, while non-warming one pre-fetches.
       const std::string map_key =
-          absl::StrCat(MessageUtil::hash(sds_config_source), ".", config_name);
+          absl::StrCat(MessageUtil::hash(sds_config_source), ".", config_name, warm);
 
       std::shared_ptr<SecretType> secret_provider = dynamic_secret_providers_[map_key].lock();
       if (!secret_provider) {
@@ -88,14 +97,29 @@ private:
         std::function<void()> unregister_secret_provider = [map_key, this]() {
           removeDynamicSecretProvider(map_key);
         };
-        secret_provider = SecretType::create(secret_provider_context, sds_config_source,
-                                             config_name, unregister_secret_provider);
+        secret_provider = SecretType::create(server_context, sds_config_source, config_name,
+                                             unregister_secret_provider, warm);
         dynamic_secret_providers_[map_key] = secret_provider;
       }
       // It is important to add the init target to the manager regardless the secret provider is new
       // or existing. Different clusters / listeners can share same secret so they have to be marked
       // warming correctly.
-      secret_provider_context.initManager().add(*secret_provider->initTarget());
+
+      // Note that we are not using server_context's init manager because in some cases,
+      // for example oauth2 filter with sds config, it could be server's init manager. In oauth2
+      // filter example, if the filter config is dynamic, it could be received from xds server when
+      // the server's init manager is already in the initialized state. In that situation, adding
+      // init target to the initialized init manager will lead to assertion failure.
+      //
+      // It is expected that correct init manager will be passed to this method by the caller
+      // separately.
+      if (init_manager) {
+        init_manager->add(*secret_provider->initTarget());
+      } else {
+        // A secret provider can be shared across multiple warming and non-warming users,
+        // so this line can be called repeatedly.
+        secret_provider->start();
+      }
       return secret_provider;
     }
 

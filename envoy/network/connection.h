@@ -10,6 +10,7 @@
 #include "envoy/common/scope_tracker.h"
 #include "envoy/event/deferred_deletable.h"
 #include "envoy/network/address.h"
+#include "envoy/network/drain_decision.h"
 #include "envoy/network/filter.h"
 #include "envoy/network/listen_socket.h"
 #include "envoy/network/socket.h"
@@ -30,6 +31,7 @@ enum class ConnectionEvent {
   RemoteClose,
   LocalClose,
   Connected,
+  ConnectedZeroRtt,
 };
 
 /**
@@ -60,6 +62,19 @@ public:
    * watermark to under its low watermark.
    */
   virtual void onBelowWriteBufferLowWatermark() PURE;
+
+  /**
+   * Called when the connection has been notified that it is being drained (for example
+   * because the filter chain or listener that owns it is being drained). Callbacks may
+   * use this signal to begin a graceful shutdown of any state layered on top of the
+   * connection (e.g. send an HTTP/2 GOAWAY or close-after-current-request).
+   *
+   * The connection remains usable after this call; it is not closed by onDrain() itself.
+   * The default implementation is a no-op.
+   * @param drain_event describes the drain sequence (its start time and strategy) as decided on
+   *        the main thread.
+   */
+  virtual void onDrain(ConnectionDrainEvent drain_event) { (void)drain_event; }
 };
 
 /**
@@ -67,9 +82,37 @@ public:
  */
 enum class ConnectionCloseType {
   FlushWrite, // Flush pending write data before raising ConnectionEvent::LocalClose
-  NoFlush,    // Do not flush any pending data and immediately raise ConnectionEvent::LocalClose
-  FlushWriteAndDelay // Flush pending write data and delay raising a ConnectionEvent::LocalClose
-                     // until the delayed_close_timeout expires
+  NoFlush, // Do not flush any pending data. Write the pending data to buffer and then immediately
+           // raise ConnectionEvent::LocalClose
+  FlushWriteAndDelay, // Flush pending write data and delay raising a ConnectionEvent::LocalClose
+                      // until the delayed_close_timeout expires
+  Abort, // Do not write/flush any pending data and immediately raise ConnectionEvent::LocalClose
+  AbortReset // Do not write/flush any pending data and immediately raise
+             // ConnectionEvent::LocalClose. Envoy will try to close the connection with RST flag.
+};
+
+/**
+ * Combines connection event and close type for connection close operations
+ */
+struct ConnectionCloseAction {
+  ConnectionEvent event_;
+  bool close_socket_;
+  ConnectionCloseType type_;
+
+  ConnectionCloseAction(ConnectionEvent event_type = ConnectionEvent::Connected,
+                        bool close_socket = false,
+                        ConnectionCloseType close_type = ConnectionCloseType::NoFlush)
+      : event_(event_type), close_socket_(close_socket), type_(close_type) {}
+
+  bool operator==(const ConnectionCloseAction& other) const {
+    return event_ == other.event_ && type_ == other.type_ && close_socket_ == other.close_socket_;
+  }
+
+  bool operator!=(const ConnectionCloseAction& other) const { return !(*this == other); }
+
+  bool closeSocket() const { return close_socket_; }
+  bool isLocalClose() const { return event_ == ConnectionEvent::LocalClose; }
+  bool isRemoteClose() const { return event_ == ConnectionEvent::RemoteClose; }
 };
 
 /**
@@ -80,6 +123,13 @@ class Connection : public Event::DeferredDeletable,
                    public ScopeTrackedObject {
 public:
   enum class State { Open, Closing, Closed };
+
+  enum class ReadDisableStatus {
+    NoTransition,
+    StillReadDisabled,
+    TransitionedToReadEnabled,
+    TransitionedToReadDisabled
+  };
 
   /**
    * Callback function for when bytes have been sent by a connection.
@@ -128,17 +178,45 @@ public:
   /**
    * @return true if half-close semantics are enabled, false otherwise.
    */
-  virtual bool isHalfCloseEnabled() PURE;
+  virtual bool isHalfCloseEnabled() const PURE;
+
+  /**
+   * Notify the connection that it is being drained. This will fire onDrain() on every
+   * registered ConnectionCallbacks. Drain is a notification only: the connection is
+   * not closed and remains usable. Callbacks may react by initiating a graceful
+   * shutdown of any higher-level state (e.g. HTTP/2 GOAWAY).
+   *
+   * A connection may be notified more than once (a server drain escalating from InboundOnly to
+   * All re-notifies inbound listeners, and a filter chain drain can follow a server drain). The
+   * first event wins: subsequent notifications are dropped, so a connection that is already
+   * draining stays on its original timeline and its callbacks see onDrain() exactly once.
+   *
+   * @param drain_event describes the drain sequence (start time and strategy).
+   */
+  virtual void onDrain(ConnectionDrainEvent drain_event) PURE;
 
   /**
    * Close the connection.
+   * @param type the connection close type.
    */
   virtual void close(ConnectionCloseType type) PURE;
 
   /**
+   * Close the connection.
+   * @param type the connection close type.
+   * @param details the reason the connection is being closed.
+   */
+  virtual void close(ConnectionCloseType type, absl::string_view details) PURE;
+
+  /**
+   * @return the detected close type from socket.
+   */
+  virtual StreamInfo::DetectedCloseType detectedCloseType() const PURE;
+
+  /**
    * @return Event::Dispatcher& the dispatcher backing this connection.
    */
-  virtual Event::Dispatcher& dispatcher() PURE;
+  virtual Event::Dispatcher& dispatcher() const PURE;
 
   /**
    * @return uint64_t the unique local ID of this connection.
@@ -168,6 +246,7 @@ public:
    * enabled again if there is data still in the input buffer it will be re-dispatched through
    * the filter chain.
    * @param disable supplies TRUE is reads should be disabled, FALSE if they should be enabled.
+   * @return status enum indicating the outcome of calling readDisable on the underlying socket.
    *
    * Note that this function reference counts calls. For example
    * readDisable(true);  // Disables data
@@ -175,7 +254,7 @@ public:
    * readDisable(false);  // Notes the connection is blocked by one source
    * readDisable(false);  // Marks the connection as unblocked, so resumes reading.
    */
-  virtual void readDisable(bool disable) PURE;
+  virtual ReadDisableStatus readDisable(bool disable) PURE;
 
   /**
    * Set if Envoy should detect TCP connection close when readDisable(true) is called.
@@ -194,6 +273,7 @@ public:
   /**
    * @return the connection info provider backing this connection.
    */
+  virtual ConnectionInfoSetter& connectionInfoSetter() PURE;
   virtual const ConnectionInfoProvider& connectionInfoProvider() const PURE;
   virtual ConnectionInfoProviderSharedPtr connectionInfoProviderSharedPtr() const PURE;
 
@@ -219,7 +299,7 @@ public:
    * @return The unix socket peer credentials of the remote client. Note that this is only
    * supported for unix socket connections.
    */
-  virtual absl::optional<UnixDomainSocketPeerCredentials> unixSocketPeerCredentials() const PURE;
+  virtual std::optional<UnixDomainSocketPeerCredentials> unixSocketPeerCredentials() const PURE;
 
   /**
    * Set the stats to update for various connection state changes. Note that for performance reasons
@@ -251,7 +331,7 @@ public:
   virtual bool connecting() const PURE;
 
   /**
-   * Write data to the connection. Will iterate through downstream filters with the buffer if any
+   * Write data to the connection. Will iterate through network filters with the buffer if any
    * are installed.
    * @param data Supplies the data to write to the connection.
    * @param end_stream If true, this indicates that this is the last write to the connection. If
@@ -273,6 +353,14 @@ public:
   virtual void setBufferLimits(uint32_t limit) PURE;
 
   /**
+   * Set the timeout when connection will be closed due to buffer high watermark usage. This is used
+   * to prevent the connection from staying above the buffer high watermark indefinitely due to slow
+   * processing. By default, the timeout is not set.
+   * @param timeout The timeout value in milliseconds
+   */
+  virtual void setBufferHighWatermarkTimeout(std::chrono::milliseconds timeout) PURE;
+
+  /**
    * Get the value set with setBufferLimits.
    */
   virtual uint32_t bufferLimit() const PURE;
@@ -283,10 +371,21 @@ public:
   virtual bool aboveHighWatermark() const PURE;
 
   /**
+   * @return const ConnectionSocketPtr& reference to the socket from current connection.
+   */
+  virtual const ConnectionSocketPtr& getSocket() const PURE;
+
+  /**
    * Get the socket options set on this connection.
    */
   virtual const ConnectionSocket::OptionsSharedPtr& socketOptions() const PURE;
 
+  /**
+   * Set a socket option on the underlying socket(s) of this connection.
+   * @param option The socket option to set.
+   * @return boolean telling if the socket option was set successfully.
+   */
+  virtual bool setSocketOption(Network::SocketOptionName name, absl::Span<uint8_t> value) PURE;
   /**
    * The StreamInfo object associated with this connection. This is typically
    * used for logging purposes. Individual filters may add specific information
@@ -307,10 +406,16 @@ public:
   virtual void setDelayedCloseTimeout(std::chrono::milliseconds timeout) PURE;
 
   /**
-   * @return std::string the failure reason of the underlying transport socket, if no failure
-   *         occurred an empty string is returned.
+   * @return absl::string_view the failure reason of the underlying transport socket, if no failure
+   *         occurred an empty string view is returned.
    */
   virtual absl::string_view transportFailureReason() const PURE;
+
+  /**
+   * @return absl::string_view the local close reason of the underlying socket, if local close
+   *         did not occur an empty string view is returned.
+   */
+  virtual absl::string_view localCloseReason() const PURE;
 
   /**
    * Instructs the connection to start using secure transport.
@@ -321,11 +426,34 @@ public:
   virtual bool startSecureTransport() PURE;
 
   /**
-   *  @return absl::optional<std::chrono::milliseconds> An optional of the most recent round-trip
+   *  @return std::optional<std::chrono::milliseconds> An optional of the most recent round-trip
    *  time of the connection. If the platform does not support this, then an empty optional is
    *  returned.
    */
-  virtual absl::optional<std::chrono::milliseconds> lastRoundTripTime() const PURE;
+  virtual std::optional<std::chrono::milliseconds> lastRoundTripTime() const PURE;
+
+  /**
+   * Try to configure the connection's initial congestion window.
+   * The operation is advisory - the connection may not support it, even if it's supported, it may
+   * not do anything after the first few network round trips with the peer.
+   * @param bandwidth_bits_per_sec The estimated bandwidth between the two endpoints of the
+   * connection.
+   * @param rtt The estimated round trip time between the two endpoints of the connection.
+   *
+   * @note Envoy does not provide an implementation for TCP connections because
+   * there is no portable system api to do so. Applications can implement it
+   * with a proprietary api in a customized TransportSocket.
+   */
+  virtual void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
+                                                std::chrono::microseconds rtt) PURE;
+
+  /**
+   * @return the current congestion window in bytes, or unset if not available or not
+   * congestion-controlled.
+   * @note some congestion controller's cwnd is measured in number of packets, in that case the
+   * return value is cwnd(in packets) times the connection's MSS.
+   */
+  virtual std::optional<uint64_t> congestionWindowInBytes() const PURE;
 };
 
 using ConnectionPtr = std::unique_ptr<Connection>;

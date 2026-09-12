@@ -9,19 +9,23 @@ namespace Extensions {
 namespace HttpFilters {
 namespace GrpcHttp1Bridge {
 
-Http::FilterFactoryCb GrpcHttp1BridgeFilterConfig::createFilterFactoryFromProtoTyped(
-    const envoy::extensions::filters::http::grpc_http1_bridge::v3::Config&, const std::string&,
-    Server::Configuration::FactoryContext& factory_context) {
-  return [&factory_context](Http::FilterChainFactoryCallbacks& callbacks) {
-    callbacks.addStreamFilter(std::make_shared<Http1BridgeFilter>(factory_context.grpcContext()));
+absl::StatusOr<Http::FilterFactoryCb>
+GrpcHttp1BridgeFilterConfig::createHttpFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::http::grpc_http1_bridge::v3::Config& proto_config,
+    Server::Configuration::ServerFactoryContext& factory_context,
+    Server::Configuration::ExtraFactoryContext&) {
+  return [&factory_context, proto_config](Http::FilterChainFactoryCallbacks& callbacks) {
+    callbacks.addStreamFilter(
+        std::make_shared<Http1BridgeFilter>(factory_context.grpcContext(), proto_config));
   };
 }
 
 /**
  * Static registration for the grpc HTTP1 bridge filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(GrpcHttp1BridgeFilterConfig,
-                 Server::Configuration::NamedHttpFilterConfigFactory){"envoy.grpc_http1_bridge"};
+LEGACY_REGISTER_FACTORY(GrpcHttp1BridgeFilterConfig,
+                        Server::Configuration::NamedHttpFilterConfigFactory,
+                        "envoy.grpc_http1_bridge");
 
 } // namespace GrpcHttp1Bridge
 } // namespace HttpFilters

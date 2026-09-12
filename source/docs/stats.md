@@ -77,10 +77,16 @@ followed.
    accumulates in to *interval* histograms.
  * Finally the main *interval* histogram is merged to *cumulative* histogram.
 
+Pictorially this looks like:
+
+![Histogram Stat Flush](histogram.png)
+
 `ParentHistogram`s are held weakly a set in ThreadLocalStore. Like other stats,
 they keep an embedded reference count and are removed from the set and destroyed
-when the last strong reference disappears. Consequently, we must hold a lock for
-the set when decrementing histogram reference counts. A similar process occurs for
+when the last strong reference disappears. Consequently, a decrement that may
+drop the last reference must hold a lock for the set, so that removal from the
+set is atomic with the final decrement; non-final decrements take a lock-free
+fast path. A similar process occurs for
 other types of stats, but in those cases it is taken care of in `AllocatorImpl`.
 There are strong references to `ParentHistograms` in TlsCacheEntry::parent_histograms_.
 
@@ -94,7 +100,7 @@ maintain data continuity as scopes are re-created during operation.
 Stat names are replicated in several places in various forms.
 
  * Held with the stat values, in `CounterImpl`, `GaugeImpl` and `TextReadoutImpl`, which are defined in
-   [allocator_impl.cc](https://github.com/envoyproxy/envoy/blob/main/source/common/stats/allocator_impl.cc)
+   [allocator.cc](https://github.com/envoyproxy/envoy/blob/main/source/common/stats/allocator.cc)
  * In [MetricImpl](https://github.com/envoyproxy/envoy/blob/main/source/common/stats/metric_impl.h)
    in a transformed state, with tags extracted into vectors of name/value strings.
  * In static strings across the codebase where stats are referenced
@@ -184,7 +190,7 @@ showing the memory layout for a few scenarios of constructing and joining symbol
 
 There are several ways to create hot-path contention looking up stats by name,
 and there is no bulletproof way to prevent it from occurring.
- * The [stats macros](https://github.com/envoyproxy/envoy/blob/main/include/envoy/stats/stats_macros.h) may be used in a data structure which is constructed in response to requests. In this
+ * The [stats macros](https://github.com/envoyproxy/envoy/blob/main/envoy/stats/stats_macros.h) may be used in a data structure which is constructed in response to requests. In this
    scenario, consider factoring out the symbolization phase using MAKE_STAT_NAMES_STRUCT
    in a factory or context during startup, and using MAKE_STATS_STRUCT in the hot-path and during
    control-plane updates, so that we do not need to take symbol-table locks. As an example, see
@@ -204,9 +210,7 @@ occurring during via an admin endpoint that shows 20 recent lookups by name, at
 
 Class | Superclass | Description
 -----| ---------- | ---------
-SymbolTable | | Abstract class providing an interface for symbol tables
-SymbolTableImpl | SymbolTable | Implementation of SymbolTable API where StatName share symbols held in a table
-SymbolTableImpl::Encoding | | Helper class for incrementally encoding strings into symbols
+SymbolTable | | Holds a table of dot-separated names with shared tokens
 StatName | | Provides an API and a view into a StatName (dynamic or symbolized). Like absl::string_view, the backing store must be separately maintained.
 StatNameStorageBase | | Holds storage (an array of bytes) for a dynamic or symbolized StatName
 StatNameStorage  | StatNameStorageBase | Holds storage for a symbolized StatName. Must be explicitly freed (not just destructed).
@@ -274,7 +278,7 @@ Developers trying to can iterate through changes in these tests locally with:
 If you are visiting this section because you saw a message like:
 
 ```bash
-[...][16][critical][assert] [source/common/stats/symbol_table_impl.cc:251] assert failure:
+[...][16][critical][assert] [source/common/stats/symbol_table.cc:341] assert failure:
 decode_search != decode_map_.end(). Details: Please see
 https://github.com/envoyproxy/envoy/blob/main/source/docs/stats.md#debugging-symbol-table-assertions
 ```
@@ -297,3 +301,11 @@ from the same symbol table. To facilitate this, a test-only global singleton can
 be instantiated, via either `Stats::TestUtil::TestSymbolTable` or
 `Stats::TestUtil::TestStore`. All such structures use a singleton symbol-table
 whose lifetime is a single test method. This should resolve the assertion.
+
+
+Deferred Initialization of Stats
+================================
+
+When :ref:`enable_deferred_creation_stats <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.deferred_stat_options>`
+is enabled in Bootstrap, for stats that are deferred creation compatible, the actual stats struct creation
+is deferred to first access of any member of that stats, i.e. instantiation only happens when an invocation on operator "*" or "->" happens.

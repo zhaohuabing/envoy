@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Generates request and response fixtures for integration tests.
 
@@ -59,7 +59,7 @@ shift
 FIXTURE_DIR="${TEST_TMPDIR}"
 mkdir -p "${FIXTURE_DIR}"
 
-DRIVER_DIR="${TEST_SRCDIR}/envoy/test/extensions/filters/network/thrift_proxy/driver"
+DRIVER_DIR="${TEST_SRCDIR}/${TEST_WORKSPACE}/test/extensions/filters/network/thrift_proxy/driver"
 
 # On UNIX python supports AF_UNIX socket which are more reliable and efficient for communication
 # between the client and the server, so we use it. On Windows, we find a random unused port
@@ -70,7 +70,8 @@ if [[ "$OSTYPE" == "msys" ]]; then
         port=$(shuf -n 1 -i 49152-65535)
         netstat -atn | grep -q "$port" >> /dev/null
     do
-    continue
+        echo "Port is used. retrying..."
+        continue
     done
     SOCKET="127.0.0.1:${port}"
 else
@@ -107,7 +108,7 @@ else
     SERVICE_FLAGS+=("--unix")
     "${DRIVER_DIR}/server" "${SERVICE_FLAGS[@]}" &
     SERVER_PID="$!"
-    while [[ ! -a "${SOCKET}" ]]; do
+    while [[ ! -e "${SOCKET}" ]]; do
         sleep 0.1
 
         if ! kill -0 "${SERVER_PID}"; then

@@ -7,6 +7,7 @@
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/extensions/filters/http/common/empty_http_filter_config.h"
+#include "test/integration/filters/test_filters.pb.h"
 
 namespace Envoy {
 
@@ -14,17 +15,21 @@ namespace Envoy {
 class ClearRouteCacheFilter : public Http::PassThroughFilter {
 public:
   void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override {
-    callbacks.clearRouteCache();
+    callbacks.downstreamCallbacks()->clearRouteCache();
     Http::PassThroughFilter::setDecoderFilterCallbacks(callbacks);
   }
 };
 
-class ClearRouteCacheFilterConfig : public Extensions::HttpFilters::Common::EmptyHttpFilterConfig {
+class ClearRouteCacheFilterConfig
+    : public Extensions::HttpFilters::Common::UniqueEmptyHttpFilterConfig<
+          test::integration::filters::ClearRouteCacheFilterConfig> {
 public:
-  ClearRouteCacheFilterConfig() : EmptyHttpFilterConfig("clear-route-cache") {}
+  ClearRouteCacheFilterConfig()
+      : UniqueEmptyHttpFilterConfig<test::integration::filters::ClearRouteCacheFilterConfig>(
+            "clear-route-cache") {}
 
-  Http::FilterFactoryCb createFilter(const std::string&,
-                                     Server::Configuration::FactoryContext&) override {
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilter(const std::string&, Server::Configuration::FactoryContext&) override {
     return [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       callbacks.addStreamFilter(std::make_shared<::Envoy::ClearRouteCacheFilter>());
     };

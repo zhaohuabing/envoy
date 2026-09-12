@@ -52,6 +52,24 @@ lack of safe defaults. Over time, we will work towards improved safe-by-default 
 due to backwards compatibility and performance concerns, this will require following the breaking
 change deprecation policy.
 
+Build configurations
+--------------------
+
+Issues that do not affect Envoy in published release configurations are not covered by the threat model
+and will not be considered security issues. This includes:
+
+* Debug assertion failures, which are compiled out of Envoy release builds
+* Use of TLS libraries other than BoringSSL
+
+Envoy configurations
+--------------------
+
+Issues that can only be hit by configuring a feature marked as deprecated (via protobuf annotations) are not
+covered by the security policy.
+
+Issues that can only be hit by enabling a :ref:`runtime flag <arch_overview_runtime>` which defaults to
+false are not covered by the security policy.
+
 Data and control plane
 ----------------------
 
@@ -69,6 +87,16 @@ this might be a service operator that hosts multiple tenants on an Envoy, where 
 a regular expression on a header match in ``RouteConfiguration``. In this case, we expect that Envoy
 is resilient against the risks posed by malicious configuration from a confidentiality, integrity
 and availability perspective, as described above.
+
+For issues requiring control plane and data plane coordination, such as a configuration option which
+results in a Query of Death, risk is assessed by Envoy Security Team. If the configuration option is
+long-standing, turning it off presents a risk (e.g turning off overload manager) and leaving it on
+results in risk, the Security Team would usually opt to fix the issue under embargo. If a feature is new
+and a config change always results in a data plane crash, it might be classified as something the
+trusted control plane should disallow, and be fixed in the clear. For more nuanced issues, such as long
+standing configuration where only one variant is problematic, the Security Team will try to assess if
+there is an attack which presents a risk to any users, including large scale multi-tenant operators
+to determine if it should be fixed in the clear or not.
 
 We generally assume that services utilized for side calls during the request processing, e.g.
 external authorization, credential suppliers, rate limit services, are trusted. When this is not the

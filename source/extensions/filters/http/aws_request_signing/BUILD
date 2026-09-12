@@ -8,7 +8,7 @@ load(
 licenses(["notice"])  # Apache 2
 
 # L7 HTTP AWS request signing filter
-# Public docs: docs/root/configuration/http_filters/aws_request_signing_filter.rst
+# Public docs: https://envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/aws_request_signing_filter
 
 envoy_extension_package()
 
@@ -18,8 +18,11 @@ envoy_cc_library(
     hdrs = ["aws_request_signing_filter.h"],
     deps = [
         "//envoy/http:filter_interface",
-        "//source/extensions/common/aws:credentials_provider_impl_lib",
-        "//source/extensions/common/aws:signer_impl_lib",
+        "//source/common/common:cancel_wrapper_lib",
+        "//source/extensions/common/aws:credential_provider_chains_lib",
+        "//source/extensions/common/aws:region_provider_impl_lib",
+        "//source/extensions/common/aws/signers:sigv4_signer_impl_lib",
+        "//source/extensions/common/aws/signers:sigv4a_signer_impl_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "@envoy_api//envoy/extensions/filters/http/aws_request_signing/v3:pkg_cc_proto",
     ],
@@ -32,8 +35,10 @@ envoy_cc_extension(
     deps = [
         ":aws_request_signing_filter_lib",
         "//envoy/registry",
-        "//source/extensions/common/aws:credentials_provider_impl_lib",
-        "//source/extensions/common/aws:signer_impl_lib",
+        "//source/common/common:matchers_lib",
+        "//source/extensions/common/aws:credential_provider_chains_lib",
+        "//source/extensions/common/aws/credential_providers:inline_credentials_provider_lib",
+        "//source/extensions/common/aws/signers:sigv4_signer_impl_lib",
         "//source/extensions/filters/http/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/http/aws_request_signing/v3:pkg_cc_proto",
     ],

@@ -1,20 +1,25 @@
+load("@envoy_repo//:compiler.bzl", "LLVM_PATH")
+
 # DO NOT LOAD THIS FILE. Load envoy_build_system.bzl instead.
 # Envoy test targets. This includes both test library and test binary targets.
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 load("@rules_fuzzing//fuzzing:cc_defs.bzl", "fuzzing_decoration")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(":envoy_binary.bzl", "envoy_cc_binary")
-load(":envoy_library.bzl", "tcmalloc_external_deps")
-load(":envoy_pch.bzl", "envoy_pch_copts")
 load(
     ":envoy_internal.bzl",
     "envoy_copts",
+    "envoy_dbg_linkopts",
+    "envoy_exported_symbols_input",
     "envoy_external_dep_path",
     "envoy_linkstatic",
     "envoy_select_force_libcpp",
     "envoy_stdlib_deps",
     "tcmalloc_external_dep",
 )
+load(":envoy_library.bzl", "tcmalloc_external_deps")
+load(":envoy_pch.bzl", "envoy_pch_copts", "envoy_pch_deps")
 
 # Envoy C++ related test infrastructure (that want gtest, gmock, but may be
 # relied on by envoy_cc_test_library) should use this function.
@@ -37,9 +42,9 @@ def _envoy_cc_test_infrastructure_library(
     extra_deps = []
     pch_copts = []
     if disable_pch:
-        extra_deps = [envoy_external_dep_path("googletest")]
+        extra_deps = ["@googletest//:gtest"]
     else:
-        extra_deps = [repository + "//test:test_pch"]
+        extra_deps = envoy_pch_deps(repository, "//test:test_pch")
         pch_copts = envoy_pch_copts(repository, "//test:test_pch")
 
     cc_library(
@@ -57,6 +62,24 @@ def _envoy_cc_test_infrastructure_library(
         **kargs
     )
 
+def _envoy_test_default_exported_symbols():
+    return select({
+        "@envoy//bazel:linux": [
+            "-Wl,--dynamic-list=$(location @envoy//bazel:exported_symbols.txt)",
+        ],
+        "@envoy//bazel:apple": [
+            "-Wl,-exported_symbols_list,$(location @envoy//bazel:exported_symbols_apple.txt)",
+        ],
+        "//conditions:default": [],
+    })
+
+# Select the given values if exporting is enabled in the current build.
+def envoy_test_select_exported_symbols(xs):
+    return select({
+        "@envoy//bazel:enable_exported_symbols": xs,
+        "//conditions:default": [],
+    })
+
 # Compute the test linkopts based on various options.
 def _envoy_test_linkopts():
     return select({
@@ -64,24 +87,31 @@ def _envoy_test_linkopts():
         "@envoy//bazel:windows_x86_64": [
             "-DEFAULTLIB:ws2_32.lib",
             "-DEFAULTLIB:iphlpapi.lib",
+            "-DEFAULTLIB:Bcrypt.lib",
             "-WX",
         ],
 
         # TODO(mattklein123): It's not great that we universally link against the following libs.
         # In particular, -latomic and -lrt are not needed on all platforms. Make this more granular.
         "//conditions:default": ["-pthread", "-lrt", "-ldl"],
-    }) + envoy_select_force_libcpp([], ["-lstdc++fs", "-latomic"])
+    }) + envoy_select_force_libcpp([], ["-lstdc++fs", "-latomic"]) + envoy_dbg_linkopts() + envoy_test_select_exported_symbols(["-Wl,-E"])
 
 # Envoy C++ fuzz test targets. These are not included in coverage runs.
 def envoy_cc_fuzz_test(
         name,
         corpus,
         dictionaries = [],
+        rbe_pool = None,
+        exec_properties = {},
         repository = "",
         size = "medium",
         deps = [],
         tags = [],
         **kwargs):
+    exec_properties = exec_properties | select({
+        repository + "//bazel:engflow_rbe_x86_64": {"Pool": rbe_pool} if rbe_pool else {},
+        "//conditions:default": {},
+    })
     if not (corpus.startswith("//") or corpus.startswith(":") or corpus.startswith("@")):
         corpus_name = name + "_corpus_files"
         native.filegroup(
@@ -94,6 +124,7 @@ def envoy_cc_fuzz_test(
     test_lib_name = name + "_lib"
     envoy_cc_test_library(
         name = test_lib_name,
+        exec_properties = exec_properties,
         deps = deps + envoy_stdlib_deps() + [
             repository + "//test/fuzz:fuzz_runner_lib",
             repository + "//test/test_common:test_version_linkstamp",
@@ -106,6 +137,7 @@ def envoy_cc_fuzz_test(
     cc_test(
         name = name,
         copts = envoy_copts("@envoy", test = True),
+        additional_linker_inputs = envoy_exported_symbols_input(),
         linkopts = _envoy_test_linkopts() + select({
             "@envoy//bazel:libfuzzer": ["-fsanitize=fuzzer"],
             "//conditions:default": [],
@@ -117,6 +149,7 @@ def envoy_cc_fuzz_test(
             "//conditions:default": ["$(locations %s)" % corpus_name],
         }),
         data = [corpus_name],
+        exec_properties = exec_properties,
         # No fuzzing on macOS or Windows
         deps = select({
             "@envoy//bazel:apple": [repository + "//test:dummy_main"],
@@ -151,30 +184,39 @@ def envoy_cc_test(
         tags = [],
         args = [],
         copts = [],
+        linkopts = [],
         condition = None,
         shard_count = None,
         coverage = True,
         local = False,
         size = "medium",
         flaky = False,
-        env = {}):
+        env = {},
+        rbe_pool = None,
+        exec_properties = {}):
     coverage_tags = tags + ([] if coverage else ["nocoverage"])
-
+    exec_properties = exec_properties | select({
+        repository + "//bazel:engflow_rbe_x86_64": {"Pool": rbe_pool} if rbe_pool else {},
+        "//conditions:default": {},
+    })
     cc_test(
         name = name,
         srcs = srcs,
-        data = data,
-        copts = envoy_copts(repository, test = True) + copts + envoy_pch_copts(repository, "//test:test_pch"),
-        linkopts = _envoy_test_linkopts(),
-        linkstatic = envoy_linkstatic(),
-        malloc = tcmalloc_external_dep(repository),
-        deps = envoy_stdlib_deps() + deps + [envoy_external_dep_path(dep) for dep in external_deps + ["googletest"]] + [
-            repository + "//test:main",
-            repository + "//test/test_common:test_version_linkstamp",
-        ] + select({
-            repository + "//bazel:clang_pch_build": [repository + "//test:test_pch"],
+        data = data + select({
+            "%s//bazel:local_asan_build" % repository: [],
+            "%s//bazel:asan_build" % repository: ["@llvm_toolchain_llvm//:symbolizer"],
             "//conditions:default": [],
         }),
+        copts = envoy_copts(repository, test = True) + copts + envoy_pch_copts(repository, "//test:test_pch"),
+        additional_linker_inputs = envoy_exported_symbols_input(),
+        linkopts = _envoy_test_linkopts() + linkopts,
+        linkstatic = envoy_linkstatic(),
+        malloc = tcmalloc_external_dep(repository),
+        deps = envoy_stdlib_deps() + deps + [envoy_external_dep_path(dep) for dep in external_deps] + [
+            repository + "//test:main",
+            repository + "//test/test_common:test_version_linkstamp",
+            "@googletest//:gtest",
+        ] + envoy_pch_deps(repository, "//test:test_pch"),
         # from https://github.com/google/googletest/blob/6e1970e2376c14bf658eb88f655a054030353f9f/googlemock/src/gmock.cc#L51
         # 2 - by default, mocks act as StrictMocks.
         args = args + ["--gmock_default_mock_behavior=2"],
@@ -183,7 +225,22 @@ def envoy_cc_test(
         shard_count = shard_count,
         size = size,
         flaky = flaky,
-        env = env,
+        env = env | select({
+            "%s//bazel:local_asan_build" % repository: {"ASAN_SYMBOLIZER_PATH": "%s/bin/llvm-symbolizer" % LLVM_PATH},
+            "%s//bazel:asan_build" % repository: {"ASAN_SYMBOLIZER_PATH": "$(location @llvm_toolchain_llvm//:symbolizer)"},
+            "//conditions:default": {},
+        }),
+        exec_properties = exec_properties,
+    )
+
+# Envoy C++ test targets loading dynamic modules should be specified with this macro.
+def envoy_cc_dyn_module_test(
+        name,
+        **kargs):
+    envoy_cc_test(
+        name,
+        linkopts = _envoy_test_default_exported_symbols(),
+        **kargs
     )
 
 # Envoy C++ test related libraries (that want gtest, gmock) should be specified
@@ -193,6 +250,8 @@ def envoy_cc_test_library(
         srcs = [],
         hdrs = [],
         data = [],
+        rbe_pool = None,
+        exec_properties = {},
         external_deps = [],
         deps = [],
         repository = "",
@@ -201,6 +260,10 @@ def envoy_cc_test_library(
         copts = [],
         alwayslink = 1,
         **kargs):
+    exec_properties = exec_properties | select({
+        repository + "//bazel:engflow_rbe_x86_64": {"Pool": rbe_pool} if rbe_pool else {},
+        "//conditions:default": {},
+    })
     disable_pch = kargs.pop("disable_pch", True)
     _envoy_cc_test_infrastructure_library(
         name,
@@ -216,6 +279,7 @@ def envoy_cc_test_library(
         visibility = ["//visibility:public"],
         alwayslink = alwayslink,
         disable_pch = disable_pch,
+        exec_properties = exec_properties,
         **kargs
     )
 
@@ -224,15 +288,20 @@ def envoy_cc_test_binary(
         name,
         tags = [],
         deps = [],
+        linkopts = [],
+        stamp = 0,
+        linkstatic = True,
         **kargs):
     envoy_cc_binary(
         name,
         testonly = 1,
-        linkopts = _envoy_test_linkopts(),
+        linkopts = _envoy_test_linkopts() + linkopts,
         tags = tags + ["compilation_db_dep"],
         deps = deps + [
             "@envoy//test/test_common:test_version_linkstamp",
         ],
+        stamp = stamp,
+        linkstatic = linkstatic,
         **kargs
     )
 
@@ -250,6 +319,21 @@ def envoy_cc_benchmark_binary(
         **kargs
     )
 
+# Envoy benchmark binaries loading dynamic modules should be specified with this function. bazel run
+# these targets to measure performance.
+def envoy_cc_benchmark_dyn_module_binary(
+        name,
+        deps = [],
+        repository = "",
+        **kargs):
+    envoy_cc_test_binary(
+        name,
+        deps = deps + [repository + "//test/benchmark:main"],
+        repository = repository,
+        linkopts = _envoy_test_default_exported_symbols(),
+        **kargs
+    )
+
 # Tests to validate that Envoy benchmarks run successfully should be specified
 # with this function. Not for actual performance measurements: iteratons and
 # expensive benchmarks will be skipped in the interest of execution time.
@@ -257,14 +341,23 @@ def envoy_benchmark_test(
         name,
         benchmark_binary,
         data = [],
+        rbe_pool = None,
+        exec_properties = {},
         tags = [],
+        repository = "",
         **kargs):
-    native.sh_test(
+    exec_properties = exec_properties | select({
+        repository + "//bazel:engflow_rbe_x86_64": {"Pool": rbe_pool} if rbe_pool else {},
+        "//conditions:default": {},
+    })
+    sh_test(
         name = name,
-        srcs = ["//bazel:test_for_benchmark_wrapper.sh"],
+        srcs = [repository + "//bazel:test_for_benchmark_wrapper.sh"],
+        deps = ["@bazel_tools//tools/bash/runfiles"],
         data = [":" + benchmark_binary] + data,
-        args = ["%s/%s" % (native.package_name(), benchmark_binary)],
-        tags = tags + ["nocoverage"],
+        exec_properties = exec_properties,
+        args = ["$(rlocationpath %s)" % native.package_relative_label(benchmark_binary)],
+        tags = tags + ["no_san", "nocoverage"],
         **kargs
     )
 
@@ -326,7 +419,7 @@ def envoy_sh_test(
         )
 
     else:
-        native.sh_test(
+        sh_test(
             name = name,
             srcs = ["//bazel:sh_test_wrapper.sh"],
             data = srcs + data + cc_binary,

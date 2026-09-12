@@ -1,14 +1,15 @@
+#include <optional>
+
 #include "source/common/event/dispatcher_impl.h"
 #include "source/common/stats/isolated_store_impl.h"
 #include "source/extensions/common/wasm/wasm.h"
 
 #include "test/extensions/common/wasm/wasm_runtime.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/local_info/mocks.h"
 #include "test/mocks/upstream/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/utility.h"
 
-#include "absl/types/optional.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest-param-test.h"
 #include "gtest/gtest.h"
@@ -50,9 +51,7 @@ public:
     *plugin_config.mutable_vm_config()->mutable_vm_id() = vm_id_;
     plugin_config.mutable_vm_config()->mutable_configuration()->set_value(vm_configuration_);
     plugin_config.mutable_configuration()->set_value(plugin_configuration_);
-    plugin_ = std::make_shared<Extensions::Common::Wasm::Plugin>(
-        plugin_config, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info_,
-        nullptr);
+    plugin_ = std::make_shared<Extensions::Common::Wasm::Plugin>(plugin_config, local_info_);
     auto config = plugin_->wasmConfig();
     config.allowedCapabilities() = allowed_capabilities_;
     config.environmentVariables() = envs_;
@@ -79,27 +78,30 @@ public:
   std::string vm_configuration_;
   std::string vm_key_;
   proxy_wasm::AllowedCapabilitiesMap allowed_capabilities_;
-  Extensions::Common::Wasm::EnvironmentVariableMap envs_{};
+  Extensions::Common::Wasm::EnvironmentVariableMap envs_;
   std::string plugin_configuration_;
   std::shared_ptr<Extensions::Common::Wasm::Plugin> plugin_;
   std::shared_ptr<Extensions::Common::Wasm::Wasm> wasm_;
 };
 
-class WasmTest : public WasmTestBase, public testing::TestWithParam<std::string> {
+class WasmTest : public WasmTestBase,
+                 public testing::TestWithParam<std::tuple<std::string, std::string>> {
 public:
-  void createWasm() { WasmTestBase::createWasm(GetParam()); }
+  void createWasm() { WasmTestBase::createWasm(std::get<0>(GetParam())); }
 };
 
 INSTANTIATE_TEST_SUITE_P(Runtimes, WasmTest,
-                         Envoy::Extensions::Common::Wasm::sandbox_runtime_values);
+                         Envoy::Extensions::Common::Wasm::sandbox_runtime_and_cpp_values,
+                         Envoy::Extensions::Common::Wasm::wasmTestParamsToString);
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(WasmTest);
 
-class WasmNullTest : public WasmTestBase, public testing::TestWithParam<std::string> {
+class WasmNullTest : public WasmTestBase,
+                     public testing::TestWithParam<std::tuple<std::string, std::string>> {
 public:
   void createWasm() {
-    WasmTestBase::createWasm(GetParam());
+    WasmTestBase::createWasm(std::get<0>(GetParam()));
     const auto code =
-        GetParam() != "null"
+        std::get<0>(GetParam()) != "null"
             ? TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
                   "{{ test_rundir }}/test/extensions/bootstrap/wasm/test_data/stats_cpp.wasm"))
             : "WasmStatsCpp";
@@ -109,7 +111,8 @@ public:
   }
 };
 
-INSTANTIATE_TEST_SUITE_P(Runtimes, WasmNullTest, Envoy::Extensions::Common::Wasm::runtime_values);
+INSTANTIATE_TEST_SUITE_P(Runtimes, WasmNullTest,
+                         Envoy::Extensions::Common::Wasm::runtime_and_cpp_values);
 
 class WasmTestMatrix : public WasmTestBase,
                        public testing::TestWithParam<std::tuple<std::string, std::string>> {
@@ -130,8 +133,7 @@ protected:
 };
 
 INSTANTIATE_TEST_SUITE_P(RuntimesAndLanguages, WasmTestMatrix,
-                         testing::Combine(Envoy::Extensions::Common::Wasm::sandbox_runtime_values,
-                                          Envoy::Extensions::Common::Wasm::language_values));
+                         Envoy::Extensions::Common::Wasm::sandbox_runtime_and_language_values);
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(WasmTestMatrix);
 
 TEST_P(WasmTestMatrix, LoggingWithEnvVars) {
@@ -170,12 +172,6 @@ TEST_P(WasmTestMatrix, LoggingWithEnvVars) {
 }
 
 TEST_P(WasmTest, BadSignature) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
       "{{ test_rundir }}/test/extensions/bootstrap/wasm/test_data/bad_signature_cpp.wasm"));
@@ -186,12 +182,6 @@ TEST_P(WasmTest, BadSignature) {
 }
 
 TEST_P(WasmTest, Segv) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
       "{{ test_rundir }}/test/extensions/bootstrap/wasm/test_data/segv_cpp.wasm"));
@@ -205,12 +195,6 @@ TEST_P(WasmTest, Segv) {
 }
 
 TEST_P(WasmTest, DivByZero) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
       "{{ test_rundir }}/test/extensions/bootstrap/wasm/test_data/segv_cpp.wasm"));
@@ -224,12 +208,6 @@ TEST_P(WasmTest, DivByZero) {
 }
 
 TEST_P(WasmTest, IntrinsicGlobals) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
       "{{ test_rundir }}/test/extensions/bootstrap/wasm/test_data/emscripten_cpp.wasm"));
@@ -249,12 +227,6 @@ TEST_P(WasmTest, IntrinsicGlobals) {
 // change this behavior by providing non-trapping instructions, but in the mean time we support the
 // default Emscripten behavior.
 TEST_P(WasmTest, Asm2Wasm) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
       "{{ test_rundir }}/test/extensions/bootstrap/wasm/test_data/asm2wasm_cpp.wasm"));
@@ -267,12 +239,6 @@ TEST_P(WasmTest, Asm2Wasm) {
 }
 
 TEST_P(WasmNullTest, Stats) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   auto context = static_cast<TestContext*>(wasm_->start(plugin_));
 
@@ -292,12 +258,6 @@ TEST_P(WasmNullTest, Stats) {
 }
 
 TEST_P(WasmNullTest, StatsHigherLevel) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   auto context = static_cast<TestContext*>(wasm_->start(plugin_));
 
@@ -323,12 +283,6 @@ TEST_P(WasmNullTest, StatsHigherLevel) {
 }
 
 TEST_P(WasmNullTest, StatsHighLevel) {
-#if defined(__aarch64__)
-  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-  if (GetParam() != "null") {
-    return;
-  }
-#endif
   createWasm();
   auto context = static_cast<TestContext*>(wasm_->start(plugin_));
 

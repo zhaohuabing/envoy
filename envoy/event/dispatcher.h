@@ -4,13 +4,11 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "envoy/common/scope_tracker.h"
 #include "envoy/common/time.h"
-#include "envoy/config/core/v3/resolver.pb.h"
-#include "envoy/config/core/v3/udp_socket_config.pb.h"
 #include "envoy/event/dispatcher_thread_deletable.h"
+#include "envoy/event/evwatch.h"
 #include "envoy/event/file_event.h"
 #include "envoy/event/scaled_timer.h"
 #include "envoy/event/schedulable_cb.h"
@@ -18,16 +16,13 @@
 #include "envoy/event/timer.h"
 #include "envoy/filesystem/watcher.h"
 #include "envoy/network/connection.h"
-#include "envoy/network/connection_handler.h"
-#include "envoy/network/dns.h"
 #include "envoy/network/listen_socket.h"
-#include "envoy/network/listener.h"
 #include "envoy/network/transport_socket.h"
 #include "envoy/server/watchdog.h"
 #include "envoy/stats/scope.h"
-#include "envoy/stats/stats_macros.h"
 #include "envoy/stream_info/stream_info.h"
-#include "envoy/thread/thread.h"
+
+#include "absl/functional/any_invocable.h"
 
 namespace Envoy {
 namespace Event {
@@ -51,7 +46,7 @@ using DispatcherStatsPtr = std::unique_ptr<DispatcherStats>;
 /**
  * Callback invoked when a dispatcher post() runs.
  */
-using PostCb = std::function<void()>;
+using PostCb = absl::AnyInvocable<void()>;
 
 using PostCbSharedPtr = std::shared_ptr<PostCb>;
 
@@ -164,6 +159,20 @@ public:
                                 std::chrono::milliseconds min_touch_interval) PURE;
 
   /**
+   * Registers a non-owning Evwatch observer with this dispatcher.
+   * This should only be called on the dispatcher's thread.
+   * @param observer supplies the observer to register.
+   */
+  virtual void registerEvwatchObserver(Evwatch::Observer& observer) PURE;
+
+  /**
+   * Unregisters an Evwatch observer from this dispatcher and calls observer.onClose().
+   * This should only be called on the dispatcher's thread.
+   * @param observer supplies the observer to unregister.
+   */
+  virtual void unregisterEvwatchObserver(Evwatch::Observer& observer) PURE;
+
+  /**
    * Returns a time-source to use with this dispatcher.
    */
   virtual TimeSource& timeSource() PURE;
@@ -182,7 +191,7 @@ public:
    *               identified by its name.
    */
   virtual void initializeStats(Stats::Scope& scope,
-                               const absl::optional<std::string>& prefix = absl::nullopt) PURE;
+                               const std::optional<std::string>& prefix = std::nullopt) PURE;
 
   /**
    * Clears any items in the deferred deletion queue.
@@ -210,40 +219,21 @@ public:
    * @param transport_socket supplies a transport socket to be used by the connection.
    * @param options the socket options to be set on the underlying socket before anything is sent
    *        on the socket.
+   * @param transport socket options used to create the transport socket.
    * @return Network::ClientConnectionPtr a client connection that is owned by the caller.
    */
-  virtual Network::ClientConnectionPtr
-  createClientConnection(Network::Address::InstanceConstSharedPtr address,
-                         Network::Address::InstanceConstSharedPtr source_address,
-                         Network::TransportSocketPtr&& transport_socket,
-                         const Network::ConnectionSocket::OptionsSharedPtr& options) PURE;
+  virtual Network::ClientConnectionPtr createClientConnection(
+      Network::Address::InstanceConstSharedPtr address,
+      Network::Address::InstanceConstSharedPtr source_address,
+      Network::TransportSocketPtr&& transport_socket,
+      const Network::ConnectionSocket::OptionsSharedPtr& options,
+      const Network::TransportSocketOptionsConstSharedPtr& transport_options) PURE;
 
   /**
    * @return Filesystem::WatcherPtr a filesystem watcher owned by the caller.
    */
   virtual Filesystem::WatcherPtr createFilesystemWatcher() PURE;
 
-  /**
-   * Creates a listener on a specific port.
-   * @param socket supplies the socket to listen on.
-   * @param cb supplies the callbacks to invoke for listener events.
-   * @param bind_to_port controls whether the listener binds to a transport port or not.
-   * @return Network::ListenerPtr a new listener that is owned by the caller.
-   */
-  virtual Network::ListenerPtr createListener(Network::SocketSharedPtr&& socket,
-                                              Network::TcpListenerCallbacks& cb,
-                                              bool bind_to_port) PURE;
-
-  /**
-   * Creates a logical udp listener on a specific port.
-   * @param socket supplies the socket to listen on.
-   * @param cb supplies the udp listener callbacks to invoke for listener events.
-   * @param config provides the UDP socket configuration.
-   * @return Network::ListenerPtr a new listener that is owned by the caller.
-   */
-  virtual Network::UdpListenerPtr
-  createUdpListener(Network::SocketSharedPtr socket, Network::UdpListenerCallbacks& cb,
-                    const envoy::config::core::v3::UdpSocketConfig& config) PURE;
   /**
    * Submits an item for deferred delete. @see DeferredDeletable.
    */

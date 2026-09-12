@@ -1,11 +1,13 @@
 #pragma once
 
 #include <fstream>
+#include <optional>
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/config/tap/v3/common.pb.h"
 #include "envoy/data/tap/v3/common.pb.h"
 #include "envoy/data/tap/v3/wrapper.pb.h"
+#include "envoy/runtime/runtime.h"
 
 #include "source/extensions/common/matcher/matcher.h"
 #include "source/extensions/common/tap/tap.h"
@@ -78,7 +80,8 @@ public:
   class PerTapSinkHandleManagerImpl : public PerTapSinkHandleManager {
   public:
     PerTapSinkHandleManagerImpl(TapConfigBaseImpl& parent, uint64_t trace_id)
-        : parent_(parent), handle_(parent.sink_to_use_->createPerTapSinkHandle(trace_id)) {}
+        : parent_(parent),
+          handle_(parent.sink_to_use_->createPerTapSinkHandle(trace_id, parent.sink_type_)) {}
 
     // PerTapSinkHandleManager
     void submitTrace(TraceWrapperPtr&& trace) override;
@@ -86,6 +89,7 @@ public:
   private:
     TapConfigBaseImpl& parent_;
     PerTapSinkHandlePtr handle_;
+    bool stamped_{false};
   };
 
   // TapConfig
@@ -94,15 +98,18 @@ public:
   }
   uint32_t maxBufferedRxBytes() const override { return max_buffered_rx_bytes_; }
   uint32_t maxBufferedTxBytes() const override { return max_buffered_tx_bytes_; }
+  uint32_t minStreamedSentBytes() const override { return min_streamed_sent_bytes_; }
   Matcher::MatchStatusVector createMatchStatusVector() const override {
     return Matcher::MatchStatusVector(matchers_.size());
   }
   const Matcher& rootMatcher() const override;
   bool streaming() const override { return streaming_; }
+  bool shouldRecord() const override;
 
 protected:
   TapConfigBaseImpl(const envoy::config::tap::v3::TapConfig& proto_config,
-                    Common::Tap::Sink* admin_streamer);
+                    Common::Tap::Sink* admin_streamer,
+                    Server::Configuration::GenericFactoryContext& context);
 
 private:
   // This is the default setting for both RX/TX max buffered bytes. (This means that per tap, the
@@ -115,7 +122,15 @@ private:
   Sink* sink_to_use_;
   SinkPtr sink_;
   envoy::config::tap::v3::OutputSink::Format sink_format_;
+  envoy::config::tap::v3::OutputSink::OutputSinkTypeCase sink_type_;
   std::vector<MatcherPtr> matchers_;
+  // This is the default value for min streamed buffered bytes.
+  // (This means that per streamed trace, the minimum amount
+  // which triggering to send the tapped messages size is 9 bytes).
+  static constexpr uint32_t DefaultMinStreamedSentBytes = 9;
+  uint32_t min_streamed_sent_bytes_{0};
+  Runtime::Loader& runtime_;
+  const std::optional<envoy::config::core::v3::RuntimeFractionalPercent> tap_enabled_;
 };
 
 /**
@@ -126,7 +141,9 @@ public:
   FilePerTapSink(const envoy::config::tap::v3::FilePerTapSink& config) : config_(config) {}
 
   // Sink
-  PerTapSinkHandlePtr createPerTapSinkHandle(uint64_t trace_id) override {
+  PerTapSinkHandlePtr
+  createPerTapSinkHandle(uint64_t trace_id,
+                         envoy::config::tap::v3::OutputSink::OutputSinkTypeCase) override {
     return std::make_unique<FilePerTapSinkHandle>(*this, trace_id);
   }
 

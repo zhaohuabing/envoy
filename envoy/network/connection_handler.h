@@ -3,17 +3,38 @@
 #include <cstdint>
 #include <memory>
 
+#include "envoy/common/random_generator.h"
+#include "envoy/network/address.h"
 #include "envoy/network/connection.h"
 #include "envoy/network/connection_balancer.h"
 #include "envoy/network/filter.h"
 #include "envoy/network/listen_socket.h"
 #include "envoy/network/listener.h"
-#include "envoy/ssl/context.h"
+#include "envoy/runtime/runtime.h"
+#include "envoy/server/overload/thread_local_overload_state.h"
 
 #include "source/common/common/interval_value.h"
 
 namespace Envoy {
 namespace Network {
+
+// This interface allows for a listener to perform an alternative behavior when a
+// packet can't be routed correctly during draining; for example QUIC packets that
+// are not for an existing connection.
+// This is currently supported for QUIC listeners to forward packets to the child instance.
+// TODO(mattklein123): determine if other UDP listeners have a reason to do this.
+class NonDispatchedUdpPacketHandler {
+public:
+  virtual ~NonDispatchedUdpPacketHandler() = default;
+  virtual void handle(uint32_t worker_index, const Network::UdpRecvData& packet) PURE;
+};
+
+// Additional options for ConnectionHandler::ActiveListener::shutdownListener.
+// As a struct so that in the event of future additional parameters, the change
+// is isolated rather than cascading through all layers, mocks, etc.
+struct ExtraShutdownListenerOptions {
+  OptRef<NonDispatchedUdpPacketHandler> non_dispatched_udp_packet_handler_;
+};
 
 /**
  * Abstract connection handler.
@@ -44,9 +65,11 @@ public:
    * Adds a listener to the handler, optionally replacing the existing listener.
    * @param overridden_listener tag of the existing listener. nullopt if no previous listener.
    * @param config listener configuration options.
+   * @param runtime the runtime for the server.
+   * @param random a random number generator.
    */
-  virtual void addListener(absl::optional<uint64_t> overridden_listener,
-                           ListenerConfig& config) PURE;
+  virtual void addListener(std::optional<uint64_t> overridden_listener, ListenerConfig& config,
+                           Runtime::Loader& runtime, Random::RandomGenerator& random) PURE;
 
   /**
    * Remove listeners using the listener tag as a key. All connections owned by the removed
@@ -70,8 +93,30 @@ public:
    * Stop listeners using the listener tag as a key. This will not close any connections and is used
    * for draining.
    * @param listener_tag supplies the tag passed to addListener().
+   * @param options additional options to be passed through to shutdownListener.
    */
-  virtual void stopListeners(uint64_t listener_tag) PURE;
+  virtual void stopListeners(uint64_t listener_tag,
+                             const Network::ExtraShutdownListenerOptions& options) PURE;
+
+  /**
+   * Notify the connections in the given filter chains that they are being drained. This is
+   * intended to be invoked at the start of a filter-chain drain sequence (before the drain
+   * timer expires and connections are forcibly closed). It does not close connections.
+   * @param listener_tag supplies the tag passed to addListener().
+   * @param filter_chains supplies the filter chains whose connections should be notified.
+   * @param drain_event describes the drain sequence (start time and strategy).
+   */
+  virtual void onFilterChainDrain(uint64_t listener_tag,
+                                  const std::list<const FilterChain*>& filter_chains,
+                                  ConnectionDrainEvent drain_event) PURE;
+
+  /**
+   * Notify all connections belonging to the listener with the given tag that they are being
+   * drained. Does not close any connections.
+   * @param listener_tag supplies the tag passed to addListener().
+   * @param drain_event describes the drain sequence (start time and strategy).
+   */
+  virtual void onListenerDrain(uint64_t listener_tag, ConnectionDrainEvent drain_event) PURE;
 
   /**
    * Stop all listeners. This will not close any connections and is used for draining.
@@ -102,6 +147,11 @@ public:
   virtual const std::string& statPrefix() const PURE;
 
   /**
+   * Close idle HTTP connections.
+   */
+  virtual void closeIdleHttpConnections(bool is_saturated) PURE;
+
+  /**
    * Used by ConnectionHandler to manage listeners.
    */
   class ActiveListener {
@@ -130,8 +180,11 @@ public:
 
     /**
      * Stop listening according to implementation's own definition.
+     * @param options provides extra options that some subset of listeners might
+     *                use, e.g. Quic listeners may need to configure packet forwarding
+     *                during hot restart.
      */
-    virtual void shutdownListener() PURE;
+    virtual void shutdownListener(const ExtraShutdownListenerOptions& options) PURE;
 
     /**
      * Update the listener config.
@@ -143,6 +196,31 @@ public:
      */
     virtual void onFilterChainDraining(
         const std::list<const Network::FilterChain*>& draining_filter_chains) PURE;
+
+    /**
+     * Called at the start of the drain sequence for the given filter chains. Implementations
+     * should notify all owned connections that they are being drained (by invoking
+     * Network::Connection::onDrain()) so that callbacks registered on those connections can
+     * react to the drain (e.g. send GOAWAY). Connections are not closed by this call.
+     * @param drain_event describes the drain sequence (start time and strategy).
+     */
+    virtual void
+    onFilterChainDrainStart(const std::list<const Network::FilterChain*>& draining_filter_chains,
+                            ConnectionDrainEvent drain_event) PURE;
+
+    /**
+     * Called at the start of the drain sequence for the listener as a whole. Implementations
+     * should notify all owned connections that they are being drained. Connections are not
+     * closed by this call.
+     * @param drain_event describes the drain sequence (start time and strategy).
+     */
+    virtual void onListenerDrainStart(ConnectionDrainEvent drain_event) PURE;
+
+    // New method for handling idle connection closing
+    virtual void onCloseIdleHttpConnections(bool /*is_saturated*/) {
+      // Default implementation does nothing.
+      // Specific listener types (TCP, QUIC) will override this.
+    }
   };
 
   using ActiveListenerPtr = std::unique_ptr<ActiveListener>;
@@ -176,10 +254,12 @@ public:
   /**
    * Obtain the rebalancer of the tcp listener.
    * @param listener_tag supplies the tag of the tcp listener that was passed to addListener().
+   * @param address is used to query the address specific handler.
    * @return BalancedConnectionHandlerOptRef the balancer attached to the listener. `nullopt` if
    * listener doesn't exist or rebalancer doesn't exist.
    */
-  virtual BalancedConnectionHandlerOptRef getBalancedHandlerByTag(uint64_t listener_tag) PURE;
+  virtual BalancedConnectionHandlerOptRef
+  getBalancedHandlerByTag(uint64_t listener_tag, const Network::Address::Instance& address) PURE;
 
   /**
    * Obtain the rebalancer of the tcp listener.
@@ -189,6 +269,20 @@ public:
    */
   virtual BalancedConnectionHandlerOptRef
   getBalancedHandlerByAddress(const Network::Address::Instance& address) PURE;
+
+  /**
+   * Creates a TCP listener on a specific port.
+   * @param socket supplies the socket to listen on.
+   * @param cb supplies the callbacks to invoke for listener events.
+   * @param runtime supplies the runtime for this server.
+   * @param listener_config configuration for the TCP listener to be created.
+   * @return Network::ListenerPtr a new listener that is owned by the caller.
+   */
+  virtual Network::ListenerPtr
+  createListener(Network::SocketSharedPtr&& socket, Network::TcpListenerCallbacks& cb,
+                 Runtime::Loader& runtime, Random::RandomGenerator& random,
+                 const Network::ListenerConfig& listener_config,
+                 Server::ThreadLocalOverloadStateOptRef overload_state) PURE;
 };
 
 /**
@@ -197,11 +291,12 @@ public:
 class UdpConnectionHandler : public virtual ConnectionHandler {
 public:
   /**
-   * Get the ``UdpListenerCallbacks`` associated with ``listener_tag``. This will be
-   * absl::nullopt for non-UDP listeners and for ``listener_tag`` values that have already been
+   * Get the ``UdpListenerCallbacks`` associated with ``listener_tag`` and ``address``. This will be
+   * std::nullopt for non-UDP listeners and for ``listener_tag`` values that have already been
    * removed.
    */
-  virtual UdpListenerCallbacksOptRef getUdpListenerCallbacks(uint64_t listener_tag) PURE;
+  virtual UdpListenerCallbacksOptRef
+  getUdpListenerCallbacks(uint64_t listener_tag, const Network::Address::Instance& address) PURE;
 };
 
 /**
@@ -214,15 +309,19 @@ public:
   /**
    * Creates an ActiveUdpListener object and a corresponding UdpListener
    * according to given config.
+   * @param runtime the runtime for this server.
    * @param worker_index The index of the worker this listener is being created on.
    * @param parent is the owner of the created ActiveListener objects.
+   * @param listen_socket_ptr is the UDP socket.
    * @param dispatcher is used to create actual UDP listener.
    * @param config provides information needed to create ActiveUdpListener and
    * UdpListener objects.
    * @return the ActiveUdpListener created.
    */
   virtual ConnectionHandler::ActiveUdpListenerPtr
-  createActiveUdpListener(uint32_t worker_index, UdpConnectionHandler& parent,
+  createActiveUdpListener(Runtime::Loader& runtime, uint32_t worker_index,
+                          UdpConnectionHandler& parent,
+                          Network::SocketSharedPtr&& listen_socket_ptr,
                           Event::Dispatcher& dispatcher, Network::ListenerConfig& config) PURE;
 
   /**
@@ -237,6 +336,69 @@ public:
 };
 
 using ActiveUdpListenerFactoryPtr = std::unique_ptr<ActiveUdpListenerFactory>;
+
+/**
+ * Internal listener callbacks.
+ */
+class InternalListener : public virtual ConnectionHandler::ActiveListener {
+public:
+  /**
+   * Called when a new connection is accepted.
+   * @param socket supplies the socket that is moved into the callee.
+   */
+  virtual void onAccept(ConnectionSocketPtr&& socket) PURE;
+};
+
+using InternalListenerPtr = std::unique_ptr<InternalListener>;
+using InternalListenerOptRef = OptRef<InternalListener>;
+
+/**
+ * The query interface of the registered internal listener callbacks.
+ */
+class InternalListenerManager {
+public:
+  virtual ~InternalListenerManager() = default;
+
+  /**
+   * Return the internal listener binding the listener address.
+   *
+   * @param listen_address the internal address of the expected internal listener.
+   */
+  virtual InternalListenerOptRef
+  findByAddress(const Address::InstanceConstSharedPtr& listen_address) PURE;
+};
+
+using InternalListenerManagerOptRef =
+    std::optional<std::reference_wrapper<InternalListenerManager>>;
+
+// The thread local registry.
+class LocalInternalListenerRegistry {
+public:
+  virtual ~LocalInternalListenerRegistry() = default;
+
+  // Set the internal listener manager which maintains life of internal listeners. Called by
+  // connection handler.
+  virtual void setInternalListenerManager(InternalListenerManager& internal_listener_manager) PURE;
+
+  // Get the internal listener manager to obtain a listener. Called by client connection factory.
+  virtual InternalListenerManagerOptRef getInternalListenerManager() PURE;
+
+  // Create a new active internal listener. Called by the server connection handler.
+  virtual InternalListenerPtr createActiveInternalListener(ConnectionHandler& conn_handler,
+                                                           ListenerConfig& config,
+                                                           Event::Dispatcher& dispatcher) PURE;
+};
+
+// The central internal listener registry interface providing the thread local accessor.
+class InternalListenerRegistry {
+public:
+  virtual ~InternalListenerRegistry() = default;
+
+  /**
+   * @return The thread local registry.
+   */
+  virtual LocalInternalListenerRegistry* getLocalRegistry() PURE;
+};
 
 } // namespace Network
 } // namespace Envoy

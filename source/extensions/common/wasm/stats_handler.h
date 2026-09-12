@@ -8,7 +8,7 @@
 #include "envoy/upstream/cluster_manager.h"
 
 #include "source/common/common/logger.h"
-#include "source/common/stats/symbol_table_impl.h"
+#include "source/common/stats/symbol_table.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -57,6 +57,9 @@ enum class WasmEvent : int {
   RuntimeError,
   VmCreated,
   VmShutDown,
+  VmReloadBackoff,
+  VmReloadSuccess,
+  VmReloadFailure,
 };
 
 class CreateStatsHandler : Logger::Loggable<Logger::Id::wasm> {
@@ -87,12 +90,19 @@ protected:
 
 CreateStatsHandler& getCreateStatsHandler();
 
+// Looks up (creating if necessary) the process-wide `wasm.wasm_vm_count` gauge directly on the
+// given server root scope, so the stat name is always identical regardless of the
+// filter/plugin-specific stat prefix used for the per-runtime `wasm.<runtime>.active` gauge.
+Stats::Gauge& lookupWasmVmCountGauge(Stats::Scope& server_scope);
+
 class LifecycleStatsHandler {
 public:
-  LifecycleStatsHandler(const Stats::ScopeSharedPtr& scope, std::string runtime)
+  LifecycleStatsHandler(const Stats::ScopeSharedPtr& scope, std::string runtime,
+                        Stats::Gauge& vm_count_gauge)
       : lifecycle_stats_(LifecycleStats{
             LIFECYCLE_STATS(POOL_COUNTER_PREFIX(*scope, absl::StrCat("wasm.", runtime, ".")),
-                            POOL_GAUGE_PREFIX(*scope, absl::StrCat("wasm.", runtime, ".")))}){};
+                            POOL_GAUGE_PREFIX(*scope, absl::StrCat("wasm.", runtime, ".")))}),
+        vm_count_gauge_(vm_count_gauge) {};
   ~LifecycleStatsHandler() = default;
 
   void onEvent(WasmEvent event);
@@ -100,7 +110,32 @@ public:
 
 protected:
   LifecycleStats lifecycle_stats_;
+  Stats::Gauge& vm_count_gauge_;
 };
+
+// TODO(wbpcode): refactor all these stats handlers into a single one.
+#define WASM_STATS(COUNTER)                                                                        \
+  COUNTER(vm_reload)                                                                               \
+  COUNTER(vm_reload_backoff)                                                                       \
+  COUNTER(vm_reload_success)                                                                       \
+  COUNTER(vm_reload_failure)
+
+struct WasmStats {
+  WASM_STATS(GENERATE_COUNTER_STRUCT)
+};
+
+class StatsHandler {
+public:
+  StatsHandler(Stats::Scope& parent_scope, const std::string& prefix);
+  void onEvent(WasmEvent event) const;
+  WasmStats& wasmStats() const { return wasm_stats_; }
+
+private:
+  Stats::ScopeSharedPtr scope_;
+  mutable WasmStats wasm_stats_;
+};
+
+using StatsHandlerSharedPtr = std::shared_ptr<StatsHandler>;
 
 } // namespace Wasm
 } // namespace Common

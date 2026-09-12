@@ -1,12 +1,8 @@
 #include "contrib/sip_proxy/filters/network/source/config.h"
 
-#include <string>
+#include <format>
 
-#include "envoy/network/connection.h"
-#include "envoy/registry/registry.h"
-
-#include "source/common/config/utility.h"
-
+#include "contrib/envoy/extensions/filters/network/sip_proxy/router/v3alpha/router.pb.h"
 #include "contrib/envoy/extensions/filters/network/sip_proxy/v3alpha/sip_proxy.pb.h"
 #include "contrib/envoy/extensions/filters/network/sip_proxy/v3alpha/sip_proxy.pb.validate.h"
 #include "contrib/sip_proxy/filters/network/source/decoder.h"
@@ -31,10 +27,15 @@ addUniqueClusters(absl::flat_hash_set<std::string>& clusters,
 ProtocolOptionsConfigImpl::ProtocolOptionsConfigImpl(
     const envoy::extensions::filters::network::sip_proxy::v3alpha::SipProtocolOptions& config)
     : session_affinity_(config.session_affinity()),
-      registration_affinity_(config.registration_affinity()) {}
+      registration_affinity_(config.registration_affinity()),
+      customized_affinity_(config.customized_affinity()) {}
 
 bool ProtocolOptionsConfigImpl::sessionAffinity() const { return session_affinity_; }
 bool ProtocolOptionsConfigImpl::registrationAffinity() const { return registration_affinity_; }
+const envoy::extensions::filters::network::sip_proxy::v3alpha::CustomizedAffinity&
+ProtocolOptionsConfigImpl::customizedAffinity() const {
+  return customized_affinity_;
+}
 
 Network::FilterFactoryCb SipProxyFilterConfigFactory::createFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy& proto_config,
@@ -52,14 +53,12 @@ Network::FilterFactoryCb SipProxyFilterConfigFactory::createFilterFactoryFromPro
    */
   auto transaction_infos = std::make_shared<Router::TransactionInfos>();
   for (auto& cluster : unique_clusters) {
-    Stats::ScopePtr stats_scope =
-        context.scope().createScope(fmt::format("cluster.{}.sip_cluster", cluster));
+    Stats::ScopeSharedPtr stats_scope =
+        context.scope().createScope(std::format("cluster.{}.sip_cluster", cluster));
     auto transaction_info_ptr = std::make_shared<Router::TransactionInfo>(
-        cluster, context.threadLocal(),
+        cluster, context.serverFactoryContext().threadLocal(),
         static_cast<std::chrono::milliseconds>(
-            PROTOBUF_GET_MS_OR_DEFAULT(proto_config.settings(), transaction_timeout, 32000)),
-        proto_config.settings().own_domain(),
-        proto_config.settings().domain_match_parameter_name());
+            PROTOBUF_GET_MS_OR_DEFAULT(proto_config.settings(), transaction_timeout, 32000)));
     transaction_info_ptr->init();
     transaction_infos->emplace(cluster, transaction_info_ptr);
   }
@@ -67,8 +66,9 @@ Network::FilterFactoryCb SipProxyFilterConfigFactory::createFilterFactoryFromPro
   return
       [filter_config, &context, transaction_infos](Network::FilterManager& filter_manager) -> void {
         filter_manager.addReadFilter(std::make_shared<ConnectionManager>(
-            *filter_config, context.api().randomGenerator(),
-            context.mainThreadDispatcher().timeSource(), transaction_infos));
+            filter_config, context.serverFactoryContext().api().randomGenerator(),
+            context.serverFactoryContext().mainThreadDispatcher().timeSource(), context,
+            transaction_infos));
       };
 }
 
@@ -81,19 +81,22 @@ REGISTER_FACTORY(SipProxyFilterConfigFactory,
 ConfigImpl::ConfigImpl(
     const envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy& config,
     Server::Configuration::FactoryContext& context)
-    : context_(context), stats_prefix_(fmt::format("sip.{}.", config.stat_prefix())),
+    : context_(context), stats_prefix_(std::format("sip.{}.", config.stat_prefix())),
       stats_(SipFilterStats::generateStats(stats_prefix_, context_.scope())),
       route_matcher_(new Router::RouteMatcher(config.route_config())),
       settings_(std::make_shared<SipSettings>(
           static_cast<std::chrono::milliseconds>(
               PROTOBUF_GET_MS_OR_DEFAULT(config.settings(), transaction_timeout, 32000)),
-          config.settings().own_domain(), config.settings().domain_match_parameter_name())) {
+          config.settings().local_services(), config.settings().tra_service_config(),
+          config.settings().operate_via())) {
 
   if (config.sip_filters().empty()) {
     ENVOY_LOG(debug, "using default router filter");
 
     envoy::extensions::filters::network::sip_proxy::v3alpha::SipFilter router;
+    envoy::extensions::filters::network::sip_proxy::router::v3alpha::Router default_router;
     router.set_name(SipFilters::SipFilterNames::get().ROUTER);
+    std::ignore = router.mutable_typed_config()->PackFrom(default_router);
     processFilter(router);
   } else {
     for (const auto& filter : config.sip_filters()) {

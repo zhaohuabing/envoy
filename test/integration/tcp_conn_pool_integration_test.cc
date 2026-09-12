@@ -5,9 +5,11 @@
 #include "test/integration/integration.h"
 #include "test/integration/utility.h"
 #include "test/server/utility.h"
+#include "test/test_common/logging.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/utility.h"
 
+using testing::Eq;
 namespace Envoy {
 namespace {
 
@@ -24,7 +26,7 @@ public:
   Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override {
     UNREFERENCED_PARAMETER(end_stream);
 
-    absl::optional<Upstream::TcpPoolData> pool_data =
+    std::optional<Upstream::TcpPoolData> pool_data =
         cluster_manager_.getThreadLocalCluster("cluster_0")
             ->tcpConnPool(Upstream::ResourcePriority::Default, nullptr);
     ASSERT(pool_data.has_value());
@@ -86,57 +88,35 @@ private:
 class TestFilterConfigFactory : public Server::Configuration::NamedNetworkFilterConfigFactory {
 public:
   // NamedNetworkFilterConfigFactory
-  Network::FilterFactoryCb
+  absl::StatusOr<Network::FilterFactoryCb>
   createFilterFactoryFromProto(const Protobuf::Message&,
                                Server::Configuration::FactoryContext& context) override {
     return [&context](Network::FilterManager& filter_manager) -> void {
-      filter_manager.addReadFilter(std::make_shared<TestFilter>(context.clusterManager()));
+      filter_manager.addReadFilter(
+          std::make_shared<TestFilter>(context.serverFactoryContext().clusterManager()));
     };
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { CONSTRUCT_ON_FIRST_USE(std::string, "envoy.test.router"); }
   bool isTerminalFilterByProto(const Protobuf::Message&,
-                               Server::Configuration::FactoryContext&) override {
+                               Server::Configuration::ServerFactoryContext&) override {
     return true;
   }
 };
 
 } // namespace
 
-struct TcpConnPoolIntegrationTestParams {
-  Network::Address::IpVersion version;
-  bool test_original_version;
-};
-
-std::vector<TcpConnPoolIntegrationTestParams> getProtocolTestParams() {
-  std::vector<TcpConnPoolIntegrationTestParams> ret;
-
-  for (auto ip_version : TestEnvironment::getIpVersionsForTest()) {
-    ret.push_back(TcpConnPoolIntegrationTestParams{ip_version, true});
-    ret.push_back(TcpConnPoolIntegrationTestParams{ip_version, false});
-  }
-  return ret;
-}
-
-std::string protocolTestParamsToString(
-    const ::testing::TestParamInfo<TcpConnPoolIntegrationTestParams>& params) {
-  return absl::StrCat(
-      (params.param.version == Network::Address::IpVersion::v4 ? "IPv4_" : "IPv6_"),
-      (params.param.test_original_version == true ? "OriginalConnPool" : "NewConnPool"));
-}
-
-class TcpConnPoolIntegrationTest : public testing::TestWithParam<TcpConnPoolIntegrationTestParams>,
+class TcpConnPoolIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                    public BaseIntegrationTest {
 public:
   TcpConnPoolIntegrationTest()
-      : BaseIntegrationTest(GetParam().version, tcp_conn_pool_config),
-        filter_resolver_(config_factory_) {}
+      : BaseIntegrationTest(GetParam(), tcp_conn_pool_config), filter_resolver_(config_factory_) {}
 
   // Called once by the gtest framework before any tests are run.
   static void SetUpTestSuite() { // NOLINT(readability-identifier-naming)
@@ -145,18 +125,8 @@ public:
       - filters:
         - name: envoy.test.router
           typed_config:
+            "@type": type.googleapis.com/google.protobuf.Struct
       )EOF");
-  }
-
-  // Initializer for individual tests.
-  void SetUp() override {
-    if (GetParam().test_original_version) {
-      config_helper_.addRuntimeOverride("envoy.reloadable_features.new_tcp_connection_pool",
-                                        "false");
-    } else {
-      config_helper_.addRuntimeOverride("envoy.reloadable_features.new_tcp_connection_pool",
-                                        "true");
-    }
   }
 
 private:
@@ -165,7 +135,8 @@ private:
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, TcpConnPoolIntegrationTest,
-                         testing::ValuesIn(getProtocolTestParams()), protocolTestParamsToString);
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
 
 TEST_P(TcpConnPoolIntegrationTest, SingleRequest) {
   initialize();
@@ -227,8 +198,6 @@ TEST_P(TcpConnPoolIntegrationTest, PoolCleanupEnabled) {
   // second pool, which is why the log message is expected 2 times. If the initial pool was not
   // cleaned up, only 1 pool would be created.
   EXPECT_LOG_CONTAINS_N_TIMES("debug", "Allocating TCP conn pool", 2, {
-    config_helper_.addRuntimeOverride("envoy.reloadable_features.conn_pool_delete_when_idle",
-                                      "true");
     initialize();
 
     std::string request1("request1");
@@ -255,7 +224,7 @@ TEST_P(TcpConnPoolIntegrationTest, PoolCleanupEnabled) {
     ASSERT_TRUE(fake_upstream_connection2->waitForData(request2.size(), &data));
     EXPECT_EQ(request2, data);
 
-    test_server_->waitForGaugeEq("cluster.cluster_0.upstream_cx_active", 2);
+    test_server_->waitForGauge("cluster.cluster_0.upstream_cx_active", Eq(2));
 
     // Send response 2.
     ASSERT_TRUE(fake_upstream_connection2->write(response2));
@@ -266,7 +235,7 @@ TEST_P(TcpConnPoolIntegrationTest, PoolCleanupEnabled) {
     ASSERT_TRUE(fake_upstream_connection1->write(response1));
     ASSERT_TRUE(fake_upstream_connection1->close());
     tcp_client->waitForData(response1, false);
-    test_server_->waitForGaugeEq("cluster.cluster_0.upstream_cx_active", 0);
+    test_server_->waitForGauge("cluster.cluster_0.upstream_cx_active", Eq(0));
 
     // After both requests were completed, the pool went idle and was cleaned up. Request 3 causes a
     // new pool to be created. Seeing a new pool created is a proxy for directly observing that an
@@ -279,7 +248,7 @@ TEST_P(TcpConnPoolIntegrationTest, PoolCleanupEnabled) {
     ASSERT_TRUE(tcp_client->write(request3));
     FakeRawConnectionPtr fake_upstream_connection3;
     ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection3));
-    test_server_->waitForGaugeEq("cluster.cluster_0.upstream_cx_active", 1);
+    test_server_->waitForGauge("cluster.cluster_0.upstream_cx_active", Eq(1));
     ASSERT_TRUE(fake_upstream_connection3->waitForData(request3.size(), &data));
     EXPECT_EQ(request3, data);
 
@@ -287,7 +256,7 @@ TEST_P(TcpConnPoolIntegrationTest, PoolCleanupEnabled) {
     ASSERT_TRUE(fake_upstream_connection3->close());
     tcp_client->waitForData(response3, false);
 
-    test_server_->waitForGaugeEq("cluster.cluster_0.upstream_cx_active", 0);
+    test_server_->waitForGauge("cluster.cluster_0.upstream_cx_active", Eq(0));
 
     tcp_client->close();
   });

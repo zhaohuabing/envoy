@@ -7,6 +7,7 @@ import "udpa/annotations/status.proto";
 option java_package = "io.envoyproxy.envoy.extensions.formatter.req_without_query.v3";
 option java_outer_classname = "ReqWithoutQueryProto";
 option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/formatter/req_without_query/v3;req_without_queryv3";
 option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
 // [#protodoc-title: Formatter extension for printing request without query string]
@@ -23,6 +24,10 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //   optional parameter denoting string truncation up to Z characters long. The value is taken from
 //   the HTTP request header named X first and if it's not set, then request header Y is used. If
 //   none of the headers are present '-' symbol will be in the log.
+
+// .. warning::
+//   Please use %PATH% to replace this extension.
+//   See :ref:`access log formats <config_access_log_format>` for more details.
 
 // Configuration for the request without query formatter.
 message ReqWithoutQuery {

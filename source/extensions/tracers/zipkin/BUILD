@@ -1,3 +1,4 @@
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
@@ -11,11 +12,16 @@ licenses(["notice"])  # Apache 2
 
 envoy_extension_package()
 
+cc_proto_library(
+    name = "zipkin_cc_proto",
+    tags = ["manual"],
+    deps = ["@zipkin-api//:zipkin_proto"],
+)
+
 envoy_cc_library(
     name = "zipkin_lib",
     srcs = [
         "span_buffer.cc",
-        "span_context.cc",
         "span_context_extractor.cc",
         "tracer.cc",
         "util.cc",
@@ -34,16 +40,14 @@ envoy_cc_library(
         "zipkin_json_field_names.h",
         "zipkin_tracer_impl.h",
     ],
-    external_deps = [
-        "abseil_optional",
-    ],
     deps = [
+        ":zipkin_cc_proto",
         "//envoy/common:time_interface",
         "//envoy/local_info:local_info_interface",
         "//envoy/network:address_interface",
         "//envoy/runtime:runtime_interface",
         "//envoy/thread_local:thread_local_interface",
-        "//envoy/tracing:http_tracer_interface",
+        "//envoy/tracing:tracer_interface",
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/common:enum_to_int",
         "//source/common/common:hex_lib",
@@ -51,6 +55,7 @@ envoy_cc_library(
         "//source/common/config:utility_lib",
         "//source/common/http:async_client_utility_lib",
         "//source/common/http:header_map_lib",
+        "//source/common/http:http_service_headers_lib",
         "//source/common/http:message_lib",
         "//source/common/http:utility_lib",
         "//source/common/json:json_loader_lib",
@@ -58,8 +63,9 @@ envoy_cc_library(
         "//source/common/singleton:const_singleton",
         "//source/common/tracing:http_tracer_lib",
         "//source/common/upstream:cluster_update_tracker_lib",
-        "@com_github_openzipkin_zipkinapi//:zipkin_cc_proto",
+        "//source/extensions/tracers/opentelemetry:opentelemetry_tracer_lib",
         "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
+        "@zipkin-api",
     ],
 )
 

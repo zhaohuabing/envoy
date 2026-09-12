@@ -1,5 +1,7 @@
 // NOLINT(namespace-envoy)
 #pragma once
+#include <cstdint>
+
 
 // Note that this file is included in emscripten and NullVM environments and thus depends on
 // the context in which it is included, hence we need to disable clang-tidy warnings.
@@ -76,7 +78,17 @@ template <typename I> inline uint32_t align(uint32_t i) {
   return (i + sizeof(I) - 1) & ~(sizeof(I) - 1);
 }
 
-inline StatResult parseStatResults(std::string_view data) {
+// Used attribute is used here to work around a coverage issue in clang/llvm:
+// https://github.com/llvm/llvm-project/issues/32849.
+//
+// It's a temporary hack and is not supposed to be a permanent solution.
+// If we address the issue upstream in clang or migrate to static linking for coverage tests
+// we can drop this.
+//
+// Alternative to using used attribute here is to move the function definition to
+// the cc file. However, I didn't go for that, given that it looks that the function
+// was put in the header file intentionally.
+__attribute__((used)) inline StatResult parseStatResults(std::string_view data) {
   StatResult results;
   uint32_t data_len = 0;
   while (data_len < data.length()) {

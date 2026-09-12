@@ -5,6 +5,7 @@
 #include "envoy/config/typed_config.h"
 #include "envoy/registry/registry.h"
 
+#include "source/common/formatter/substitution_format_utility.h"
 #include "source/common/formatter/substitution_formatter.h"
 
 namespace Envoy {
@@ -13,32 +14,32 @@ namespace Formatter {
 
 class ReqWithoutQuery : public ::Envoy::Formatter::FormatterProvider {
 public:
-  ReqWithoutQuery(const std::string& main_header, const std::string& alternative_header,
-                  absl::optional<size_t> max_length);
+  ReqWithoutQuery(absl::string_view main_header, absl::string_view alternative_header,
+                  std::optional<size_t> max_length);
 
-  absl::optional<std::string> format(const Http::RequestHeaderMap&, const Http::ResponseHeaderMap&,
-                                     const Http::ResponseTrailerMap&, const StreamInfo::StreamInfo&,
-                                     absl::string_view) const override;
-  ProtobufWkt::Value formatValue(const Http::RequestHeaderMap&, const Http::ResponseHeaderMap&,
-                                 const Http::ResponseTrailerMap&, const StreamInfo::StreamInfo&,
-                                 absl::string_view) const override;
+  std::optional<std::string> format(const Envoy::Formatter::Context& context,
+                                    const StreamInfo::StreamInfo&) const override;
+  Protobuf::Value formatValue(const Envoy::Formatter::Context& context,
+                              const StreamInfo::StreamInfo&) const override;
+  bool formatTo(std::string& sink, const Envoy::Formatter::Context& context,
+                const StreamInfo::StreamInfo& stream_info) const override;
+  void formatValueTo(Envoy::Formatter::ValueSink& sink, const Envoy::Formatter::Context& context,
+                     const StreamInfo::StreamInfo& stream_info) const override;
 
 private:
-  const Http::HeaderEntry* findHeader(const Http::HeaderMap& headers) const;
+  const Http::HeaderEntry* findHeader(OptRef<const Http::HeaderMap> headers) const;
 
-  Http::LowerCaseString main_header_;
-  Http::LowerCaseString alternative_header_;
-  absl::optional<size_t> max_length_;
+  const Http::LowerCaseString main_header_;
+  const Http::LowerCaseString alternative_header_;
+  const std::optional<size_t> max_length_;
 };
 
 class ReqWithoutQueryCommandParser : public ::Envoy::Formatter::CommandParser {
 public:
   ReqWithoutQueryCommandParser() = default;
-  ::Envoy::Formatter::FormatterProviderPtr parse(const std::string& token, size_t,
-                                                 size_t) const override;
-
-private:
-  static const size_t ReqWithoutQueryParamStart{sizeof("REQ_WITHOUT_QUERY(") - 1};
+  absl::StatusOr<Envoy::Formatter::FormatterProviderPtr>
+  parse(absl::string_view command, absl::string_view subcommand,
+        std::optional<size_t> max_length) const override;
 };
 
 } // namespace Formatter

@@ -39,9 +39,10 @@ public:
    * @param host supplies the host that was just health checked.
    * @param changed_state supplies whether the health check resulted in a host moving from healthy
    *                       to not healthy or vice versa.
+   * @param state result of the current check.
    */
-  using HostStatusCb =
-      std::function<void(const HostSharedPtr& host, HealthTransition changed_state)>;
+  using HostStatusCb = std::function<void(const HostSharedPtr& host, HealthTransition changed_state,
+                                          HealthState current_check_result)>;
 
   /**
    * Install a callback that will be invoked every time a health check round is completed for
@@ -73,10 +74,13 @@ public:
    * @param health_checker_type supplies the type of health checker that generated the event.
    * @param host supplies the host that generated the event.
    * @param failure_type supplies the type of health check failure.
+   * @param http_status_code the HTTP status code of the response that triggered the ejection,
+   *        or 0 if not applicable (e.g., non-HTTP checkers or network-level failures).
    */
   virtual void logEjectUnhealthy(envoy::data::core::v3::HealthCheckerType health_checker_type,
                                  const HostDescriptionConstSharedPtr& host,
-                                 envoy::data::core::v3::HealthCheckFailureType failure_type) PURE;
+                                 envoy::data::core::v3::HealthCheckFailureType failure_type,
+                                 uint64_t http_status_code) PURE;
 
   /**
    * Log an unhealthy host event.
@@ -84,21 +88,31 @@ public:
    * @param host supplies the host that generated the event.
    * @param failure_type supplies the type of health check failure.
    * @param first_check whether this is a failure on the first health check for this host.
+   * @param http_status_code the HTTP status code of the response that caused this failure,
+   *        or 0 if not applicable (e.g., non-HTTP checkers or network-level failures).
    */
   virtual void logUnhealthy(envoy::data::core::v3::HealthCheckerType health_checker_type,
                             const HostDescriptionConstSharedPtr& host,
                             envoy::data::core::v3::HealthCheckFailureType failure_type,
-                            bool first_check) PURE;
+                            bool first_check, uint64_t http_status_code) PURE;
 
   /**
    * Log a healthy host addition event.
    * @param health_checker_type supplies the type of health checker that generated the event.
    * @param host supplies the host that generated the event.
-   * @param healthy_threshold supplied the configured healthy threshold for this health check.
    * @param first_check whether this is a fast path success on the first health check for this host.
    */
   virtual void logAddHealthy(envoy::data::core::v3::HealthCheckerType health_checker_type,
                              const HostDescriptionConstSharedPtr& host, bool first_check) PURE;
+
+  /**
+   * A health check was successful.
+   * @param health_checker_type supplies the type of health checker that generated the event.
+   * @param host supplies the host that generated the event.
+   */
+  virtual void
+  logSuccessfulHealthCheck(envoy::data::core::v3::HealthCheckerType health_checker_type,
+                           const HostDescriptionConstSharedPtr& host) PURE;
 
   /**
    * Log a degraded healthy host event.

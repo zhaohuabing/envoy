@@ -15,18 +15,26 @@ namespace RateLimitFilter {
  * Config registration for the rate limit filter. @see NamedHttpFilterConfigFactory.
  */
 class RateLimitFilterConfig
-    : public Common::FactoryBase<
+    : public Common::UnifiedFactoryBase<
           envoy::extensions::filters::http::ratelimit::v3::RateLimit,
           envoy::extensions::filters::http::ratelimit::v3::RateLimitPerRoute> {
 public:
-  RateLimitFilterConfig() : FactoryBase("envoy.filters.http.ratelimit") {}
+  RateLimitFilterConfig() : UnifiedFactoryBase("envoy.filters.http.ratelimit") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::ratelimit::v3::RateLimit& proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  // Shared factory creation used by the listener/cluster and route/vhost-level paths. The
+  // FilterConfig stats are scoped to the given scope.
+  absl::StatusOr<Http::FilterFactoryCb> createFilterFactory(
+      const envoy::extensions::filters::http::ratelimit::v3::RateLimit& proto_config,
+      Server::Configuration::ServerFactoryContext& context, Stats::Scope& scope);
+
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::ratelimit::v3::RateLimitPerRoute& proto_config,
       Server::Configuration::ServerFactoryContext& context,
       ProtobufMessage::ValidationVisitor& validator) override;

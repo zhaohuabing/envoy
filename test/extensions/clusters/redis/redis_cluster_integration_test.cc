@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <sstream>
 #include <vector>
 
@@ -5,10 +6,13 @@
 
 #include "source/common/common/macros.h"
 #include "source/extensions/filters/network/redis_proxy/command_splitter_impl.h"
+#include "source/extensions/network/dns_resolver/getaddrinfo/getaddrinfo.h"
 
 #include "test/integration/ads_integration.h"
 #include "test/integration/integration.h"
+#include "test/test_common/threadsafe_singleton_injector.h"
 
+using testing::Ge;
 using testing::Return;
 
 namespace Envoy {
@@ -69,12 +73,11 @@ const std::string& clusterConfig() {
       cluster_type:
         name: envoy.clusters.redis
         typed_config:
-          "@type": type.googleapis.com/google.protobuf.Struct
-          value:
-            cluster_refresh_rate: 60s
-            cluster_refresh_timeout: 4s
-            redirect_refresh_interval: 0s
-            redirect_refresh_threshold: 1
+          "@type": type.googleapis.com/envoy.extensions.clusters.redis.v3.RedisClusterConfig
+          cluster_refresh_rate: 60s
+          cluster_refresh_timeout: 4s
+          redirect_refresh_interval: 0s
+          redirect_refresh_threshold: 1
 )EOF");
 }
 
@@ -99,13 +102,12 @@ const std::string& testConfigWithRefresh() {
       cluster_type:
         name: envoy.clusters.redis
         typed_config:
-          "@type": type.googleapis.com/google.protobuf.Struct
-          value:
-            cluster_refresh_rate: 3600s
-            cluster_refresh_timeout: 4s
-            redirect_refresh_interval: 100s
-            redirect_refresh_threshold: 1
-            failure_refresh_threshold: 1
+          "@type": type.googleapis.com/envoy.extensions.clusters.redis.v3.RedisClusterConfig
+          cluster_refresh_rate: 3600s
+          cluster_refresh_timeout: 4s
+          redirect_refresh_interval: 100s
+          redirect_refresh_threshold: 1
+          failure_refresh_threshold: 1
 )EOF");
 }
 
@@ -155,8 +157,18 @@ public:
 
     // Change the port for each of the discovery host in cluster_0.
     config_helper_.addConfigModifier([this](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      // Add default DNS resolver config.
+      auto* typed_dns_resolver_config = bootstrap.mutable_typed_dns_resolver_config();
+      typed_dns_resolver_config->set_name("envoy.network.dns_resolver.getaddrinfo");
+      envoy::extensions::network::dns_resolver::getaddrinfo::v3::GetAddrInfoDnsResolverConfig
+          config;
+      std::ignore = typed_dns_resolver_config->mutable_typed_config()->PackFrom(config);
+
       uint32_t upstream_idx = 0;
       auto* cluster_0 = bootstrap.mutable_static_resources()->mutable_clusters(0);
+      if (version_ == Network::Address::IpVersion::v4) {
+        cluster_0->set_dns_lookup_family(envoy::config::cluster::v3::Cluster::V4_ONLY);
+      }
       for (int j = 0; j < cluster_0->load_assignment().endpoints_size(); ++j) {
         auto locality_lb = cluster_0->mutable_load_assignment()->mutable_endpoints(j);
         for (int k = 0; k < locality_lb->lb_endpoints_size(); ++k) {
@@ -319,6 +331,22 @@ protected:
     return resp.str();
   }
 
+  std::string singleSlotPrimaryReplicaHostnames(const std::string primary_hostname,
+                                                const uint32_t primary_port,
+                                                const std::string replica_hostname,
+                                                const uint32_t replica_port) {
+    int64_t start_slot = 0;
+    int64_t end_slot = 16383;
+
+    std::stringstream resp;
+    resp << "*1\r\n"
+         << "*4\r\n"
+         << ":" << start_slot << "\r\n"
+         << ":" << end_slot << "\r\n"
+         << makeIp(primary_hostname, primary_port) << makeIp(replica_hostname, replica_port);
+    return resp.str();
+  }
+
   /**
    * Simple response for 2 slot redis cluster with 2 nodes.
    * @param slot1 the ip of the primary node of slot1.
@@ -347,7 +375,7 @@ protected:
   // This method encodes a fake upstream's IP address and TCP port in the
   // same format as one would expect from a Redis server in
   // an ask/moved redirection error.
-  std::string redisAddressAndPort(FakeUpstreamPtr& upstream) {
+  std::string redisAddressAndPortNoThrow(FakeUpstreamPtr& upstream) {
     std::stringstream result;
     if (version_ == Network::Address::IpVersion::v4) {
       result << "127.0.0.1"
@@ -424,6 +452,34 @@ TEST_P(RedisClusterIntegrationTest, SingleSlotPrimaryReplica) {
   simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
 }
 
+// This test is the same as SingleSlotPrimaryReplica, the only
+// difference being that it has the primary and replica identified
+// by hostname instead of IP address.
+TEST_P(RedisClusterIntegrationTest, SingleSlotPrimaryReplicaHostnames) {
+  OsSysCallsWithMockedDns mock_os_sys_calls;
+  mock_os_sys_calls.setIpVersion(version_);
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls{&mock_os_sys_calls};
+
+  random_index_ = 0;
+
+  on_server_init_function_ = [this]() {
+    std::string cluster_slot_response = singleSlotPrimaryReplicaHostnames(
+        "localhost", fake_upstreams_[0]->localAddress()->ip()->port(), "localhost",
+        fake_upstreams_[1]->localAddress()->ip()->port());
+
+    expectCallClusterSlot(random_index_, cluster_slot_response);
+  };
+
+  initialize();
+
+  // foo hashes to slot 12182 which is in upstream 0
+  simpleRequestAndResponse(0, makeBulkStringArray({"get", "foo"}), "$3\r\nbar\r\n");
+
+  // Stop worker threads before os_calls restores the process-wide syscall singleton.
+  test_server_.reset();
+}
+
+// This test sends a simple "get foo" command from a fake
 // This test sends a simple "get foo" command from a fake
 // downstream client through the proxy to a fake upstream
 // Redis cluster with 2 slots. The fake server sends a valid response
@@ -468,7 +524,7 @@ TEST_P(RedisClusterIntegrationTest, ClusterSlotRequestAfterRedirection) {
   std::string request = makeBulkStringArray({"get", "foo"});
   // The actual moved redirection error that redirects to the fake_upstreams_[1] server.
   std::string redirection_response =
-      "-MOVED 12182 " + redisAddressAndPort(fake_upstreams_[1]) + "\r\n";
+      "-MOVED 12182 " + redisAddressAndPortNoThrow(fake_upstreams_[1]) + "\r\n";
   // The "get foo" response from fake_upstreams_[1].
   std::string response = "$3\r\nbar\r\n";
   std::string cluster_slots_request = makeBulkStringArray({"CLUSTER", "SLOTS"});
@@ -636,38 +692,39 @@ TEST_P(RedisAdsIntegrationTest, RedisClusterRemoval) {
   initialize();
 
   // Send initial configuration with a redis cluster and a redis proxy listener.
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "", {}, {}, {}, true));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-      Config::TypeUrl::get().Cluster, {buildRedisCluster("redis_cluster")},
+      Config::TestTypeUrl::get().Cluster, {buildRedisCluster("redis_cluster")},
       {buildRedisCluster("redis_cluster")}, {}, "1");
 
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().ClusterLoadAssignment, "",
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().ClusterLoadAssignment, "",
                                       {"redis_cluster"}, {"redis_cluster"}, {}));
   sendDiscoveryResponse<envoy::config::endpoint::v3::ClusterLoadAssignment>(
-      Config::TypeUrl::get().ClusterLoadAssignment, {buildClusterLoadAssignment("redis_cluster")},
-      {buildClusterLoadAssignment("redis_cluster")}, {}, "1");
+      Config::TestTypeUrl::get().ClusterLoadAssignment,
+      {buildClusterLoadAssignment("redis_cluster")}, {buildClusterLoadAssignment("redis_cluster")},
+      {}, "1");
 
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Cluster, "1", {}, {}, {}));
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "", {}, {}, {}));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "1", {}, {}, {}));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "", {}, {}, {}));
   sendDiscoveryResponse<envoy::config::listener::v3::Listener>(
-      Config::TypeUrl::get().Listener, {buildRedisListener("listener_0", "redis_cluster")},
+      Config::TestTypeUrl::get().Listener, {buildRedisListener("listener_0", "redis_cluster")},
       {buildRedisListener("listener_0", "redis_cluster")}, {}, "1");
 
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().ClusterLoadAssignment, "1",
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().ClusterLoadAssignment, "1",
                                       {"redis_cluster"}, {}, {}));
 
-  EXPECT_TRUE(compareDiscoveryRequest(Config::TypeUrl::get().Listener, "1", {}, {}, {}));
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Listener, "1", {}, {}, {}));
 
   // Validate that redis listener is successfully created.
-  test_server_->waitForCounterGe("listener_manager.listener_create_success", 1);
+  test_server_->waitForCounter("listener_manager.listener_create_success", Ge(1));
 
   // Now send a CDS update, removing redis cluster added above.
   sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
-      Config::TypeUrl::get().Cluster, {buildCluster("cluster_2")}, {buildCluster("cluster_2")},
+      Config::TestTypeUrl::get().Cluster, {buildCluster("cluster_2")}, {buildCluster("cluster_2")},
       {"redis_cluster"}, "2");
 
   // Validate that the cluster is removed successfully.
-  test_server_->waitForCounterGe("cluster_manager.cluster_removed", 1);
+  test_server_->waitForCounter("cluster_manager.cluster_removed", Ge(1));
 }
 
 INSTANTIATE_TEST_SUITE_P(IpVersionsClientTypeDeltaWildcard, RedisAdsIntegrationTest,

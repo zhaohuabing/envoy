@@ -1,9 +1,11 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "envoy/common/optref.h"
 #include "envoy/common/platform.h"
 #include "envoy/common/pure.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -12,7 +14,6 @@
 #include "envoy/ssl/connection.h"
 
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Network {
@@ -23,7 +24,6 @@ namespace Network {
 // avoid #ifdef proliferation.
 struct SocketOptionName {
   SocketOptionName() = default;
-  SocketOptionName(const SocketOptionName&) = default;
   SocketOptionName(int level, int option, const std::string& name)
       : value_(std::make_tuple(level, option, name)) {}
 
@@ -35,13 +35,176 @@ struct SocketOptionName {
   bool operator==(const SocketOptionName& rhs) const { return value_ == rhs.value_; }
 
 private:
-  absl::optional<std::tuple<int, int, std::string>> value_;
+  std::optional<std::tuple<int, int, std::string>> value_;
 };
 
 // ENVOY_MAKE_SOCKET_OPTION_NAME is a helper macro to generate a
 // SocketOptionName with a descriptive string name.
 #define ENVOY_MAKE_SOCKET_OPTION_NAME(level, option)                                               \
-  Network::SocketOptionName(level, option, #level "/" #option)
+  ::Envoy::Network::SocketOptionName(level, option, #level "/" #option)
+
+// Moved from source/common/network/socket_option_impl.h to avoid dependency loops.
+#ifdef IP_TRANSPARENT
+#define ENVOY_SOCKET_IP_TRANSPARENT ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_TRANSPARENT)
+#else
+#define ENVOY_SOCKET_IP_TRANSPARENT Network::SocketOptionName()
+#endif
+
+#ifdef IPV6_TRANSPARENT
+#define ENVOY_SOCKET_IPV6_TRANSPARENT ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_TRANSPARENT)
+#else
+#define ENVOY_SOCKET_IPV6_TRANSPARENT Network::SocketOptionName()
+#endif
+
+#ifdef IP_FREEBIND
+#define ENVOY_SOCKET_IP_FREEBIND ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_FREEBIND)
+#else
+#define ENVOY_SOCKET_IP_FREEBIND Network::SocketOptionName()
+#endif
+
+#ifdef IPV6_FREEBIND
+#define ENVOY_SOCKET_IPV6_FREEBIND ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_FREEBIND)
+#else
+#define ENVOY_SOCKET_IPV6_FREEBIND Network::SocketOptionName()
+#endif
+
+#ifdef IP_RECVTOS
+#define ENVOY_SOCKET_IP_RECVTOS ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_RECVTOS)
+#else
+#define ENVOY_SOCKET_IP_RECVTOS Network::SocketOptionName()
+#endif
+
+#ifdef IPV6_RECVTCLASS
+#define ENVOY_SOCKET_IPV6_RECVTCLASS ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_RECVTCLASS)
+#else
+#define ENVOY_SOCKET_IPV6_RECVTCLASS Network::SocketOptionName()
+#endif
+
+#ifdef SO_KEEPALIVE
+#define ENVOY_SOCKET_SO_KEEPALIVE ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_SOCKET, SO_KEEPALIVE)
+#else
+#define ENVOY_SOCKET_SO_KEEPALIVE Network::SocketOptionName()
+#endif
+
+#ifdef SO_MARK
+#define ENVOY_SOCKET_SO_MARK ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_SOCKET, SO_MARK)
+#else
+#define ENVOY_SOCKET_SO_MARK Network::SocketOptionName()
+#endif
+
+#ifdef SO_NOSIGPIPE
+#define ENVOY_SOCKET_SO_NOSIGPIPE ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_SOCKET, SO_NOSIGPIPE)
+#else
+#define ENVOY_SOCKET_SO_NOSIGPIPE Network::SocketOptionName()
+#endif
+
+#ifdef SO_REUSEPORT
+#define ENVOY_SOCKET_SO_REUSEPORT ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_SOCKET, SO_REUSEPORT)
+#else
+#define ENVOY_SOCKET_SO_REUSEPORT Network::SocketOptionName()
+#endif
+
+#ifdef SO_ORIGINAL_DST
+#define ENVOY_SOCKET_SO_ORIGINAL_DST ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_IP, SO_ORIGINAL_DST)
+#else
+#define ENVOY_SOCKET_SO_ORIGINAL_DST Network::SocketOptionName()
+#endif
+
+#ifdef IP6T_SO_ORIGINAL_DST
+#define ENVOY_SOCKET_IP6T_SO_ORIGINAL_DST                                                          \
+  ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_IPV6, IP6T_SO_ORIGINAL_DST)
+#else
+#define ENVOY_SOCKET_IP6T_SO_ORIGINAL_DST Network::SocketOptionName()
+#endif
+
+#ifdef UDP_GRO
+#define ENVOY_SOCKET_UDP_GRO ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_UDP, UDP_GRO)
+#else
+#define ENVOY_SOCKET_UDP_GRO Network::SocketOptionName()
+#endif
+
+#ifdef TCP_KEEPCNT
+#define ENVOY_SOCKET_TCP_KEEPCNT ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_TCP, TCP_KEEPCNT)
+#else
+#define ENVOY_SOCKET_TCP_KEEPCNT Network::SocketOptionName()
+#endif
+
+#ifdef TCP_KEEPIDLE
+#define ENVOY_SOCKET_TCP_KEEPIDLE ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_TCP, TCP_KEEPIDLE)
+#elif TCP_KEEPALIVE // macOS uses a different name from Linux for just this option.
+#define ENVOY_SOCKET_TCP_KEEPIDLE ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_TCP, TCP_KEEPALIVE)
+#else
+#define ENVOY_SOCKET_TCP_KEEPIDLE Network::SocketOptionName()
+#endif
+
+#ifdef TCP_KEEPINTVL
+#define ENVOY_SOCKET_TCP_KEEPINTVL ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_TCP, TCP_KEEPINTVL)
+#else
+#define ENVOY_SOCKET_TCP_KEEPINTVL Network::SocketOptionName()
+#endif
+
+#ifdef TCP_FASTOPEN
+#define ENVOY_SOCKET_TCP_FASTOPEN ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_TCP, TCP_FASTOPEN)
+#else
+#define ENVOY_SOCKET_TCP_FASTOPEN Network::SocketOptionName()
+#endif
+
+// Linux uses IP_PKTINFO for both sending source address and receiving destination
+// address.
+// FreeBSD uses IP_RECVDSTADDR for receiving destination address and IP_SENDSRCADDR for sending
+// source address. And these two have same value for convenience purpose.
+#ifdef IP_RECVDSTADDR
+#ifdef IP_SENDSRCADDR
+static_assert(IP_RECVDSTADDR == IP_SENDSRCADDR);
+#endif
+#define ENVOY_IP_PKTINFO IP_RECVDSTADDR
+#elif IP_PKTINFO
+#define ENVOY_IP_PKTINFO IP_PKTINFO
+#endif
+
+#ifdef IP_BIND_ADDRESS_NO_PORT
+#define ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT                                                       \
+  ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT)
+#else
+#define ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT Network::SocketOptionName()
+#endif
+
+#define ENVOY_SELF_IP_ADDR ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, ENVOY_IP_PKTINFO)
+
+// Both Linux and FreeBSD use IPV6_RECVPKTINFO for both sending source address and
+// receiving destination address.
+#define ENVOY_SELF_IPV6_ADDR ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_RECVPKTINFO)
+
+#ifdef SO_ATTACH_REUSEPORT_CBPF
+#define ENVOY_ATTACH_REUSEPORT_CBPF                                                                \
+  ENVOY_MAKE_SOCKET_OPTION_NAME(SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF)
+#else
+#define ENVOY_ATTACH_REUSEPORT_CBPF Network::SocketOptionName()
+#endif
+
+#if !defined(ANDROID) && defined(__APPLE__)
+// Only include TargetConditionals after testing ANDROID as some Android builds
+// on the Mac have this header available and it's not needed unless the target
+// is really an Apple platform.
+#include <TargetConditionals.h>
+#if !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
+// MAC_OS
+#define ENVOY_IP_DONTFRAG ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_DONTFRAG)
+#define ENVOY_IPV6_DONTFRAG ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_DONTFRAG)
+#endif
+#endif
+
+#if !defined(ENVOY_IP_DONTFRAG) && defined(IP_PMTUDISC_DO)
+#define ENVOY_IP_MTU_DISCOVER ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IP, IP_MTU_DISCOVER)
+#define ENVOY_IP_MTU_DISCOVER_VALUE IP_PMTUDISC_DO
+#define ENVOY_IPV6_MTU_DISCOVER ENVOY_MAKE_SOCKET_OPTION_NAME(IPPROTO_IPV6, IPV6_MTU_DISCOVER)
+#define ENVOY_IPV6_MTU_DISCOVER_VALUE IPV6_PMTUDISC_DO
+#endif
+
+class FilterChainInfo;
+class ListenerInfo;
+
+using FilterChainInfoConstSharedPtr = std::shared_ptr<const FilterChainInfo>;
 
 /**
  * Interfaces for providing a socket's various addresses. This is split into a getters interface
@@ -56,6 +219,12 @@ public:
    * @return the local address of the socket.
    */
   virtual const Address::InstanceConstSharedPtr& localAddress() const PURE;
+
+  /**
+   * @return the direct local address of the socket. This is the listener address and it can not be
+   * modified by listener filters.
+   */
+  virtual const Address::InstanceConstSharedPtr& directLocalAddress() const PURE;
 
   /**
    * @return true if the local address has been restored to a value that is different from the
@@ -80,9 +249,20 @@ public:
   virtual absl::string_view requestedServerName() const PURE;
 
   /**
+   * @return requestedApplicationProtocols value for downstream host.
+   */
+  virtual const std::vector<std::string>& requestedApplicationProtocols() const PURE;
+
+  /**
    * @return Connection ID of the downstream connection, or unset if not available.
    **/
-  virtual absl::optional<uint64_t> connectionID() const PURE;
+  virtual std::optional<uint64_t> connectionID() const PURE;
+
+  /**
+   * @return the name of the network interface used by local end of the connection, or unset if not
+   *available.
+   **/
+  virtual std::optional<absl::string_view> interfaceName() const PURE;
 
   /**
    * Dumps the state of the ConnectionInfoProvider to the given ostream.
@@ -97,6 +277,32 @@ public:
    * connection does not use SSL.
    */
   virtual Ssl::ConnectionInfoConstSharedPtr sslConnection() const PURE;
+
+  /**
+   * @return ja3 fingerprint hash of the downstream connection, if any.
+   */
+  virtual absl::string_view ja3Hash() const PURE;
+
+  /**
+   * @return ja4 fingerprint hash of the downstream connection, if any.
+   */
+  virtual absl::string_view ja4Hash() const PURE;
+
+  /**
+   * @return roundTripTime of the connection
+   * TODO(wbpcode): support better precision for round trip time, e.g. std::chrono::nanoseconds.
+   */
+  virtual const std::optional<std::chrono::milliseconds>& roundTripTime() const PURE;
+
+  /**
+   * @return the filter chain info provider backing this socket.
+   */
+  virtual OptRef<const FilterChainInfo> filterChainInfo() const PURE;
+
+  /**
+   * @return the listener info backing this socket.
+   */
+  virtual OptRef<const ListenerInfo> listenerInfo() const PURE;
 };
 
 class ConnectionInfoSetter : public ConnectionInfoProvider {
@@ -133,14 +339,57 @@ public:
   virtual void setRequestedServerName(const absl::string_view requested_server_name) PURE;
 
   /**
+   * @param protocols Application protocols requested.
+   */
+  virtual void
+  setRequestedApplicationProtocols(const std::vector<absl::string_view>& protocols) PURE;
+
+  /**
    * @param id Connection ID of the downstream connection.
    **/
   virtual void setConnectionID(uint64_t id) PURE;
 
   /**
+   * @param enable whether to enable or disable setting interface name. While having an interface
+   *               name might be helpful for debugging, it might come at a performance cost.
+   */
+  virtual void enableSettingInterfaceName(const bool enable) PURE;
+
+  /**
+   * @param interface_name the name of the network interface used by the local end of the
+   *connection.
+   **/
+  virtual void maybeSetInterfaceName(IoHandle& io_handle) PURE;
+
+  /**
    * @param connection_info sets the downstream ssl connection.
    */
   virtual void setSslConnection(const Ssl::ConnectionInfoConstSharedPtr& ssl_connection_info) PURE;
+
+  /**
+   * @param JA3 fingerprint.
+   */
+  virtual void setJA3Hash(const absl::string_view ja3_hash) PURE;
+
+  /**
+   * @param JA4 fingerprint.
+   */
+  virtual void setJA4Hash(const absl::string_view ja4_hash) PURE;
+
+  /**
+   * @param  milliseconds of round trip time of previous connection
+   */
+  virtual void setRoundTripTime(std::chrono::milliseconds round_trip_time) PURE;
+
+  /**
+   * @param filter_chain_info the filter chain info provider backing this socket.
+   */
+  virtual void setFilterChainInfo(FilterChainInfoConstSharedPtr filter_chain_info) PURE;
+
+  /**
+   * @param listener_info the listener info provider backing this socket.
+   */
+  virtual void setListenerInfo(std::shared_ptr<const ListenerInfo> listener_info) PURE;
 };
 
 using ConnectionInfoSetterSharedPtr = std::shared_ptr<ConnectionInfoSetter>;
@@ -192,9 +441,14 @@ public:
   virtual Address::Type addressType() const PURE;
 
   /**
-   * @return the IP version used by the socket if address type is IP, absl::nullopt otherwise
+   * @return the IP version used by the socket if address type is IP, std::nullopt otherwise
    */
-  virtual absl::optional<Address::IpVersion> ipVersion() const PURE;
+  virtual std::optional<Address::IpVersion> ipVersion() const PURE;
+
+  /**
+   * Request RST on a subsequent close().
+   */
+  virtual void setAbortiveClose() PURE;
 
   /**
    * Close the underlying socket.
@@ -296,11 +550,21 @@ public:
      * @param state The state at which we would apply the options.
      * @return What we would apply to the socket at the provided state. Empty if we'd apply nothing.
      */
-    virtual absl::optional<Details>
+    virtual std::optional<Details>
     getOptionDetails(const Socket& socket,
                      envoy::config::core::v3::SocketOption::SocketState state) const PURE;
+
+    /**
+     * Whether the socket implementation is supported. Real implementations should typically return
+     * true. Placeholder implementations may indicate such by returning false. Note this does NOT
+     * inherently prevent an option from being applied if it's passed to socket/connection
+     * interfaces.
+     * @return Whether this is a supported socket option.
+     */
+    virtual bool isSupported() const PURE;
   };
 
+  using OptionConstPtr = std::unique_ptr<const Option>;
   using OptionConstSharedPtr = std::shared_ptr<const Option>;
   using Options = std::vector<OptionConstSharedPtr>;
   using OptionsSharedPtr = std::shared_ptr<Options>;
@@ -337,11 +601,18 @@ public:
    * @return the socket options stored earlier with addOption() and addOptions() calls, if any.
    */
   virtual const OptionsSharedPtr& options() const PURE;
+
+  /**
+   * @return a ParentDrainedCallbackRegistrar for UDP listen sockets during hot restart.
+   */
+  virtual OptRef<class ParentDrainedCallbackRegistrar> parentDrainedCallbackRegistrar() const {
+    return std::nullopt;
+  }
 };
 
 using SocketPtr = std::unique_ptr<Socket>;
 using SocketSharedPtr = std::shared_ptr<Socket>;
-using SocketOptRef = absl::optional<std::reference_wrapper<Socket>>;
+using SocketOptRef = std::optional<std::reference_wrapper<Socket>>;
 
 } // namespace Network
 } // namespace Envoy

@@ -5,7 +5,7 @@
 #include "envoy/stats/histogram.h"
 #include "envoy/stats/stats.h"
 
-#include "source/common/stats/symbol_table_impl.h"
+#include "source/common/stats/symbol_table.h"
 #include "source/common/stats/utility.h"
 
 #include "absl/strings/match.h"
@@ -25,8 +25,8 @@ namespace Envoy {
  *
  * By convention, starting with #7083, we sort the lines of this macro block, so
  * all the counters are grouped together, then all the gauges, etc. We do not
- * use clang-format-on/off etc. "./tools/code_format/check_format.py fix" will take care of
- * lining up the backslashes.
+ * use clang-format-on/off etc. "bazel run //tools/code_format:check_format -- fix" will take
+ * care of lining up the backslashes.
  *
  * Now actually put these stats somewhere, usually as a member of a struct:
  *   struct MyCoolStats {
@@ -99,6 +99,38 @@ static inline std::string statPrefixJoin(absl::string_view prefix, absl::string_
 #define POOL_HISTOGRAM(POOL) POOL_HISTOGRAM_PREFIX(POOL, "")
 #define POOL_TEXT_READOUT(POOL) POOL_TEXT_READOUT_PREFIX(POOL, "")
 
+// Tagged variants of the POOL_*_PREFIX macros: create each stat directly on POOL with pre-encoded
+// tags. BASE_PREFIX and PREFIX are Stats::StatNames (the tag-extracted and flat prefixes,
+// pre-encoded once by the caller) and TAGS is a Stats::StatNameTagSpan. Callers must include
+// "source/common/stats/utility.h". See Stats::Utility::counterFromTaggedPrefix.
+#define POOL_COUNTER_TAGGED_PREFIX(POOL, BASE_PREFIX, TAGS, PREFIX)                                \
+  Envoy::Stats::Utility::counterFromTaggedPrefix((POOL), (BASE_PREFIX), (TAGS), (PREFIX),          \
+                                                 (FINISH_STAT_DECL_
+#define POOL_GAUGE_TAGGED_PREFIX(POOL, BASE_PREFIX, TAGS, PREFIX)                                  \
+  Envoy::Stats::Utility::gaugeFromTaggedPrefix((POOL), (BASE_PREFIX), (TAGS), (PREFIX),            \
+                                               (FINISH_STAT_DECL_MODE_
+#define POOL_HISTOGRAM_TAGGED_PREFIX(POOL, BASE_PREFIX, TAGS, PREFIX)                              \
+  Envoy::Stats::Utility::histogramFromTaggedPrefix((POOL), (BASE_PREFIX), (TAGS), (PREFIX),        \
+                                                   (FINISH_STAT_DECL_UNIT_
+#define POOL_TEXT_READOUT_TAGGED_PREFIX(POOL, BASE_PREFIX, TAGS, PREFIX)                           \
+  Envoy::Stats::Utility::textReadoutFromTaggedPrefix((POOL), (BASE_PREFIX), (TAGS), (PREFIX),      \
+                                                     (FINISH_STAT_DECL_
+
+// Convenience wrappers taking a Stats::TaggedStatName (see utility.h), which pre-encodes the
+// tag-extracted prefix, the flat prefix and the tags.
+#define POOL_COUNTER_TAGGED(POOL, TAGGED_NAME)                                                     \
+  POOL_COUNTER_TAGGED_PREFIX(POOL, (TAGGED_NAME).baseName(), (TAGGED_NAME).tags(),                 \
+                             (TAGGED_NAME).name())
+#define POOL_GAUGE_TAGGED(POOL, TAGGED_NAME)                                                       \
+  POOL_GAUGE_TAGGED_PREFIX(POOL, (TAGGED_NAME).baseName(), (TAGGED_NAME).tags(),                   \
+                           (TAGGED_NAME).name())
+#define POOL_HISTOGRAM_TAGGED(POOL, TAGGED_NAME)                                                   \
+  POOL_HISTOGRAM_TAGGED_PREFIX(POOL, (TAGGED_NAME).baseName(), (TAGGED_NAME).tags(),               \
+                               (TAGGED_NAME).name())
+#define POOL_TEXT_READOUT_TAGGED(POOL, TAGGED_NAME)                                                \
+  POOL_TEXT_READOUT_TAGGED_PREFIX(POOL, (TAGGED_NAME).baseName(), (TAGGED_NAME).tags(),            \
+                                  (TAGGED_NAME).name())
+
 #define NULL_STAT_DECL_(X) std::string(#X)),
 #define NULL_STAT_DECL_IGNORE_MODE_(X, MODE) std::string(#X)),
 
@@ -107,6 +139,12 @@ static inline std::string statPrefixJoin(absl::string_view prefix, absl::string_
 // Used for declaring StatNames in a structure.
 #define GENERATE_STAT_NAME_STRUCT(NAME, ...) Envoy::Stats::StatName NAME##_;
 #define GENERATE_STAT_NAME_INIT(NAME, ...) , NAME##_(pool_.add(#NAME))
+
+// Used for defining constructors of stat objects
+#define GENERATE_CONSTRUCTOR_PARAM(NAME) Envoy::Stats::Counter &NAME,
+#define GENERATE_CONSTRUCTOR_COUNTER_PARAM(NAME) Envoy::Stats::Counter &NAME,
+#define GENERATE_CONSTRUCTOR_GAUGE_PARAM(NAME, ...) Envoy::Stats::Gauge &NAME,
+#define GENERATE_CONSTRUCTOR_INIT_LIST(NAME, ...) , NAME##_(NAME)
 
 // Macros for declaring stat-structures using StatNames, for those that must be
 // instantiated during operation, and where speed and scale matters. These
@@ -152,6 +190,9 @@ static inline std::string statPrefixJoin(absl::string_view prefix, absl::string_
  */
 #define MAKE_STATS_STRUCT(StatsStruct, StatNamesStruct, ALL_STATS)                                 \
   struct StatsStruct {                                                                             \
+    /* Also referenced in Stats::createDeferredCompatibleStats. */                                 \
+    using StatNameType = StatNamesStruct;                                                          \
+    static const absl::string_view typeName() { return #StatsStruct; }                             \
     StatsStruct(const StatNamesStruct& stat_names, Envoy::Stats::Scope& scope,                     \
                 Envoy::Stats::StatName prefix = Envoy::Stats::StatName())                          \
         : stat_names_(stat_names)                                                                  \
@@ -159,9 +200,8 @@ static inline std::string statPrefixJoin(absl::string_view prefix, absl::string_
                         MAKE_STATS_STRUCT_HISTOGRAM_HELPER_,                                       \
                         MAKE_STATS_STRUCT_TEXT_READOUT_HELPER_,                                    \
                         MAKE_STATS_STRUCT_STATNAME_HELPER_) {}                                     \
-    const StatNamesStruct& stat_names_;                                                            \
+    const StatNameType& stat_names_;                                                               \
     ALL_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT,           \
               GENERATE_TEXT_READOUT_STRUCT, GENERATE_STATNAME_STRUCT)                              \
   }
-
 } // namespace Envoy

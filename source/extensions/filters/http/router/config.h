@@ -16,18 +16,19 @@ namespace RouterFilter {
  * Config registration for the router filter. @see NamedHttpFilterConfigFactory.
  */
 class RouterFilterConfig
-    : public Common::FactoryBase<envoy::extensions::filters::http::router::v3::Router> {
+    : public Common::UnifiedFactoryBase<envoy::extensions::filters::http::router::v3::Router> {
 public:
-  RouterFilterConfig() : FactoryBase("envoy.filters.http.router") {}
+  RouterFilterConfig() : UnifiedFactoryBase("envoy.filters.http.router") {}
 
 private:
   bool isTerminalFilterByProtoTyped(const envoy::extensions::filters::http::router::v3::Router&,
-                                    Server::Configuration::FactoryContext&) override {
+                                    Server::Configuration::ServerFactoryContext&) override {
     return true;
   }
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::router::v3::Router& proto_config,
-      const std::string& stat_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 };
 
 DECLARE_FACTORY(RouterFilterConfig);

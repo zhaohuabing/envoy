@@ -9,12 +9,23 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "aligned_allocator_lib",
+    hdrs = ["aligned_allocator.h"],
+    deps = [
+    ],
+)
+
+envoy_cc_library(
     name = "stats_lib",
     srcs = ["stats.cc"],
     hdrs = ["stats.h"],
     tcmalloc_dep = 1,
     deps = [
+        "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
+        "//source/common/common:thread_lib",
+        "//source/common/protobuf:utility_lib",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
     ],
 )
 
@@ -37,6 +48,7 @@ envoy_cc_library(
         "//envoy/event:dispatcher_interface",
         "//envoy/server/overload:overload_manager_interface",
         "//envoy/stats:stats_interface",
+        "//source/common/protobuf:utility_lib",
         "//source/common/stats:symbol_table_lib",
     ],
 )

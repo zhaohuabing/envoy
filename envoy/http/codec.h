@@ -4,9 +4,13 @@
 #include <limits>
 #include <memory>
 
+#include "envoy/access_log/access_log.h"
 #include "envoy/buffer/buffer.h"
+#include "envoy/common/matchers.h"
+#include "envoy/common/optref.h"
 #include "envoy/common/pure.h"
 #include "envoy/grpc/status.h"
+#include "envoy/http/codec_runtime_overrides.h"
 #include "envoy/http/header_formatter.h"
 #include "envoy/http/header_map.h"
 #include "envoy/http/metadata_interface.h"
@@ -17,8 +21,35 @@
 
 #include "source/common/http/status.h"
 
+namespace webtransport {
+class Session;
+class SessionVisitor;
+} // namespace webtransport
+
 namespace Envoy {
 namespace Http {
+
+// TODO(wbpcode): The webtransport::Session should be used ideally. However, the
+// webtransport::Session does not provide the SetVisitor method which is necessary for bridging the
+// downstream and upstream session.
+class WebTransportSession {
+public:
+  virtual ~WebTransportSession() = default;
+
+  /**
+   * Set a visitor for this WebTransport session. The visitor will be notified of session-level
+   * events such as incoming streams and datagrams. This is only used for negotiated WebTransport
+   * sessions, and should not be set for non-WebTransport sessions.
+   *
+   * @param visitor supplies the visitor to set.
+   */
+  virtual void setWebTransportVisitor(std::unique_ptr<webtransport::SessionVisitor> visitor) PURE;
+
+  /**
+   * @return a pointer to the webtransport::Session.
+   */
+  virtual webtransport::Session* rawWebTransportSession() PURE;
+};
 
 enum class CodecType { HTTP1, HTTP2, HTTP3 };
 
@@ -34,17 +65,19 @@ namespace Http3 {
 struct CodecStats;
 }
 
-// Legacy default value of 60K is safely under both codec default limits.
-static constexpr uint32_t DEFAULT_MAX_REQUEST_HEADERS_KB = 60;
-// Default maximum number of headers.
-static constexpr uint32_t DEFAULT_MAX_HEADERS_COUNT = 100;
-
-const char MaxRequestHeadersCountOverrideKey[] =
-    "envoy.reloadable_features.max_request_headers_count";
-const char MaxResponseHeadersCountOverrideKey[] =
-    "envoy.reloadable_features.max_response_headers_count";
-
 class Stream;
+class RequestDecoder;
+
+class RequestDecoderHandle {
+public:
+  virtual ~RequestDecoderHandle() = default;
+
+  /**
+   * @return a reference to the underlying decoder if it is still valid.
+   */
+  virtual OptRef<RequestDecoder> get() PURE;
+};
+using RequestDecoderHandlePtr = std::unique_ptr<RequestDecoderHandle>;
 
 /**
  * Error codes used to convey the reason for a GOAWAY.
@@ -69,7 +102,7 @@ public:
 };
 
 using Http1StreamEncoderOptionsOptRef =
-    absl::optional<std::reference_wrapper<Http1StreamEncoderOptions>>;
+    std::optional<std::reference_wrapper<Http1StreamEncoderOptions>>;
 
 /**
  * Encodes an HTTP stream. This interface contains methods common to both the request and response
@@ -101,7 +134,7 @@ public:
 
   /**
    * Return the HTTP/1 stream encoder options if applicable. If the stream is not HTTP/1 returns
-   * absl::nullopt.
+   * std::nullopt.
    */
   virtual Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() PURE;
 };
@@ -140,10 +173,12 @@ public:
 class ResponseEncoder : public virtual StreamEncoder {
 public:
   /**
-   * Encode 100-Continue headers.
-   * @param headers supplies the 100-Continue header map to encode.
+   * Encode supported 1xx headers.
+   * Currently 100-Continue, 102-Processing, 103-Early-Data, and 104-Upload-Resumption-Supported
+   * headers are supported.
+   * @param headers supplies the 1xx header map to encode.
    */
-  virtual void encode100ContinueHeaders(const ResponseHeaderMap& headers) PURE;
+  virtual void encode1xxHeaders(const ResponseHeaderMap& headers) PURE;
 
   /**
    * Encode headers, optionally indicating end of stream. Response headers must
@@ -164,7 +199,48 @@ public:
    * error.
    */
   virtual bool streamErrorOnInvalidHttpMessage() const PURE;
+
+  /**
+   * Set a new request decoder for this ResponseEncoder. This is helpful in the case of an internal
+   * redirect, in which a new request decoder is created in the context of the same downstream
+   * request.
+   * @param decoder new request decoder.
+   */
+  virtual void setRequestDecoder(RequestDecoder& decoder) PURE;
+
+  /**
+   * Set headers, trailers, and stream info for deferred logging. This allows HCM to hand off
+   * stream-level details to the codec for logging after the stream may be destroyed (e.g. on
+   * receiving the final ack packet from the client). Note that headers and trailers are const
+   * as they will not be modified after this point.
+   * @param request_header_map Request headers for this stream.
+   * @param response_header_map Response headers for this stream.
+   * @param response_trailer_map Response trailers for this stream.
+   * @param stream_info Stream info for this stream.
+   */
+  virtual void
+  setDeferredLoggingHeadersAndTrailers(Http::RequestHeaderMapConstSharedPtr request_header_map,
+                                       Http::ResponseHeaderMapConstSharedPtr response_header_map,
+                                       Http::ResponseTrailerMapConstSharedPtr response_trailer_map,
+                                       StreamInfo::StreamInfo& stream_info) PURE;
 };
+
+class ResponseDecoder;
+
+/**
+ * A handle to a ResponseDecoder. This handle can be used to check if the underlying decoder is
+ * still valid and to get a reference to it.
+ */
+class ResponseDecoderHandle {
+public:
+  virtual ~ResponseDecoderHandle() = default;
+
+  /**
+   * @return a reference to the underlying decoder if it is still valid.
+   */
+  virtual OptRef<ResponseDecoder> get() PURE;
+};
+using ResponseDecoderHandlePtr = std::unique_ptr<ResponseDecoderHandle>;
 
 /**
  * Decodes an HTTP stream. These are callbacks fired into a sink. This interface contains methods
@@ -201,7 +277,7 @@ public:
    * @param headers supplies the decoded headers map.
    * @param end_stream supplies whether this is a header only request.
    */
-  virtual void decodeHeaders(RequestHeaderMapPtr&& headers, bool end_stream) PURE;
+  virtual void decodeHeaders(RequestHeaderMapSharedPtr&& headers, bool end_stream) PURE;
 
   /**
    * Called with a decoded trailers frame. This implicitly ends the stream.
@@ -219,13 +295,24 @@ public:
    */
   virtual void sendLocalReply(Code code, absl::string_view body,
                               const std::function<void(ResponseHeaderMap& headers)>& modify_headers,
-                              const absl::optional<Grpc::Status::GrpcStatus> grpc_status,
+                              const std::optional<Grpc::Status::GrpcStatus> grpc_status,
                               absl::string_view details) PURE;
 
   /**
    * @return StreamInfo::StreamInfo& the stream_info for this stream.
    */
   virtual StreamInfo::StreamInfo& streamInfo() PURE;
+
+  /**
+   * @return List of shared pointers to access loggers for this stream.
+   */
+  virtual AccessLog::InstanceSharedPtrVector accessLogHandlers() PURE;
+
+  /**
+   * @return A handle to the request decoder. Caller can check the request decoder's liveness via
+   * the handle.
+   */
+  virtual RequestDecoderHandlePtr getRequestDecoderHandle() PURE;
 };
 
 /**
@@ -235,10 +322,12 @@ public:
 class ResponseDecoder : public virtual StreamDecoder {
 public:
   /**
-   * Called with decoded 100-Continue headers.
-   * @param headers supplies the decoded 100-Continue headers map.
+   * Called with decoded 1xx headers.
+   * Currently 100-Continue, 102-Processing, 103-Early-Data, and 104-Upload-Resumption-Supported
+   * headers are supported.
+   * @param headers supplies the decoded 1xx headers map.
    */
-  virtual void decode100ContinueHeaders(ResponseHeaderMapPtr&& headers) PURE;
+  virtual void decode1xxHeaders(ResponseHeaderMapPtr&& headers) PURE;
 
   /**
    * Called with decoded headers, optionally indicating end of stream.
@@ -259,9 +348,26 @@ public:
    * @param os the ostream to dump state to
    * @param indent_level the depth, for pretty-printing.
    *
+
    * This function is called on Envoy fatal errors so should avoid memory allocation.
    */
   virtual void dumpState(std::ostream& os, int indent_level = 0) const PURE;
+
+  /**
+   * @return A handle to the response decoder. Caller can check the response decoder's liveness via
+   * the handle.
+   */
+  virtual ResponseDecoderHandlePtr createResponseDecoderHandle() PURE;
+
+  /**
+   * @return the WebTransport session of the *downstream* stream paired with this decoder, if any.
+   *
+   * Only decoders on the router's upstream path (which are paired 1:1 with a downstream stream)
+   * implement this; they reach the downstream StreamDecoderFilterCallbacks and return its
+   * webTransportSession(). It lets the upstream codec obtain the downstream WebTransport session so
+   * it can bridge the two directly. All other response decoders inherit the default empty OptRef.
+   */
+  virtual OptRef<WebTransportSession> downstreamWebTransportSession() { return {}; }
 };
 
 /**
@@ -292,6 +398,25 @@ public:
 };
 
 /**
+ * Codec event callbacks for a given HTTP Stream.
+ * This can be used to tightly couple an entity with a streams low-level events.
+ */
+class CodecEventCallbacks {
+public:
+  virtual ~CodecEventCallbacks() = default;
+  /**
+   * Called when the the underlying codec finishes encoding.
+   */
+  virtual void onCodecEncodeComplete() PURE;
+
+  /**
+   * Called when the underlying codec has a low level reset.
+   * e.g. Envoy serialized the response but it has not been flushed.
+   */
+  virtual void onCodecLowLevelReset() PURE;
+};
+
+/**
  * An HTTP stream (request, response, and push).
  */
 class Stream : public StreamResetHandler {
@@ -307,6 +432,15 @@ public:
    * @param callbacks supplies the callbacks to remove.
    */
   virtual void removeCallbacks(StreamCallbacks& callbacks) PURE;
+
+  /**
+   * Register the codec event callbacks for this stream.
+   * The stream can only have a single registered callback at a time.
+   * @param codec_callbacks the codec callbacks for this stream.
+   * @return CodecEventCallbacks* the prior registered codec callbacks.
+   */
+  virtual CodecEventCallbacks*
+  registerCodecEventCallbacks(CodecEventCallbacks* codec_callbacks) PURE;
 
   /**
    * Enable/disable further data from this stream.
@@ -327,7 +461,7 @@ public:
    * configured.
    * @return uint32_t the stream's configured buffer limits.
    */
-  virtual uint32_t bufferLimit() PURE;
+  virtual uint32_t bufferLimit() const PURE;
 
   /**
    * @return string_view optionally return the reason behind codec level errors.
@@ -339,10 +473,10 @@ public:
   virtual absl::string_view responseDetails() { return ""; }
 
   /**
-   * @return const Address::InstanceConstSharedPtr& the local address of the connection associated
-   * with the stream.
+   * @return const Network::ConnectionInfoProvider& the address provider of the connection
+   * associated with the stream.
    */
-  virtual const Network::Address::InstanceConstSharedPtr& connectionLocalAddress() PURE;
+  virtual const Network::ConnectionInfoProvider& connectionInfoProvider() PURE;
 
   /**
    * Set the flush timeout for the stream. At the codec level this is used to bound the amount of
@@ -350,6 +484,11 @@ public:
    * small window updates as satisfying the idle timeout as this is a potential DoS vector.
    */
   virtual void setFlushTimeout(std::chrono::milliseconds timeout) PURE;
+
+  /**
+   * @return the account, if any, used by this stream.
+   */
+  virtual Buffer::BufferMemoryAccountSharedPtr account() const PURE;
 
   /**
    * Sets the account for this stream, propagating it to all of its buffers.
@@ -361,6 +500,23 @@ public:
    * Get the bytes meter for this stream.
    */
   virtual const StreamInfo::BytesMeterSharedPtr& bytesMeter() PURE;
+
+  /**
+   * @return std::optional<uint32_t> the codec level stream ID if available
+   * or nullopt if not applicable or not yet assigned.
+   *
+   * HTTP/1 streams return nullopt.
+   * HTTP/2 streams return the HTTP/2 stream ID or nullopt if not available.
+   * HTTP/3 streams return the HTTP/3 stream ID or nullopt if not available.
+   */
+  virtual std::optional<uint32_t> codecStreamId() const PURE;
+
+  /**
+   * @return the WebTransport session this stream carries, if it is a negotiated WebTransport
+   * CONNECT stream. Only HTTP/3 codec streams that have created a WebTransportHttp3 session return
+   * a value; all other streams inherit the default empty OptRef.
+   */
+  virtual OptRef<WebTransportSession> webTransportSession() { return {}; }
 };
 
 /**
@@ -371,9 +527,9 @@ public:
   virtual ~ReceivedSettings() = default;
 
   /**
-   * @return value of SETTINGS_MAX_CONCURRENT_STREAMS, or absl::nullopt if it was not present.
+   * @return value of SETTINGS_MAX_CONCURRENT_STREAMS, or std::nullopt if it was not present.
    */
-  virtual const absl::optional<uint32_t>& maxConcurrentStreams() const PURE;
+  virtual const std::optional<uint32_t>& maxConcurrentStreams() const PURE;
 };
 
 /**
@@ -425,6 +581,9 @@ struct Http1Settings {
   // headers set. By default such messages are rejected, but if option is enabled - Envoy will
   // remove Content-Length header and process message.
   bool allow_chunked_length_{false};
+  // Remove HTTP/1.1 Upgrade header tokens matching any provided matcher. By default such
+  // messages are rejected
+  std::shared_ptr<const std::vector<Matchers::StringMatcherPtr>> ignore_upgrade_matchers_;
 
   enum class HeaderKeyFormat {
     // By default no formatting is performed, presenting all headers in lowercase (as Envoy
@@ -451,6 +610,14 @@ struct Http1Settings {
   // True if this is an edge Envoy (using downstream address, no trusted hops)
   // and https:// URLs should be rejected over unencrypted connections.
   bool validate_scheme_{false};
+
+  // If true, Envoy will send a fully qualified URL in the first line of the request.
+  bool send_fully_qualified_url_{false};
+
+  // If true, any non-empty method composed of valid characters is accepted.
+  // If false, only methods from a hard-coded list of known methods are accepted.
+  // Only implemented in BalsaParser. http-parser only accepts known methods.
+  bool allow_custom_methods_{false};
 };
 
 /**
@@ -524,6 +691,39 @@ public:
    * when both the stream and the connection go under the low watermark limit, and the callee must
    * ensure that the flow of data does not resume until all callers which were above their high
    * watermarks have gone below.
+   */
+  virtual void onBelowWriteBufferLowWatermark() PURE;
+};
+
+/**
+ * Callbacks for upstream request watermark limits, as observed on the request (decode) path.
+ *
+ * These are the mirror image of DownstreamWatermarkCallbacks: where the downstream callbacks fire
+ * when the downstream connection/stream backs up (a slow client reading the response), these fire
+ * when the upstream backs up while accepting the request body. The connection manager already
+ * receives this signal via
+ * StreamDecoderFilterCallbacks::onDecoderFilterAboveWriteBufferHighWatermark (raised by the
+ * router's UpstreamRequest) and read-disables the downstream codec to slow the original source;
+ * subscribing here additionally lets a filter that produces request data on its own (e.g. by
+ * replaying a buffered body via injectDecodedDataToFilterChain) pause and resume in step with the
+ * upstream.
+ */
+class UpstreamWatermarkCallbacks {
+public:
+  virtual ~UpstreamWatermarkCallbacks() = default;
+
+  /**
+   * Called when the upstream request path goes over its high watermark. As with
+   * DownstreamWatermarkCallbacks, this may be called more than once (e.g. for the stream and the
+   * connection independently), and the implementation is responsible for unwinding multiple high
+   * and low watermark calls.
+   */
+  virtual void onAboveWriteBufferHighWatermark() PURE;
+
+  /**
+   * Called when the upstream request path goes from over its high watermark to under its low
+   * watermark. The implementation must not resume the flow of data until a matching number of low
+   * watermark callbacks have been received for the outstanding high watermark callbacks.
    */
   virtual void onBelowWriteBufferLowWatermark() PURE;
 };

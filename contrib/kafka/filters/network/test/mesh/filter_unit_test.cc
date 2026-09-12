@@ -1,3 +1,5 @@
+#include <optional>
+
 #include "test/mocks/network/mocks.h"
 
 #include "contrib/kafka/filters/network/source/mesh/filter.h"
@@ -179,7 +181,7 @@ class MockUpstreamKafkaConfiguration : public UpstreamKafkaConfiguration {
 public:
   MOCK_METHOD(void, onData, (Buffer::Instance&));
   MOCK_METHOD(void, reset, ());
-  MOCK_METHOD(absl::optional<ClusterConfig>, computeClusterConfigForTopic,
+  MOCK_METHOD(std::optional<ClusterConfig>, computeClusterConfigForTopic,
               (const std::string& topic), (const));
   MOCK_METHOD((std::pair<std::string, int32_t>), getAdvertisedAddress, (), (const));
 };
@@ -189,13 +191,21 @@ public:
   MOCK_METHOD(KafkaProducer&, getProducerForTopic, (const std::string&));
 };
 
+class MockRecordCallbackProcessor : public RecordCallbackProcessor {
+public:
+  MOCK_METHOD(void, processCallback, (const RecordCbSharedPtr&));
+  MOCK_METHOD(void, removeCallback, (const RecordCbSharedPtr&));
+};
+
 TEST(Filter, ShouldBeConstructable) {
   // given
   MockUpstreamKafkaConfiguration configuration;
   MockUpstreamKafkaFacade upstream_kafka_facade;
+  MockRecordCallbackProcessor record_callback_processor;
 
   // when
-  KafkaMeshFilter filter = KafkaMeshFilter(configuration, upstream_kafka_facade);
+  KafkaMeshFilter filter =
+      KafkaMeshFilter(configuration, upstream_kafka_facade, record_callback_processor);
 
   // then - no exceptions.
 }

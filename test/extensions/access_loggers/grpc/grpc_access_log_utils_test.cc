@@ -1,6 +1,12 @@
 #include "envoy/data/accesslog/v3/accesslog.pb.h"
 
+#include "source/common/http/header_map_impl.h"
+#include "source/common/stream_info/filter_state_impl.h"
 #include "source/extensions/access_loggers/grpc/grpc_access_log_utils.h"
+
+#if defined(USE_CEL)
+#include "source/extensions/filters/common/expr/cel_state.h"
+#endif // USE_CEL
 
 #include "test/mocks/stream_info/mocks.h"
 
@@ -9,6 +15,11 @@ namespace Extensions {
 namespace AccessLoggers {
 namespace GrpcCommon {
 namespace {
+
+#if defined(USE_CEL)
+using Filters::Common::Expr::CelStatePrototype;
+using Filters::Common::Expr::CelStateType;
+#endif // USE_CEL
 
 using testing::_;
 using testing::Return;
@@ -48,9 +59,135 @@ TEST(UtilityResponseFlagsToAccessLogResponseFlagsTest, All) {
   common_access_log_expected.mutable_response_flags()->set_upstream_protocol_error(true);
   common_access_log_expected.mutable_response_flags()->set_no_cluster_found(true);
   common_access_log_expected.mutable_response_flags()->set_overload_manager(true);
+  common_access_log_expected.mutable_response_flags()->set_dns_resolution_failure(true);
+  common_access_log_expected.mutable_response_flags()->set_downstream_remote_reset(true);
 
   EXPECT_EQ(common_access_log_expected.DebugString(), common_access_log.DebugString());
 }
+
+#if defined(USE_CEL)
+// key is present only in downstream streamInfo's filter state
+TEST(UtilityExtractCommonAccessLogPropertiesTest, FilterStateFromDownstream) {
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(stream_info, hasResponseFlag(_)).WillByDefault(Return(true));
+  envoy::data::accesslog::v3::AccessLogCommon common_access_log;
+  envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig config;
+  config.mutable_filter_state_objects_to_log()->Add("downstream_peer");
+  auto custom_tag = config.mutable_custom_tags()->Add();
+  custom_tag->set_tag("format-key");
+  custom_tag->set_value("format-value");
+  CommonPropertiesConfig common_properties_config(config);
+
+  CelStatePrototype prototype(true, CelStateType::Bytes, "",
+                              StreamInfo::FilterState::LifeSpan::FilterChain);
+  auto state = std::make_unique<::Envoy::Extensions::Filters::Common::Expr::CelState>(prototype);
+  state->setValue("value_from_downstream_peer");
+  stream_info.filter_state_->setData("downstream_peer", std::move(state),
+                                     StreamInfo::FilterState::LifeSpan::Connection);
+
+  Formatter::Context formatter_context;
+  formatter_context.setAccessLogType(envoy::data::accesslog::v3::AccessLogType::TcpConnectionEnd);
+  Utility::extractCommonAccessLogProperties(common_access_log, common_properties_config,
+                                            *Http::StaticEmptyHeaders::get().request_headers.get(),
+                                            stream_info, formatter_context);
+
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->contains("downstream_peer"), true);
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->count("downstream_peer"), 1);
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->size(), 1);
+  ASSERT_EQ(common_access_log.mutable_custom_tags()->size(), 1);
+  EXPECT_EQ(common_access_log.mutable_custom_tags()->at("format-key"), "format-value");
+  auto any = (*(common_access_log.mutable_filter_state_objects()))["downstream_peer"];
+  Protobuf::BytesValue gotState;
+  std::ignore = any.UnpackTo(&gotState);
+  EXPECT_EQ(gotState.value(), "value_from_downstream_peer");
+}
+
+// key is present only in the upstream streamInfo's filter state
+TEST(UtilityExtractCommonAccessLogPropertiesTest, FilterStateFromUpstream) {
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(stream_info, hasResponseFlag(_)).WillByDefault(Return(true));
+  envoy::data::accesslog::v3::AccessLogCommon common_access_log;
+  envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig config;
+  config.mutable_filter_state_objects_to_log()->Add("upstream_peer");
+  auto custom_tag = config.mutable_custom_tags()->Add();
+  custom_tag->set_tag("format-key");
+  custom_tag->set_value("format-value");
+  CommonPropertiesConfig common_properties_config(config);
+
+  CelStatePrototype prototype(true, CelStateType::Bytes, "",
+                              StreamInfo::FilterState::LifeSpan::FilterChain);
+  auto state = std::make_unique<::Envoy::Extensions::Filters::Common::Expr::CelState>(prototype);
+  auto filter_state =
+      std::make_shared<StreamInfo::FilterStateImpl>(StreamInfo::FilterState::LifeSpan::FilterChain);
+  state->setValue("value_from_upstream_peer");
+  filter_state->setData("upstream_peer", std::move(state),
+                        StreamInfo::FilterState::LifeSpan::Connection);
+  stream_info.upstreamInfo()->setUpstreamFilterState(filter_state);
+
+  Formatter::Context formatter_context;
+  formatter_context.setAccessLogType(envoy::data::accesslog::v3::AccessLogType::TcpConnectionEnd);
+  Utility::extractCommonAccessLogProperties(common_access_log, common_properties_config,
+                                            *Http::StaticEmptyHeaders::get().request_headers.get(),
+                                            stream_info, formatter_context);
+
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->contains("upstream_peer"), true);
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->count("upstream_peer"), 1);
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->size(), 1);
+  ASSERT_EQ(common_access_log.mutable_custom_tags()->size(), 1);
+  EXPECT_EQ(common_access_log.mutable_custom_tags()->at("format-key"), "format-value");
+  auto any = (*(common_access_log.mutable_filter_state_objects()))["upstream_peer"];
+  Protobuf::BytesValue gotState;
+  std::ignore = any.UnpackTo(&gotState);
+  EXPECT_EQ(gotState.value(), "value_from_upstream_peer");
+}
+
+// key is present in both the streamInfo's filter state
+TEST(UtilityExtractCommonAccessLogPropertiesTest,
+     FilterStateFromDownstreamIfSameKeyInBothStreamInfo) {
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(stream_info, hasResponseFlag(_)).WillByDefault(Return(true));
+  envoy::data::accesslog::v3::AccessLogCommon common_access_log;
+  envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig config;
+  config.mutable_filter_state_objects_to_log()->Add("same_key");
+  auto custom_tag = config.mutable_custom_tags()->Add();
+  custom_tag->set_tag("format-key");
+  custom_tag->set_value("format-value");
+  CommonPropertiesConfig config_common_properties_config(config);
+
+  CelStatePrototype prototype(true, CelStateType::Bytes, "",
+                              StreamInfo::FilterState::LifeSpan::FilterChain);
+  auto downstream_state =
+      std::make_unique<::Envoy::Extensions::Filters::Common::Expr::CelState>(prototype);
+  downstream_state->setValue("value_from_downstream_peer");
+  stream_info.filter_state_->setData("same_key", std::move(downstream_state),
+                                     StreamInfo::FilterState::LifeSpan::Connection);
+
+  auto upstream_state =
+      std::make_unique<::Envoy::Extensions::Filters::Common::Expr::CelState>(prototype);
+  auto filter_state =
+      std::make_shared<StreamInfo::FilterStateImpl>(StreamInfo::FilterState::LifeSpan::FilterChain);
+  upstream_state->setValue("value_from_upstream_peer");
+  filter_state->setData("same_key", std::move(upstream_state),
+                        StreamInfo::FilterState::LifeSpan::Connection);
+  stream_info.upstreamInfo()->setUpstreamFilterState(filter_state);
+
+  Formatter::Context formatter_context;
+  formatter_context.setAccessLogType(envoy::data::accesslog::v3::AccessLogType::TcpConnectionEnd);
+  Utility::extractCommonAccessLogProperties(common_access_log, config_common_properties_config,
+                                            *Http::StaticEmptyHeaders::get().request_headers.get(),
+                                            stream_info, formatter_context);
+
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->contains("same_key"), true);
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->count("same_key"), 1);
+  ASSERT_EQ(common_access_log.mutable_filter_state_objects()->size(), 1);
+  ASSERT_EQ(common_access_log.mutable_custom_tags()->size(), 1);
+  EXPECT_EQ(common_access_log.mutable_custom_tags()->at("format-key"), "format-value");
+  auto any = (*(common_access_log.mutable_filter_state_objects()))["same_key"];
+  Protobuf::BytesValue gotState;
+  std::ignore = any.UnpackTo(&gotState);
+  EXPECT_EQ(gotState.value(), "value_from_downstream_peer");
+}
+#endif // USE_CEL
 
 } // namespace
 } // namespace GrpcCommon

@@ -7,3 +7,5 @@ Health checkers
   :maxdepth: 2
 
   redis
+  thrift
+  dynamic_modules

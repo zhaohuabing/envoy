@@ -24,13 +24,25 @@ namespace Envoy {
 namespace Network {
 namespace {
 
-TEST(ConnectionSocketImplTest, LowerCaseRequestedServerName) {
+class ConnectionSocketImplTest : public testing::TestWithParam<Address::IpVersion> {};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, ConnectionSocketImplTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+TEST_P(ConnectionSocketImplTest, LowerCaseRequestedServerName) {
   absl::string_view serverName("www.EXAMPLE.com");
   absl::string_view expectedServerName("www.example.com");
   auto loopback_addr = Network::Test::getCanonicalLoopbackAddress(Address::IpVersion::v4);
-  auto conn_socket_ = ConnectionSocketImpl(Socket::Type::Stream, loopback_addr, loopback_addr);
+  auto conn_socket_ = ConnectionSocketImpl(Socket::Type::Stream, loopback_addr, loopback_addr, {});
   conn_socket_.setRequestedServerName(serverName);
   EXPECT_EQ(expectedServerName, conn_socket_.requestedServerName());
+  conn_socket_.setRequestedApplicationProtocols({"h2", "http/1.1"});
+  EXPECT_THAT(conn_socket_.requestedApplicationProtocols(), testing::ElementsAre("h2", "http/1.1"));
+}
+
+TEST_P(ConnectionSocketImplTest, IpVersion) {
+  ClientSocketImpl socket(Network::Test::getCanonicalLoopbackAddress(GetParam()), nullptr);
+  EXPECT_EQ(socket.ipVersion(), GetParam());
 }
 
 template <Network::Socket::Type Type>
@@ -119,7 +131,7 @@ protected:
       auto socket_result = os_sys_calls.socket(domain, SOCK_STREAM, 0);
       EXPECT_TRUE(SOCKET_VALID(socket_result.return_value_));
       Network::IoHandlePtr io_handle =
-          std::make_unique<IoSocketHandleImpl>(socket_result.return_value_);
+          std::make_unique<Network::Test::IoSocketHandlePlatformImpl>(socket_result.return_value_);
       auto socket3 = createListenSocketPtr(std::move(io_handle), addr, nullptr);
       EXPECT_EQ(socket3->connectionInfoProvider().localAddress()->asString(), addr->asString());
 
@@ -173,7 +185,7 @@ TEST_P(ListenSocketImplTestTcp, BindSpecificPort) { testBindSpecificPort(); }
 class TestListenSocket : public ListenSocketImpl {
 public:
   TestListenSocket(Address::InstanceConstSharedPtr address)
-      : ListenSocketImpl(std::make_unique<Network::IoSocketHandleImpl>(), address) {}
+      : ListenSocketImpl(std::make_unique<Network::Test::IoSocketHandlePlatformImpl>(), address) {}
 
   TestListenSocket(Address::IpVersion ip_version)
       : ListenSocketImpl(/*io_handle=*/nullptr, ip_version == Address::IpVersion::v4
@@ -197,7 +209,8 @@ TEST_P(ListenSocketImplTestTcp, SetLocalAddress) {
     address_str = "1::2";
   }
 
-  Address::InstanceConstSharedPtr address = Network::Utility::parseInternetAddress(address_str);
+  Address::InstanceConstSharedPtr address =
+      Network::Utility::parseInternetAddressNoThrow(address_str);
 
   TestListenSocket socket(Utility::getIpv4AnyAddress());
 
@@ -218,11 +231,11 @@ TEST_P(ListenSocketImplTestTcp, SupportedIpFamilyVirtualSocketIsCreatedWithNoBsd
   auto any_address = version_ == Address::IpVersion::v4 ? Utility::getIpv4AnyAddress()
                                                         : Utility::getIpv6AnyAddress();
 
-  StackedScopedInjectableLoader<SocketInterface> new_interface(std::move(mock_interface));
+  StackedScopedInjectableLoaderForTest<SocketInterface> new_interface(std::move(mock_interface));
 
   {
-    EXPECT_CALL(*mock_interface_ptr, socket(_, _)).Times(0);
-    EXPECT_CALL(*mock_interface_ptr, socket(_, _, _, _)).Times(0);
+    EXPECT_CALL(*mock_interface_ptr, socket(_, _, _)).Times(0);
+    EXPECT_CALL(*mock_interface_ptr, socket(_, _, _, _, _)).Times(0);
     TcpListenSocket virtual_listener_socket(any_address, nullptr,
                                             /*bind_to_port*/ false);
   }
@@ -234,10 +247,10 @@ TEST_P(ListenSocketImplTestTcp, DeathAtUnSupportedIpFamilyListenSocket) {
   auto* mock_interface_ptr = mock_interface.get();
   auto the_other_address = version_ == Address::IpVersion::v4 ? Utility::getIpv6AnyAddress()
                                                               : Utility::getIpv4AnyAddress();
-  StackedScopedInjectableLoader<SocketInterface> new_interface(std::move(mock_interface));
+  StackedScopedInjectableLoaderForTest<SocketInterface> new_interface(std::move(mock_interface));
   {
-    EXPECT_CALL(*mock_interface_ptr, socket(_, _)).Times(0);
-    EXPECT_CALL(*mock_interface_ptr, socket(_, _, _, _)).Times(0);
+    EXPECT_CALL(*mock_interface_ptr, socket(_, _, _)).Times(0);
+    EXPECT_CALL(*mock_interface_ptr, socket(_, _, _, _, _)).Times(0);
     EXPECT_DEATH(
         {
           TcpListenSocket virtual_listener_socket(the_other_address, nullptr,

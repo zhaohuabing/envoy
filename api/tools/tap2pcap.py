@@ -49,7 +49,7 @@ def tap2pcap(tap_path, pcap_path):
         with open(tap_path, 'r') as f:
             text_format.Merge(f.read(), wrapper)
     else:
-        with open(tap_path, 'r') as f:
+        with open(tap_path, 'rb') as f:
             wrapper.ParseFromString(f.read())
 
     trace = wrapper.socket_buffered_trace
@@ -73,7 +73,7 @@ def tap2pcap(tap_path, pcap_path):
         pass
 
     text2pcap_args = [
-        'text2pcap', '-D', '-t', '%Y-%m-%d %H:%M:%S.', '-6' if ipv6 else '-4',
+        'text2pcap', '-D', '-t', '%Y-%m-%d %H:%M:%S.%f', '-6' if ipv6 else '-4',
         '%s,%s' % (remote_address, local_address), '-T',
         '%d,%d' % (remote_port, local_port), '-', pcap_path
     ]

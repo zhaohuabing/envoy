@@ -6,27 +6,48 @@
 #include <string>
 
 #include "envoy/api/api.h"
+#include "envoy/extensions/http/header_validators/envoy_default/v3/header_validator.pb.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/header_map.h"
 #include "envoy/network/filter.h"
 #include "envoy/server/factory_context.h"
+#include "envoy/thread_local/thread_local.h"
 
+#include "source/common/api/os_sys_calls_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/dump_state_utils.h"
 #include "source/common/common/utility.h"
 #include "source/common/http/codec_client.h"
+#include "source/common/http/response_decoder_impl_base.h"
 #include "source/common/stats/isolated_store_impl.h"
 
 #include "test/test_common/printers.h"
 #include "test/test_common/test_time.h"
+#include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
 
 namespace Envoy {
+
+class OsSysCallsWithMockedDns : public Api::OsSysCallsImpl {
+public:
+  static addrinfo* makeAddrInfo(const Network::Address::InstanceConstSharedPtr& addr);
+
+  Api::SysCallIntResult getaddrinfo(const char* node, const char* service, const addrinfo* hints,
+                                    addrinfo** res) override;
+  void freeaddrinfo(addrinfo* ai) override;
+
+  void setIpVersion(Network::Address::IpVersion version);
+
+  Network::Address::IpVersion ip_version_ = Network::Address::IpVersion::v4;
+  absl::flat_hash_set<absl::string_view> nonexisting_addresses_ = {"doesnotexist.example.com",
+                                                                   "itdoesnotexist"};
+};
+
 /**
  * A buffering response decoder used for testing.
  */
-class BufferingStreamDecoder : public Http::ResponseDecoder, public Http::StreamCallbacks {
+class BufferingStreamDecoder : public Http::ResponseDecoderImplBase, public Http::StreamCallbacks {
 public:
   BufferingStreamDecoder(std::function<void()> on_complete_cb) : on_complete_cb_(on_complete_cb) {}
 
@@ -39,7 +60,7 @@ public:
   void decodeMetadata(Http::MetadataMapPtr&&) override {}
 
   // Http::ResponseDecoder
-  void decode100ContinueHeaders(Http::ResponseHeaderMapPtr&&) override {}
+  void decode1xxHeaders(Http::ResponseHeaderMapPtr&&) override {}
   void decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool end_stream) override;
   void decodeTrailers(Http::ResponseTrailerMapPtr&& trailers) override;
   void dumpState(std::ostream& os, int indent_level) const override {
@@ -84,14 +105,16 @@ public:
                       Event::Dispatcher& dispatcher,
                       Network::TransportSocketPtr transport_socket = nullptr);
   ~RawConnectionDriver();
-  const Network::Connection& connection() { return *client_; }
-  void run(Event::Dispatcher::RunType run_type = Event::Dispatcher::RunType::Block);
+
+  testing::AssertionResult
+  run(Event::Dispatcher::RunType run_type = Event::Dispatcher::RunType::Block,
+      std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);
   void close();
   Network::ConnectionEvent lastConnectionEvent() const {
     return callbacks_->last_connection_event_;
   }
   // Wait until connected or closed().
-  void waitForConnection();
+  ABSL_MUST_USE_RESULT testing::AssertionResult waitForConnection();
 
   bool closed() { return callbacks_->closed(); }
   bool allBytesSent() const;
@@ -115,7 +138,8 @@ private:
   struct ConnectionCallbacks : public Network::ConnectionCallbacks {
     using WriteCb = std::function<void()>;
 
-    ConnectionCallbacks(WriteCb write_cb) : write_cb_(write_cb) {}
+    ConnectionCallbacks(WriteCb write_cb, Event::Dispatcher& dispatcher)
+        : write_cb_(write_cb), dispatcher_(dispatcher) {}
     bool connected() const { return connected_; }
     bool closed() const { return closed_; }
 
@@ -124,11 +148,15 @@ private:
       if (!connected_ && event == Network::ConnectionEvent::Connected) {
         write_cb_();
       }
-
       last_connection_event_ = event;
+
       closed_ |= (event == Network::ConnectionEvent::RemoteClose ||
                   event == Network::ConnectionEvent::LocalClose);
       connected_ |= (event == Network::ConnectionEvent::Connected);
+
+      if (closed_) {
+        dispatcher_.exit();
+      }
     }
     void onAboveWriteBufferHighWatermark() override {}
     void onBelowWriteBufferLowWatermark() override { write_cb_(); }
@@ -137,6 +165,7 @@ private:
 
   private:
     WriteCb write_cb_;
+    Event::Dispatcher& dispatcher_;
     bool connected_{false};
     bool closed_{false};
   };
@@ -195,10 +224,15 @@ public:
    * Create transport socket factory for Quic upstream transport socket.
    * @return TransportSocketFactoryPtr the client transport socket factory.
    */
-  static Network::TransportSocketFactoryPtr
-  createQuicUpstreamTransportSocketFactory(Api::Api& api, Stats::Store& store,
-                                           Ssl::ContextManager& context_manager,
-                                           const std::string& san_to_match);
+  static Network::UpstreamTransportSocketFactoryPtr createQuicUpstreamTransportSocketFactory(
+      Api::Api& api, Stats::Store& store, Ssl::ContextManager& context_manager,
+      ThreadLocal::Instance& threadlocal, const std::string& san_to_match,
+      // Allow configuring TLS to talk to upstreams instead of Envoy
+      bool connect_to_fake_upstreams = false);
+
+  static Http::HeaderValidatorFactoryPtr makeHeaderValidationFactory(
+      const ::envoy::extensions::http::header_validators::envoy_default::v3::HeaderValidatorConfig&
+          config);
 };
 
 // A set of connection callbacks which tracks connection state.
@@ -233,7 +267,7 @@ public:
   // Network::ReadFilter
   Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
 
-  void set_data_to_wait_for(const std::string& data, bool exact_match = true) {
+  void setDataToWaitFor(const std::string& data, bool exact_match = true) {
     data_to_wait_for_ = data;
     exact_match_ = exact_match;
   }
@@ -250,13 +284,14 @@ public:
 
     dispatcher_.run(Event::Dispatcher::RunType::Block);
 
+    length_to_wait_for_ = 0;
+    wait_for_length_ = false;
+
     if (timeout_timer->enabled()) {
       timeout_timer->disableTimer();
       return testing::AssertionSuccess();
     }
 
-    length_to_wait_for_ = 0;
-    wait_for_length_ = false;
     return testing::AssertionFailure() << "Timed out waiting for " << length << " bytes of data\n";
   }
 

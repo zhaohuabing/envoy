@@ -7,7 +7,7 @@
 #include "source/extensions/filters/http/header_to_metadata/header_to_metadata_filter.h"
 
 #include "test/mocks/server/factory_context.h"
-#include "test/mocks/server/instance.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -18,6 +18,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace HeaderToMetadataFilter {
 
+using ::Envoy::StatusHelpers::IsOk;
+using ::testing::Not;
 using HeaderToMetadataProtoConfig =
     envoy::extensions::filters::http::header_to_metadata::v3::Config;
 
@@ -28,8 +30,8 @@ void testForbiddenConfig(const std::string& yaml) {
   testing::NiceMock<Server::Configuration::MockFactoryContext> context;
   HeaderToMetadataConfig factory;
 
-  EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context),
-               EnvoyException);
+  auto status_or = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  EXPECT_THAT(status_or, Not(IsOk()));
 }
 
 // Tests that empty (metadata) keys are rejected.
@@ -84,7 +86,8 @@ request_rules:
   testing::NiceMock<Server::Configuration::MockFactoryContext> context;
   HeaderToMetadataConfig factory;
 
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   EXPECT_CALL(filter_callbacks, addStreamFilter(_));
   cb(filter_callbacks);
@@ -112,7 +115,39 @@ request_rules:
   testing::NiceMock<Server::Configuration::MockFactoryContext> context;
   HeaderToMetadataConfig factory;
 
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
+  Http::MockFilterChainFactoryCallbacks filter_callbacks;
+  EXPECT_CALL(filter_callbacks, addStreamFilter(_));
+  cb(filter_callbacks);
+}
+
+// Tests that a valid config is properly consumed via a server factory context.
+TEST(HeaderToMetadataFilterConfigTest, CreateFilterWithServerContext) {
+  const std::string yaml = R"EOF(
+request_rules:
+  - header: x-version
+    on_header_present:
+      metadata_namespace: envoy.lb
+      key: version
+      type: STRING
+    on_header_missing:
+      metadata_namespace: envoy.lb
+      key: default
+      value: 'true'
+      type: STRING
+  )EOF";
+
+  HeaderToMetadataProtoConfig proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
+  HeaderToMetadataConfig factory;
+  Server::Configuration::ExtraFactoryContext extra_context{
+      server_context.messageValidationVisitor(), "stats"};
+
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(proto_config, server_context, extra_context).value();
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   EXPECT_CALL(filter_callbacks, addStreamFilter(_));
   cb(filter_callbacks);
@@ -140,8 +175,11 @@ request_rules:
   testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
   HeaderToMetadataConfig factory;
 
-  const auto route_config = factory.createRouteSpecificFilterConfig(
-      proto_config, context, ProtobufMessage::getNullValidationVisitor());
+  const auto route_config =
+      factory
+          .createRouteSpecificFilterConfig(proto_config, context,
+                                           ProtobufMessage::getNullValidationVisitor())
+          .value();
   const auto* config = dynamic_cast<const Config*>(route_config.get());
   EXPECT_TRUE(config->doRequest());
   EXPECT_FALSE(config->doResponse());
@@ -158,7 +196,6 @@ request_rules:
       value: foo
       regex_value_rewrite:
         pattern:
-          google_re2: {}
           regex: "^/(cluster[\\d\\w-]+)/?.*$"
         substitution: "\\1"
   )EOF";
@@ -177,7 +214,6 @@ request_rules:
       value: foo
       regex_value_rewrite:
         pattern:
-          google_re2: {}
           regex: "^/(cluster[\\d\\w-]+)/?.*$"
         substitution: "\\1"
   )EOF";

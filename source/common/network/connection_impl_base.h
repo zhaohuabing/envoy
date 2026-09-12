@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "envoy/event/dispatcher.h"
 
 #include "source/common/common/logger.h"
@@ -23,11 +25,20 @@ public:
   // Network::Connection
   void addConnectionCallbacks(ConnectionCallbacks& cb) override;
   void removeConnectionCallbacks(ConnectionCallbacks& cb) override;
-  Event::Dispatcher& dispatcher() override { return dispatcher_; }
+  void onDrain(ConnectionDrainEvent drain_event) override;
+
+  // Network::FilterManagerConnection
+  void onFilterAboveHighWatermark() override;
+  void onFilterBelowLowWatermark() override;
+
+  Event::Dispatcher& dispatcher() const override { return dispatcher_; }
   uint64_t id() const override { return id_; }
   void hashKey(std::vector<uint8_t>& hash) const override;
   void setConnectionStats(const ConnectionStats& stats) override;
   void setDelayedCloseTimeout(std::chrono::milliseconds timeout) override;
+
+  // ScopeTrackedObject
+  OptRef<const StreamInfo::StreamInfo> trackedStream() const override;
 
 protected:
   void initializeDelayedCloseTimer();
@@ -37,6 +48,16 @@ protected:
   void raiseConnectionEvent(ConnectionEvent event);
 
   virtual void closeConnectionImmediately() PURE;
+
+  void closeConnectionImmediatelyWithDetails(absl::string_view local_close_details) {
+    setLocalCloseReason(local_close_details);
+    closeConnectionImmediately();
+  }
+
+  absl::string_view localCloseReason() const override { return local_close_reason_; }
+  virtual void setLocalCloseReason(absl::string_view local_close_reason) {
+    local_close_reason_ = std::string(local_close_reason);
+  }
 
   // States associated with delayed closing of the connection (i.e., when the underlying socket is
   // not immediately close()d as a result of a ConnectionImpl::close()).
@@ -55,10 +76,18 @@ protected:
 
   Event::TimerPtr delayed_close_timer_;
   std::chrono::milliseconds delayed_close_timeout_{0};
+  // Should be set with setLocalCloseReason.
+  std::string local_close_reason_;
   Event::Dispatcher& dispatcher_;
   const uint64_t id_;
   std::list<ConnectionCallbacks*> callbacks_;
+  // Set once the connection has been notified of a drain sequence via onDrain(). Retained so that
+  // callbacks registered after the notification are replayed it (see addConnectionCallbacks()).
+  std::optional<ConnectionDrainEvent> drain_event_;
   std::unique_ptr<ConnectionStats> connection_stats_;
+  // Number of sources above their high watermark. ConnectionCallbacks are notified on
+  // transitions (0→1, 1→0).
+  uint32_t above_high_watermark_count_{0};
 
 private:
   // Callback issued when a delayed close timeout triggers.

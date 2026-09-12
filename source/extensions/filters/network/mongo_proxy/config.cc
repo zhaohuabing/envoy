@@ -8,6 +8,7 @@
 #include "envoy/registry/registry.h"
 
 #include "source/common/common/fmt.h"
+#include "source/extensions/filters/network/mongo_proxy/bson_impl.h"
 #include "source/extensions/filters/network/mongo_proxy/proxy.h"
 
 namespace Envoy {
@@ -24,8 +25,9 @@ Network::FilterFactoryCb MongoProxyFilterConfigFactory::createFilterFactoryFromP
   const std::string stat_prefix = fmt::format("mongo.{}", proto_config.stat_prefix());
   AccessLogSharedPtr access_log;
   if (!proto_config.access_log().empty()) {
-    access_log = std::make_shared<AccessLog>(proto_config.access_log(), context.accessLogManager(),
-                                             context.mainThreadDispatcher().timeSource());
+    access_log = std::make_shared<AccessLog>(
+        proto_config.access_log(), context.serverFactoryContext().accessLogManager(),
+        context.serverFactoryContext().mainThreadDispatcher().timeSource());
   }
 
   Filters::Common::Fault::FaultDelayConfigSharedPtr fault_config;
@@ -41,20 +43,25 @@ Network::FilterFactoryCb MongoProxyFilterConfigFactory::createFilterFactoryFromP
 
   auto stats = std::make_shared<MongoStats>(context.scope(), stat_prefix, commands);
   const bool emit_dynamic_metadata = proto_config.emit_dynamic_metadata();
-  return [stat_prefix, &context, access_log, fault_config, emit_dynamic_metadata,
-          stats](Network::FilterManager& filter_manager) -> void {
+  const uint32_t max_bson_depth =
+      PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto_config, max_bson_depth, 100);
+
+  return [stat_prefix, &context, access_log, fault_config, emit_dynamic_metadata, stats,
+          max_bson_depth](Network::FilterManager& filter_manager) -> void {
     filter_manager.addFilter(std::make_shared<ProdProxyFilter>(
-        stat_prefix, context.scope(), context.runtime(), access_log, fault_config,
-        context.drainDecision(), context.mainThreadDispatcher().timeSource(), emit_dynamic_metadata,
-        stats));
+        stat_prefix, context.scope(), context.serverFactoryContext().runtime(), access_log,
+        fault_config, context.drainDecision(), context.serverFactoryContext(),
+        context.serverFactoryContext().mainThreadDispatcher().timeSource(), emit_dynamic_metadata,
+        stats, max_bson_depth));
   };
 }
 
 /**
  * Static registration for the mongo filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(MongoProxyFilterConfigFactory,
-                 Server::Configuration::NamedNetworkFilterConfigFactory){"envoy.mongo_proxy"};
+LEGACY_REGISTER_FACTORY(MongoProxyFilterConfigFactory,
+                        Server::Configuration::NamedNetworkFilterConfigFactory,
+                        "envoy.mongo_proxy");
 
 } // namespace MongoProxy
 } // namespace NetworkFilters

@@ -14,15 +14,27 @@ namespace AdaptiveConcurrency {
  * Config registration for the adaptive concurrency limit filter. @see NamedHttpFilterConfigFactory.
  */
 class AdaptiveConcurrencyFilterFactory
-    : public Common::FactoryBase<
+    : public Common::UnifiedFactoryBase<
           envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency> {
 public:
-  AdaptiveConcurrencyFilterFactory() : FactoryBase("envoy.filters.http.adaptive_concurrency") {}
+  AdaptiveConcurrencyFilterFactory()
+      : UnifiedFactoryBase("envoy.filters.http.adaptive_concurrency") {}
 
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency&
           proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override {
+    return createFilterFactory(proto_config, extra_context.stats_prefix, context,
+                               extra_context.scopeOr(context));
+  }
+
+private:
+  absl::StatusOr<Http::FilterFactoryCb> createFilterFactory(
+      const envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency&
+          proto_config,
+      const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& context,
+      Stats::Scope& scope);
 };
 
 } // namespace AdaptiveConcurrency

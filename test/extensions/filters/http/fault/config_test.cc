@@ -22,12 +22,14 @@ TEST(FaultFilterConfigTest, ValidateFail) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   envoy::extensions::filters::http::fault::v3::HTTPFault fault;
   fault.mutable_abort();
-  EXPECT_THROW(FaultFilterFactory().createFilterFactoryFromProto(fault, "stats", context),
+  EXPECT_THROW(FaultFilterFactory().createFilterFactoryFromProto(fault, "stats", context).value(),
                ProtoValidationException);
 }
 
 TEST(FaultFilterConfigTest, FaultFilterCorrectJson) {
   const std::string yaml_string = R"EOF(
+  filter_metadata:
+    hello: "world"
   delay:
     percentage:
       numerator: 100
@@ -38,10 +40,35 @@ TEST(FaultFilterConfigTest, FaultFilterCorrectJson) {
   const auto proto_config = convertYamlStrToProtoConfig(yaml_string);
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FaultFilterFactory factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
+}
+
+TEST(FaultFilterConfigTest, FaultFilterCorrectJsonWithServerContext) {
+  const std::string yaml_string = R"EOF(
+  filter_metadata:
+    hello: "world"
+  delay:
+    percentage:
+      numerator: 100
+      denominator: HUNDRED
+    fixed_delay: 5s
+  )EOF";
+
+  envoy::extensions::filters::http::fault::v3::HTTPFault config;
+  TestUtility::loadFromYamlAndValidate(yaml_string, config);
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  FaultFilterFactory factory;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(config, context, extra_context).value();
+  Http::MockFilterChainFactoryCallbacks filter_callbacks;
+  EXPECT_CALL(filter_callbacks, addStreamFilter(_));
+  cb(filter_callbacks);
 }
 
 TEST(FaultFilterConfigTest, FaultFilterCorrectProto) {
@@ -53,7 +80,7 @@ TEST(FaultFilterConfigTest, FaultFilterCorrectProto) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FaultFilterFactory factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context);
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
@@ -63,21 +90,11 @@ TEST(FaultFilterConfigTest, FaultFilterEmptyProto) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FaultFilterFactory factory;
   Http::FilterFactoryCb cb =
-      factory.createFilterFactoryFromProto(*factory.createEmptyConfigProto(), "stats", context);
+      factory.createFilterFactoryFromProto(*factory.createEmptyConfigProto(), "stats", context)
+          .value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
-}
-
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(FaultFilterConfigTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.fault";
-
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedHttpFilterConfigFactory>::getFactory(
-          deprecated_name));
 }
 
 } // namespace

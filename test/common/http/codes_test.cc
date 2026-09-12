@@ -10,6 +10,7 @@
 #include "source/common/http/header_map_impl.h"
 
 #include "test/mocks/stats/mocks.h"
+#include "test/test_common/enum_test_utils.h"
 #include "test/test_common/printers.h"
 #include "test/test_common/utility.h"
 
@@ -24,7 +25,7 @@ namespace Http {
 class CodeUtilityTest : public testing::Test {
 public:
   CodeUtilityTest()
-      : global_store_(*symbol_table_), cluster_scope_(*symbol_table_), code_stats_(*symbol_table_),
+      : global_store_(*symbol_table_), cluster_store_(*symbol_table_), code_stats_(*symbol_table_),
         pool_(*symbol_table_) {}
 
   void addResponse(uint64_t code, bool canary, bool internal_request,
@@ -32,23 +33,34 @@ public:
                    const std::string& request_vcluster_name = EMPTY_STRING,
                    const std::string& from_az = EMPTY_STRING,
                    const std::string& to_az = EMPTY_STRING) {
-    Stats::StatName prefix = pool_.add("prefix");
+    Stats::StatName prefix = pool_.add(prefix_);
     Stats::StatName from_zone = pool_.add(from_az);
     Stats::StatName to_zone = pool_.add(to_az);
     Stats::StatName vhost_name = pool_.add(request_vhost_name);
     Stats::StatName vcluster_name = pool_.add(request_vcluster_name);
-    Http::CodeStats::ResponseStatInfo info{
-        global_store_, cluster_scope_, prefix,    code,    internal_request,
-        vhost_name,    vcluster_name,  from_zone, to_zone, canary};
+    Stats::StatName empty_stat_name;
+    Http::CodeStats::ResponseStatInfo info{*global_store_.rootScope(),
+                                           *cluster_store_.rootScope(),
+                                           prefix,
+                                           code,
+                                           internal_request,
+                                           vhost_name,
+                                           vcluster_name,
+                                           empty_stat_name,
+                                           from_zone,
+                                           to_zone,
+                                           canary};
 
     code_stats_.chargeResponseStat(info, false);
   }
 
   Stats::TestUtil::TestSymbolTable symbol_table_;
   Stats::TestUtil::TestStore global_store_;
-  Stats::TestUtil::TestStore cluster_scope_;
+  Stats::TestUtil::TestStore cluster_store_;
   Http::CodeStatsImpl code_stats_;
   Stats::StatNamePool pool_;
+  // ResponseStatInfo::prefix_; empty for the router, ext_authz and ratelimit call sites.
+  std::string prefix_{"prefix"};
 };
 
 TEST_F(CodeUtilityTest, GroupStrings) {
@@ -57,7 +69,7 @@ TEST_F(CodeUtilityTest, GroupStrings) {
   EXPECT_EQ("3xx", CodeUtility::groupStringForResponseCode(Code::Found));
   EXPECT_EQ("4xx", CodeUtility::groupStringForResponseCode(Code::NotFound));
   EXPECT_EQ("5xx", CodeUtility::groupStringForResponseCode(Code::NotImplemented));
-  EXPECT_EQ("", CodeUtility::groupStringForResponseCode(static_cast<Code>(600)));
+  EXPECT_EQ("", CodeUtility::groupStringForResponseCode(uncheckedEnumCastForTest<Code>(600)));
 }
 
 TEST_F(CodeUtilityTest, NoCanary) {
@@ -66,28 +78,51 @@ TEST_F(CodeUtilityTest, NoCanary) {
   addResponse(401, false, false);
   addResponse(501, false, true);
 
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_2xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_201").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_2xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_201").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_3xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_301").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_3xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_301").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_4xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_401").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_4xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_401").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_5xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_501").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_5xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_501").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_201").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_201").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_3xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_301").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_3xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_301").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_4xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_401").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_4xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_401").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_5xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_501").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_5xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_501").value());
 
-  EXPECT_EQ(4U, cluster_scope_.counter("prefix.upstream_rq_completed").value());
-  EXPECT_EQ(2U, cluster_scope_.counter("prefix.external.upstream_rq_completed").value());
-  EXPECT_EQ(2U, cluster_scope_.counter("prefix.internal.upstream_rq_completed").value());
+  EXPECT_EQ(4U, cluster_store_.counter("prefix.upstream_rq_completed").value());
+  EXPECT_EQ(2U, cluster_store_.counter("prefix.external.upstream_rq_completed").value());
+  EXPECT_EQ(2U, cluster_store_.counter("prefix.internal.upstream_rq_completed").value());
 
-  EXPECT_EQ(19U, cluster_scope_.counters().size());
+  EXPECT_EQ(19U, cluster_store_.counters().size());
+}
+
+// The router, ext_authz and ratelimit all charge response stats with an empty prefix. The
+// resulting names must match the non-empty-prefix shape minus the prefix, with no stray dot.
+TEST_F(CodeUtilityTest, EmptyPrefix) {
+  prefix_.clear();
+  addResponse(201, false, false);
+  addResponse(301, false, true);
+
+  EXPECT_EQ(1U, cluster_store_.counter("upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("upstream_rq_201").value());
+  EXPECT_EQ(1U, cluster_store_.counter("external.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("external.upstream_rq_201").value());
+  EXPECT_EQ(1U, cluster_store_.counter("upstream_rq_3xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("upstream_rq_301").value());
+  EXPECT_EQ(1U, cluster_store_.counter("internal.upstream_rq_3xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("internal.upstream_rq_301").value());
+
+  EXPECT_EQ(2U, cluster_store_.counter("upstream_rq_completed").value());
+  EXPECT_EQ(1U, cluster_store_.counter("external.upstream_rq_completed").value());
+  EXPECT_EQ(1U, cluster_store_.counter("internal.upstream_rq_completed").value());
+
+  EXPECT_EQ(11U, cluster_store_.counters().size());
 }
 
 TEST_F(CodeUtilityTest, Canary) {
@@ -96,36 +131,36 @@ TEST_F(CodeUtilityTest, Canary) {
   addResponse(300, false, false);
   addResponse(500, true, false);
 
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_1xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_100").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_1xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_100").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_1xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_100").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_1xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_100").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_1xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_100").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_1xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_100").value());
 
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_2xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_200").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_2xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.internal.upstream_rq_200").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_2xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_200").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_3xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_300").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_3xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_300").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_5xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.upstream_rq_500").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_5xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_500").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_5xx").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_500").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_200").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.internal.upstream_rq_200").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_200").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_3xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_300").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_3xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_300").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_5xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.upstream_rq_500").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_5xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_500").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_5xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_500").value());
 
-  EXPECT_EQ(4U, cluster_scope_.counter("prefix.upstream_rq_completed").value());
-  EXPECT_EQ(2U, cluster_scope_.counter("prefix.external.upstream_rq_completed").value());
-  EXPECT_EQ(2U, cluster_scope_.counter("prefix.internal.upstream_rq_completed").value());
-  EXPECT_EQ(3U, cluster_scope_.counter("prefix.canary.upstream_rq_completed").value());
+  EXPECT_EQ(4U, cluster_store_.counter("prefix.upstream_rq_completed").value());
+  EXPECT_EQ(2U, cluster_store_.counter("prefix.external.upstream_rq_completed").value());
+  EXPECT_EQ(2U, cluster_store_.counter("prefix.internal.upstream_rq_completed").value());
+  EXPECT_EQ(3U, cluster_store_.counter("prefix.canary.upstream_rq_completed").value());
 
-  EXPECT_EQ(26U, cluster_scope_.counters().size());
+  EXPECT_EQ(26U, cluster_store_.counters().size());
 }
 
 TEST_F(CodeUtilityTest, UnknownResponseCodes) {
@@ -133,12 +168,12 @@ TEST_F(CodeUtilityTest, UnknownResponseCodes) {
   addResponse(600, false, false);
   addResponse(1000000, false, true);
 
-  EXPECT_EQ(3U, cluster_scope_.counter("prefix.upstream_rq_unknown").value());
-  EXPECT_EQ(2U, cluster_scope_.counter("prefix.internal.upstream_rq_unknown").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.canary.upstream_rq_unknown").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.external.upstream_rq_unknown").value());
+  EXPECT_EQ(3U, cluster_store_.counter("prefix.upstream_rq_unknown").value());
+  EXPECT_EQ(2U, cluster_store_.counter("prefix.internal.upstream_rq_unknown").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.canary.upstream_rq_unknown").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.external.upstream_rq_unknown").value());
 
-  EXPECT_EQ(8U, cluster_scope_.counters().size());
+  EXPECT_EQ(8U, cluster_store_.counters().size());
 }
 
 TEST_F(CodeUtilityTest, All) {
@@ -200,13 +235,13 @@ TEST_F(CodeUtilityTest, All) {
       std::make_pair(Code::LoopDetected, "Loop Detected"),
       std::make_pair(Code::NotExtended, "Not Extended"),
       std::make_pair(Code::NetworkAuthenticationRequired, "Network Authentication Required"),
-      std::make_pair(static_cast<Code>(600), "Unknown")};
+      std::make_pair(uncheckedEnumCastForTest<Code>(600), "Unknown")};
 
   for (const auto& test_case : test_set) {
     EXPECT_EQ(test_case.second, CodeUtility::toString(test_case.first));
   }
 
-  EXPECT_EQ(std::string("Unknown"), CodeUtility::toString(static_cast<Code>(600)));
+  EXPECT_EQ(std::string("Unknown"), CodeUtility::toString(uncheckedEnumCastForTest<Code>(600)));
 }
 
 TEST_F(CodeUtilityTest, RequestVirtualCluster) {
@@ -224,24 +259,26 @@ TEST_F(CodeUtilityTest, RequestVirtualCluster) {
 TEST_F(CodeUtilityTest, PerZoneStats) {
   addResponse(200, false, false, "", "", "from_az", "to_az");
 
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.zone.from_az.to_az.upstream_rq_completed").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.zone.from_az.to_az.upstream_rq_200").value());
-  EXPECT_EQ(1U, cluster_scope_.counter("prefix.zone.from_az.to_az.upstream_rq_2xx").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.zone.from_az.to_az.upstream_rq_completed").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.zone.from_az.to_az.upstream_rq_200").value());
+  EXPECT_EQ(1U, cluster_store_.counter("prefix.zone.from_az.to_az.upstream_rq_2xx").value());
 }
 
 TEST_F(CodeUtilityTest, ResponseTimingTest) {
   Stats::MockStore global_store;
   Stats::MockStore cluster_scope;
+  Stats::StatName empty_stat_name;
 
   Stats::StatNameManagedStorage prefix("prefix", *symbol_table_);
-  Http::CodeStats::ResponseTimingInfo info{global_store,
-                                           cluster_scope,
+  Http::CodeStats::ResponseTimingInfo info{*global_store.rootScope(),
+                                           *cluster_scope.rootScope(),
                                            pool_.add("prefix"),
                                            std::chrono::milliseconds(5),
                                            true,
                                            true,
                                            pool_.add("vhost_name"),
                                            pool_.add("req_vcluster_name"),
+                                           empty_stat_name,
                                            pool_.add("from_az"),
                                            pool_.add("to_az")};
 

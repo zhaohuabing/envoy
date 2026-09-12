@@ -3,6 +3,7 @@
 #include "envoy/common/pure.h"
 #include "envoy/config/tap/v3/common.pb.h"
 #include "envoy/data/tap/v3/wrapper.pb.h"
+#include "envoy/extensions/filters/http/tap/v3/tap.pb.h"
 #include "envoy/http/header_map.h"
 
 #include "source/extensions/common/matcher/matcher.h"
@@ -68,11 +69,33 @@ public:
   /**
    * Create a per tap sink handle for use in submitting either buffered traces or trace segments.
    * @param trace_id supplies a locally unique trace ID. Some sinks use this for output generation.
+   * @param type     Indicates the type of Sink specified in request body
    */
-  virtual PerTapSinkHandlePtr createPerTapSinkHandle(uint64_t trace_id) PURE;
+  virtual PerTapSinkHandlePtr
+  createPerTapSinkHandle(uint64_t trace_id,
+                         envoy::config::tap::v3::OutputSink::OutputSinkTypeCase type) PURE;
 };
 
 using SinkPtr = std::unique_ptr<Sink>;
+
+/**
+ * Abstract tap sink factory. Produces a factory that can instantiate SinkPtr objects
+ */
+class TapSinkFactory : public Config::TypedFactory {
+public:
+  ~TapSinkFactory() override = default;
+  std::string category() const override { return "envoy.tap.sinks"; }
+
+  /**
+   * Create a Sink that can be used for writing out data produced by the tap filter.
+   * @param config supplies the protobuf configuration for the sink factory
+   * @param  http_context supplies HTTP context
+   */
+  virtual SinkPtr createSinkPtr(const Protobuf::Message& config,
+                                Server::Configuration::GenericFactoryContext& http_context) PURE;
+};
+
+using TapSinkFactoryPtr = std::unique_ptr<TapSinkFactory>;
 
 /**
  * Generic configuration for a tap extension (filter, transport socket, etc.).
@@ -130,6 +153,12 @@ public:
   virtual uint32_t maxBufferedTxBytes() const PURE;
 
   /**
+   * Return the minimum transmitted bytes that can be buffered in memory. Streaming taps are still
+   * subject to this limit depending on match status.
+   */
+  virtual uint32_t minStreamedSentBytes() const PURE;
+
+  /**
    * Return a new match status vector that is correctly sized for the number of matchers that are in
    * the configuration.
    */
@@ -151,6 +180,16 @@ public:
    * Return whether the tap session should run in streaming or buffering mode.
    */
   virtual bool streaming() const PURE;
+
+  /**
+   * Per request/connection sampling gate. Called once at filter or transport socket
+   * setup. If false, the tapper is not created and no match state is allocated.
+   * Read-only: the dice roll is performed by the runtime layer's internal RNG
+   * (thread-safe), not by mutating state here.
+   *
+   * @return true if the request/connection should be admitted to matching.
+   */
+  virtual bool shouldRecord() const PURE;
 };
 
 using TapConfigSharedPtr = std::shared_ptr<TapConfig>;

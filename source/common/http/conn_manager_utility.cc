@@ -7,16 +7,22 @@
 #include "envoy/type/v3/percent.pb.h"
 
 #include "source/common/common/empty_string.h"
+#include "source/common/common/enum_to_int.h"
 #include "source/common/common/utility.h"
 #include "source/common/http/conn_manager_config.h"
+#include "source/common/http/forward_client_cert.h"
 #include "source/common/http/header_utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/http1/codec_impl.h"
 #include "source/common/http/http2/codec_impl.h"
+#include "source/common/http/matching/data_impl.h"
 #include "source/common/http/path_utility.h"
 #include "source/common/http/utility.h"
+#include "source/common/json/json_streamer.h"
+#include "source/common/matcher/matcher.h"
 #include "source/common/network/utility.h"
 #include "source/common/runtime/runtime_features.h"
+#include "source/common/stream_info/utility.h"
 #include "source/common/tracing/http_tracer_impl.h"
 
 #include "absl/strings/str_cat.h"
@@ -27,17 +33,46 @@ namespace Http {
 namespace {
 
 absl::string_view getScheme(absl::string_view forwarded_proto, bool is_ssl) {
-  if (HeaderUtility::schemeIsValid(forwarded_proto)) {
+  if (Utility::schemeIsValid(forwarded_proto)) {
     return forwarded_proto;
   }
   return is_ssl ? Headers::get().SchemeValues.Https : Headers::get().SchemeValues.Http;
 }
 
+// Determines the scheme (http/https) based on PROXY protocol destination port if configured,
+// otherwise falls back to connection's TLS status.
+absl::string_view getSchemeFromProxyProtocolOrConnection(const Network::Connection& connection,
+                                                         const ConnectionManagerConfig& config) {
+  const auto& https_ports = config.httpsDestinationPorts();
+  const auto& http_ports = config.httpDestinationPorts();
+
+  // If the feature is configured and the local address was restored from PROXY protocol,
+  // try to infer the scheme from the destination port.
+  if ((!https_ports.empty() || !http_ports.empty()) &&
+      connection.connectionInfoProvider().localAddressRestored()) {
+    const Envoy::Network::Address::Ip* ip =
+        connection.connectionInfoProvider().localAddress()->ip();
+    if (ip != nullptr) {
+      uint32_t port = ip->port();
+      if (https_ports.contains(port)) {
+        return Headers::get().SchemeValues.Https;
+      }
+      if (http_ports.contains(port)) {
+        return Headers::get().SchemeValues.Http;
+      }
+    }
+  }
+
+  // Fall back to connection's TLS status.
+  return connection.ssl() ? Headers::get().SchemeValues.Https : Headers::get().SchemeValues.Http;
+}
+
 } // namespace
 std::string ConnectionManagerUtility::determineNextProtocol(Network::Connection& connection,
                                                             const Buffer::Instance& data) {
-  if (!connection.nextProtocol().empty()) {
-    return connection.nextProtocol();
+  std::string next_protocol = connection.nextProtocol();
+  if (!next_protocol.empty()) {
+    return next_protocol;
   }
 
   // See if the data we have so far shows the HTTP/2 prefix. We ignore the case where someone sends
@@ -58,40 +93,49 @@ ServerConnectionPtr ConnectionManagerUtility::autoCreateCodec(
     const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
     uint32_t max_request_headers_kb, uint32_t max_request_headers_count,
     envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
-        headers_with_underscores_action) {
+        headers_with_underscores_action,
+    Server::OverloadManager& overload_manager, Runtime::Loader& runtime) {
   if (determineNextProtocol(connection, data) == Utility::AlpnNames::get().Http2) {
     Http2::CodecStats& stats = Http2::CodecStats::atomicGet(http2_codec_stats, scope);
     return std::make_unique<Http2::ServerConnectionImpl>(
         connection, callbacks, stats, random, http2_options, max_request_headers_kb,
-        max_request_headers_count, headers_with_underscores_action);
+        max_request_headers_count, headers_with_underscores_action, overload_manager, runtime);
   } else {
     Http1::CodecStats& stats = Http1::CodecStats::atomicGet(http1_codec_stats, scope);
     return std::make_unique<Http1::ServerConnectionImpl>(
         connection, stats, callbacks, http1_settings, max_request_headers_kb,
-        max_request_headers_count, headers_with_underscores_action);
+        max_request_headers_count, headers_with_underscores_action, overload_manager);
+  }
+}
+
+void ConnectionManagerUtility::appendXff(RequestHeaderMap& request_headers,
+                                         Network::Connection& connection,
+                                         ConnectionManagerConfig& config) {
+  if (Network::Utility::isLoopbackAddress(*connection.connectionInfoProvider().remoteAddress())) {
+    Utility::appendXff(request_headers, config.localAddress());
+  } else {
+    Utility::appendXff(request_headers, *connection.connectionInfoProvider().remoteAddress());
   }
 }
 
 ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::mutateRequestHeaders(
     RequestHeaderMap& request_headers, Network::Connection& connection,
     ConnectionManagerConfig& config, const Router::Config& route_config,
-    const LocalInfo::LocalInfo& local_info) {
+    const LocalInfo::LocalInfo& local_info, const StreamInfo::StreamInfo& stream_info) {
+
+  for (const auto& extension : config.earlyHeaderMutationExtensions()) {
+    if (!extension->mutate(request_headers, stream_info)) {
+      break;
+    }
+  }
+
   // If this is a Upgrade request, do not remove the Connection and Upgrade headers,
   // as we forward them verbatim to the upstream hosts.
-  if (Utility::isUpgrade(request_headers)) {
-    // The current WebSocket implementation re-uses the HTTP1 codec to send upgrade headers to
-    // the upstream host. This adds the "transfer-encoding: chunked" request header if the stream
-    // has not ended and content-length does not exist. In HTTP1.1, if transfer-encoding and
-    // content-length both do not exist this means there is no request body. After transfer-encoding
-    // is stripped here, the upstream request becomes invalid. We can fix it by explicitly adding a
-    // "content-length: 0" request header here.
-    const bool no_body = (!request_headers.TransferEncoding() && !request_headers.ContentLength());
-    if (no_body) {
-      request_headers.setContentLength(uint64_t(0));
-    }
-  } else {
+  if (!Utility::isUpgrade(request_headers)) {
     request_headers.removeConnection();
     request_headers.removeUpgrade();
+
+    sanitizeTEHeader(request_headers);
   }
 
   // Clean proxy headers.
@@ -101,14 +145,11 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
   request_headers.removeTransferEncoding();
 
   // Sanitize referer field if exists.
-  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.sanitize_http_header_referer")) {
-    auto result = request_headers.get(Http::CustomHeaders::get().Referer);
-    if (!result.empty()) {
-      Utility::Url url;
-      if (result.size() > 1 || !url.initialize(result[0]->value().getStringView(), false)) {
-        // A request header shouldn't have multiple referer field.
-        request_headers.remove(Http::CustomHeaders::get().Referer);
-      }
+  auto result = request_headers.get(Http::CustomHeaders::get().Referer);
+  if (!result.empty()) {
+    if (result.size() > 1 || !Utility::isValidRefererValue(result[0]->value().getStringView())) {
+      // A request header shouldn't have multiple referer field.
+      request_headers.remove(Http::CustomHeaders::get().Referer);
     }
   }
 
@@ -135,18 +176,22 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
       final_remote_address = connection.connectionInfoProvider().remoteAddress();
     }
     if (!config.skipXffAppend()) {
-      if (Network::Utility::isLoopbackAddress(
-              *connection.connectionInfoProvider().remoteAddress())) {
-        Utility::appendXff(request_headers, config.localAddress());
-      } else {
-        Utility::appendXff(request_headers, *connection.connectionInfoProvider().remoteAddress());
-      }
+      appendXff(request_headers, connection, config);
     }
-    // If the prior hop is not a trusted proxy, overwrite any x-forwarded-proto value it set as
-    // untrusted. Alternately if no x-forwarded-proto header exists, add one.
+    // If the prior hop is not a trusted proxy, overwrite any
+    // x-forwarded-proto/x-forwarded-port value it set as untrusted. Alternately if no
+    // x-forwarded-proto/x-forwarded-port header exists, add one if configured.
     if (xff_num_trusted_hops == 0 || request_headers.ForwardedProto() == nullptr) {
       request_headers.setReferenceForwardedProto(
-          connection.ssl() ? Headers::get().SchemeValues.Https : Headers::get().SchemeValues.Http);
+          getSchemeFromProxyProtocolOrConnection(connection, config));
+    }
+    if (config.appendXForwardedPort() &&
+        (xff_num_trusted_hops == 0 || request_headers.ForwardedPort() == nullptr)) {
+      const Envoy::Network::Address::Ip* ip =
+          connection.streamInfo().downstreamAddressProvider().localAddress()->ip();
+      if (ip) {
+        request_headers.setForwardedPort(ip->port());
+      }
     }
   } else {
     // If we are not using remote address, attempt to pull a valid IPv4 or IPv6 address out of XFF
@@ -163,6 +208,9 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
       if (result.reject_options.has_value()) {
         return {nullptr, result.reject_options};
       }
+      if (!result.skip_xff_append) {
+        appendXff(request_headers, connection, config);
+      }
 
       if (result.detected_remote_address) {
         final_remote_address = result.detected_remote_address;
@@ -175,8 +223,18 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
   // If the x-forwarded-proto header is not set, set it here, since Envoy uses it for determining
   // scheme and communicating it upstream.
   if (!request_headers.ForwardedProto()) {
-    request_headers.setReferenceForwardedProto(connection.ssl() ? Headers::get().SchemeValues.Https
-                                                                : Headers::get().SchemeValues.Http);
+    request_headers.setReferenceForwardedProto(
+        getSchemeFromProxyProtocolOrConnection(connection, config));
+  }
+
+  // Usually, the x-forwarded-port header comes with x-forwarded-proto header. If the
+  // x-forwarded-proto header is not set, set it here if append-x-forwarded-port is configured.
+  if (config.appendXForwardedPort() && !request_headers.ForwardedPort()) {
+    const Envoy::Network::Address::Ip* ip =
+        connection.streamInfo().downstreamAddressProvider().localAddress()->ip();
+    if (ip) {
+      request_headers.setForwardedPort(ip->port());
+    }
   }
 
   if (config.schemeToSet().has_value()) {
@@ -191,6 +249,7 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
     request_headers.setScheme(
         getScheme(request_headers.getForwardedProtoValue(), connection.ssl() != nullptr));
   }
+  request_headers.setScheme(absl::AsciiStrToLower(request_headers.getSchemeValue()));
 
   // At this point we can determine whether this is an internal or external request. The
   // determination of internal status uses the following:
@@ -251,27 +310,63 @@ ConnectionManagerUtility::MutateRequestHeadersResult ConnectionManagerUtility::m
 
   // Generate x-request-id for all edge requests, or if there is none.
   if (config.generateRequestId()) {
-    auto rid_extension = config.requestIDExtension();
-    // Unconditionally set a request ID if we are allowed to override it from
-    // the edge. Otherwise just ensure it is set.
-    const bool force_set = !config.preserveExternalRequestId() && edge_request;
-    rid_extension->set(request_headers, force_set);
+    config.requestIDExtension()->set(request_headers, edge_request,
+                                     config.preserveExternalRequestId());
   }
 
-  mutateXfccRequestHeader(request_headers, connection, config);
+  if (connection.connecting() && request_headers.get(Headers::get().EarlyData).empty()) {
+    // Add an Early-Data header to indicate that this is a 0-RTT request according to
+    // https://datatracker.ietf.org/doc/html/rfc8470#section-5.1.
+    HeaderString value;
+    value.setCopy("1");
+    request_headers.addViaMove(HeaderString(Headers::get().EarlyData), std::move(value));
+  }
+  mutateXfccRequestHeader(request_headers, stream_info, connection, config);
 
-  return {final_remote_address, absl::nullopt};
+  return {final_remote_address, std::nullopt};
+}
+
+void ConnectionManagerUtility::sanitizeTEHeader(RequestHeaderMap& request_headers) {
+  absl::string_view te_header = request_headers.getTEValue();
+  if (te_header.empty()) {
+    return;
+  }
+
+  // If the TE header contains the "trailers" value, set the TE header to "trailers" only.
+  std::vector<absl::string_view> te_values = absl::StrSplit(te_header, ',');
+  for (const absl::string_view& te_value : te_values) {
+    bool is_trailers =
+        absl::StripAsciiWhitespace(te_value) == Http::Headers::get().TEValues.Trailers;
+
+    if (is_trailers) {
+      request_headers.setTE(Http::Headers::get().TEValues.Trailers);
+      return;
+    }
+  }
+
+  // If the TE header does not contain the "trailers" value, remove the TE header.
+  request_headers.removeTE();
 }
 
 void ConnectionManagerUtility::cleanInternalHeaders(
     RequestHeaderMap& request_headers, bool edge_request,
-    const std::list<Http::LowerCaseString>& internal_only_headers) {
+    const std::vector<Http::LowerCaseString>& internal_only_headers) {
   if (edge_request) {
+    // Headers to be stripped from edge requests, i.e. to sanitize so
+    // clients can't inject values.
     request_headers.removeEnvoyDecoratorOperation();
     request_headers.removeEnvoyDownstreamServiceCluster();
     request_headers.removeEnvoyDownstreamServiceNode();
+
+    // TODO(wbpcode): Envoy may should always remove these headers from client because
+    // these headers are hop by hop headers and should not be sent to upstream.
+    request_headers.removeEnvoyOriginalPath();
+    request_headers.removeEnvoyOriginalHost();
   }
 
+  // Headers to be stripped from edge *and* intermediate-hop external requests.
+  // TODO: some of these should only be stripped at edge, i.e. moved into
+  // the block above.
   request_headers.removeEnvoyRetriableStatusCodes();
   request_headers.removeEnvoyRetriableHeaderNames();
   request_headers.removeEnvoyRetryOn();
@@ -304,7 +399,7 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
   if (!rid_extension->useRequestIdForTraceSampling()) {
     return Tracing::Reason::Sampling;
   }
-  const auto rid_to_integer = rid_extension->toInteger(request_headers);
+  const auto rid_to_integer = rid_extension->getInteger(request_headers);
   // Skip if request-id is corrupted, or non-existent
   if (!rid_to_integer.has_value()) {
     return final_reason;
@@ -318,10 +413,11 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
   const envoy::type::v3::FractionalPercent* overall_sampling =
       &config.tracingConfig()->overall_sampling_;
 
-  if (route && route->tracingConfig()) {
-    client_sampling = &route->tracingConfig()->getClientSampling();
-    random_sampling = &route->tracingConfig()->getRandomSampling();
-    overall_sampling = &route->tracingConfig()->getOverallSampling();
+  const Router::RouteTracing* route_tracing = route ? route->tracingConfig() : nullptr;
+  if (route_tracing != nullptr) {
+    client_sampling = &route_tracing->getClientSampling();
+    random_sampling = &route_tracing->getRandomSampling();
+    overall_sampling = &route_tracing->getOverallSampling();
   }
 
   // Do not apply tracing transformations if we are currently tracing.
@@ -350,96 +446,264 @@ Tracing::Reason ConnectionManagerUtility::mutateTracingRequestHeader(
   return final_reason;
 }
 
-void ConnectionManagerUtility::mutateXfccRequestHeader(RequestHeaderMap& request_headers,
-                                                       Network::Connection& connection,
-                                                       ConnectionManagerConfig& config) {
+namespace {
+
+// Helper functions to apply forward client cert logic.
+
+// Append a single XFCC JSON object into the output string using the cert information from the
+// connection. The caller is responsible for the surrounding array delimiters.
+void appendXfccJsonObject(
+    std::string& output, Network::Connection& connection,
+    const std::vector<ClientCertDetailsType>& set_current_client_cert_details) {
+  Json::StreamerBase<Json::StringOutput> streamer(output);
+  {
+    auto root = streamer.makeRootMap();
+    const auto uri_sans_local_cert = connection.ssl()->uriSanLocalCertificate();
+    if (!uri_sans_local_cert.empty()) {
+      root->addKey("by");
+      auto arr = root->addArray();
+      for (const std::string& uri : uri_sans_local_cert) {
+        arr->addString(uri);
+      }
+    }
+    const std::string& cert_digest = connection.ssl()->sha256PeerCertificateDigest();
+    if (!cert_digest.empty()) {
+      root->addKey("hash");
+      root->addString(cert_digest);
+    }
+    for (const auto& detail : set_current_client_cert_details) {
+      switch (detail) {
+      case ClientCertDetailsType::Cert: {
+        const std::string& peer_cert = connection.ssl()->pemEncodedPeerCertificate();
+        if (!peer_cert.empty()) {
+          root->addKey("cert");
+          root->addString(peer_cert);
+        }
+        break;
+      }
+      case ClientCertDetailsType::Chain: {
+        const absl::Span<const std::string> peer_certs =
+            connection.ssl()->pemEncodedPeerCertificateChain();
+        if (!peer_certs.empty()) {
+          root->addKey("chain");
+          auto arr = root->addArray();
+          for (const std::string& cert : peer_certs) {
+            arr->addString(cert);
+          }
+        }
+        break;
+      }
+      case ClientCertDetailsType::Subject: {
+        const std::string& subject = connection.ssl()->subjectPeerCertificate();
+        if (!subject.empty()) {
+          root->addKey("subject");
+          root->addString(subject);
+        }
+        break;
+      }
+      case ClientCertDetailsType::URI: {
+        const auto uri_sans = connection.ssl()->uriSanPeerCertificate();
+        if (!uri_sans.empty()) {
+          root->addKey("uri");
+          auto arr = root->addArray();
+          for (const std::string& uri : uri_sans) {
+            arr->addString(uri);
+          }
+        }
+        break;
+      }
+      case ClientCertDetailsType::DNS: {
+        auto dns_sans = connection.ssl()->dnsSansPeerCertificate();
+        if (!dns_sans.empty()) {
+          root->addKey("dns");
+          auto arr = root->addArray();
+          for (const std::string& dns : dns_sans) {
+            arr->addString(dns);
+          }
+        }
+        break;
+      }
+      case ClientCertDetailsType::Issuer: {
+        const std::string& issuer = connection.ssl()->issuerPeerCertificate();
+        if (!issuer.empty()) {
+          root->addKey("issuer");
+          root->addString(issuer);
+        }
+        break;
+      }
+      }
+    }
+  }
+}
+
+// Base implementation that takes the forward client cert type, details, and format directly.
+void applyForwardClientCertConfig(
+    RequestHeaderMap& request_headers, Network::Connection& connection,
+    ForwardClientCertType forward_client_cert,
+    const std::vector<ClientCertDetailsType>& set_current_client_cert_details,
+    ClientCertFormat format) {
   // When AlwaysForwardOnly is set, always forward the XFCC header without modification.
-  if (config.forwardClientCert() == ForwardClientCertType::AlwaysForwardOnly) {
+  if (forward_client_cert == ForwardClientCertType::AlwaysForwardOnly) {
     return;
   }
   // When Sanitize is set, or the connection is not mutual TLS, remove the XFCC header.
-  if (config.forwardClientCert() == ForwardClientCertType::Sanitize ||
+  if (forward_client_cert == ForwardClientCertType::Sanitize ||
       !(connection.ssl() && connection.ssl()->peerCertificatePresented())) {
     request_headers.removeForwardedClientCert();
     return;
   }
 
   // When ForwardOnly is set, always forward the XFCC header without modification.
-  if (config.forwardClientCert() == ForwardClientCertType::ForwardOnly) {
+  if (forward_client_cert == ForwardClientCertType::ForwardOnly) {
     return;
   }
 
   // TODO(myidpt): Handle the special characters in By and URI fields.
   // TODO: Optimize client_cert_details based on perf analysis (direct string appending may be more
   // preferable).
-  std::vector<std::string> client_cert_details;
+  std::string client_cert_details_str;
   // When AppendForward or SanitizeSet is set, the client certificate information should be set into
   // the XFCC header.
-  if (config.forwardClientCert() == ForwardClientCertType::AppendForward ||
-      config.forwardClientCert() == ForwardClientCertType::SanitizeSet) {
-    const auto uri_sans_local_cert = connection.ssl()->uriSanLocalCertificate();
-    if (!uri_sans_local_cert.empty()) {
-      client_cert_details.push_back(absl::StrCat("By=", uri_sans_local_cert[0]));
+  if (forward_client_cert == ForwardClientCertType::AppendForward ||
+      forward_client_cert == ForwardClientCertType::SanitizeSet) {
+    // Determine the effective format. For AppendForward with an existing value, match the format
+    // of the existing value rather than the configured format to avoid mixing formats.
+    ClientCertFormat effective_format = format;
+    absl::string_view existing_xfcc;
+    if (forward_client_cert == ForwardClientCertType::AppendForward) {
+      existing_xfcc = request_headers.getForwardedClientCertValue();
+      if (!existing_xfcc.empty()) {
+        effective_format = (existing_xfcc.front() == '[' && existing_xfcc.back() == ']')
+                               ? ClientCertFormat::Json
+                               : ClientCertFormat::Text;
+      }
     }
-    const std::string cert_digest = connection.ssl()->sha256PeerCertificateDigest();
-    if (!cert_digest.empty()) {
-      client_cert_details.push_back(absl::StrCat("Hash=", cert_digest));
-    }
-    for (const auto& detail : config.setCurrentClientCertDetails()) {
-      switch (detail) {
-      case ClientCertDetailsType::Cert: {
-        const std::string peer_cert = connection.ssl()->urlEncodedPemEncodedPeerCertificate();
-        if (!peer_cert.empty()) {
-          client_cert_details.push_back(absl::StrCat("Cert=\"", peer_cert, "\""));
+
+    if (effective_format == ClientCertFormat::Json) {
+      std::string result;
+      if (!existing_xfcc.empty()) {
+        // Existing JSON array — splice the new object in before the closing ']'.
+        result.reserve(existing_xfcc.size());
+        result.append(existing_xfcc.data(), existing_xfcc.size() - 1);
+        result.append(",");
+      } else {
+        result.append("[");
+      }
+      appendXfccJsonObject(result, connection, set_current_client_cert_details);
+      result.append("]");
+      request_headers.setForwardedClientCert(result);
+      return;
+    } else {
+      std::vector<std::string> client_cert_details;
+      const absl::Span<const std::string> uri_sans_local_cert =
+          connection.ssl()->uriSanLocalCertificate();
+      if (!uri_sans_local_cert.empty()) {
+        for (const std::string& uri : uri_sans_local_cert) {
+          client_cert_details.push_back(absl::StrCat("By=", uri));
         }
-        break;
       }
-      case ClientCertDetailsType::Chain: {
-        const std::string peer_chain = connection.ssl()->urlEncodedPemEncodedPeerCertificateChain();
-        if (!peer_chain.empty()) {
-          client_cert_details.push_back(absl::StrCat("Chain=\"", peer_chain, "\""));
-        }
-        break;
+      const std::string& cert_digest = connection.ssl()->sha256PeerCertificateDigest();
+      if (!cert_digest.empty()) {
+        client_cert_details.push_back(absl::StrCat("Hash=", cert_digest));
       }
-      case ClientCertDetailsType::Subject:
-        // The "Subject" key still exists even if the subject is empty.
-        client_cert_details.push_back(
-            absl::StrCat("Subject=\"", connection.ssl()->subjectPeerCertificate(), "\""));
-        break;
-      case ClientCertDetailsType::URI: {
-        // The "URI" key still exists even if the URI is empty.
-        const auto sans = connection.ssl()->uriSanPeerCertificate();
-        const auto& uri_san = sans.empty() ? "" : sans[0];
-        client_cert_details.push_back(absl::StrCat("URI=", uri_san));
-        break;
-      }
-      case ClientCertDetailsType::DNS: {
-        auto dns_sans = connection.ssl()->dnsSansPeerCertificate();
-        if (!dns_sans.empty()) {
-          for (const std::string& dns : dns_sans) {
-            client_cert_details.push_back(absl::StrCat("DNS=", dns));
+      for (const auto& detail : set_current_client_cert_details) {
+        switch (detail) {
+        case ClientCertDetailsType::Cert: {
+          const std::string& peer_cert = connection.ssl()->urlEncodedPemEncodedPeerCertificate();
+          if (!peer_cert.empty()) {
+            client_cert_details.push_back(absl::StrCat("Cert=\"", peer_cert, "\""));
           }
+          break;
         }
-        break;
+        case ClientCertDetailsType::Chain: {
+          const std::string& peer_chain =
+              connection.ssl()->urlEncodedPemEncodedPeerCertificateChain();
+          if (!peer_chain.empty()) {
+            client_cert_details.push_back(absl::StrCat("Chain=\"", peer_chain, "\""));
+          }
+          break;
+        }
+        case ClientCertDetailsType::Subject:
+          // The "Subject" key still exists even if the subject is empty.
+          client_cert_details.push_back(
+              absl::StrCat("Subject=\"", connection.ssl()->subjectPeerCertificate(), "\""));
+          break;
+        case ClientCertDetailsType::URI: {
+          // The "URI" key still exists even if the URI is empty.
+          const absl::Span<const std::string> sans = connection.ssl()->uriSanPeerCertificate();
+          if (!sans.empty()) {
+            for (const std::string& uri : sans) {
+              client_cert_details.push_back(absl::StrCat("URI=", uri));
+            }
+          } else {
+            client_cert_details.push_back("URI=");
+          }
+          break;
+        }
+        case ClientCertDetailsType::DNS: {
+          const absl::Span<const std::string> dns_sans = connection.ssl()->dnsSansPeerCertificate();
+          if (!dns_sans.empty()) {
+            for (const std::string& dns : dns_sans) {
+              client_cert_details.push_back(absl::StrCat("DNS=", dns));
+            }
+          }
+          break;
+        }
+        case ClientCertDetailsType::Issuer:
+          // The "Issuer" key still exists even if the issuer is empty.
+          client_cert_details.push_back(
+              absl::StrCat("Issuer=\"", connection.ssl()->issuerPeerCertificate(), "\""));
+          break;
+        }
       }
-      }
+      client_cert_details_str = absl::StrJoin(client_cert_details, ";");
     }
   }
 
-  const std::string client_cert_details_str = absl::StrJoin(client_cert_details, ";");
-  if (config.forwardClientCert() == ForwardClientCertType::AppendForward) {
+  ENVOY_BUG(forward_client_cert == ForwardClientCertType::AppendForward ||
+                forward_client_cert == ForwardClientCertType::SanitizeSet,
+            "error in client cert logic");
+  if (forward_client_cert == ForwardClientCertType::AppendForward) {
     request_headers.appendForwardedClientCert(client_cert_details_str, ",");
-  } else if (config.forwardClientCert() == ForwardClientCertType::SanitizeSet) {
+  } else if (forward_client_cert == ForwardClientCertType::SanitizeSet) {
     request_headers.setForwardedClientCert(client_cert_details_str);
-  } else {
-    NOT_REACHED_GCOVR_EXCL_LINE;
   }
+}
+
+} // namespace
+
+void ConnectionManagerUtility::mutateXfccRequestHeader(RequestHeaderMap& request_headers,
+                                                       const StreamInfo::StreamInfo& stream_info,
+                                                       Network::Connection& connection,
+                                                       ConnectionManagerConfig& config) {
+  // If a matcher is configured, evaluate it to get per-request forward client cert config.
+  if (const auto& matcher = config.forwardClientCertMatcher(); matcher != nullptr) {
+    Matching::HttpMatchingDataImpl data(stream_info);
+    data.onRequestHeaders(request_headers);
+    auto match_result = Matcher::evaluateMatch<HttpMatchingData>(*matcher, data);
+    if (match_result.isMatch() && match_result.action() != nullptr) {
+      // Use the matched action's config via the ForwardClientCertActionConfig interface.
+      const auto& forward_client_cert_action =
+          match_result.action()->getTyped<ForwardClientCertActionConfig>();
+      applyForwardClientCertConfig(request_headers, connection,
+                                   forward_client_cert_action.forwardClientCertType(),
+                                   forward_client_cert_action.setCurrentClientCertDetails(),
+                                   forward_client_cert_action.clientCertFormat());
+      return;
+    }
+  }
+
+  // Fall back to static config if no matcher or no match.
+  applyForwardClientCertConfig(request_headers, connection, config.forwardClientCert(),
+                               config.setCurrentClientCertDetails(), config.clientCertFormat());
 }
 
 void ConnectionManagerUtility::mutateResponseHeaders(ResponseHeaderMap& response_headers,
                                                      const RequestHeaderMap* request_headers,
                                                      ConnectionManagerConfig& config,
                                                      const std::string& via,
+                                                     const StreamInfo::StreamInfo& stream_info,
+                                                     absl::string_view proxy_name,
                                                      bool clear_hop_by_hop) {
   if (request_headers != nullptr && Utility::isUpgrade(*request_headers) &&
       Utility::isUpgrade(response_headers)) {
@@ -466,7 +730,14 @@ void ConnectionManagerUtility::mutateResponseHeaders(ResponseHeaderMap& response
   }
   if (clear_hop_by_hop) {
     response_headers.removeTransferEncoding();
-    response_headers.removeKeepAlive();
+    // Only preserve Keep-Alive for HTTP/1.x downstream connections when the feature is enabled.
+    // Keep-Alive is an HTTP/1.1 hop-by-hop header with no meaning in HTTP/2 or HTTP/3.
+    const auto protocol = stream_info.protocol();
+    if (!Runtime::runtimeFeatureEnabled(
+            "envoy.reloadable_features.preserve_downstream_keepalive") ||
+        !protocol.has_value() || *protocol >= Protocol::Http2) {
+      response_headers.removeKeepAlive();
+    }
     response_headers.removeProxyConnection();
   }
 
@@ -476,6 +747,35 @@ void ConnectionManagerUtility::mutateResponseHeaders(ResponseHeaderMap& response
   }
   if (!via.empty()) {
     Utility::appendVia(response_headers, via);
+  }
+
+  setProxyStatusHeader(response_headers, config, stream_info, proxy_name);
+}
+
+void ConnectionManagerUtility::setProxyStatusHeader(ResponseHeaderMap& response_headers,
+                                                    const ConnectionManagerConfig& config,
+                                                    const StreamInfo::StreamInfo& stream_info,
+                                                    absl::string_view proxy_name) {
+  if (auto* proxy_status_config = config.proxyStatusConfig(); proxy_status_config != nullptr) {
+    // Writing the Proxy-Status header is gated on the existence of
+    // |proxy_status_config|. The |details| field and other internals are generated in
+    // fromStreamInfo().
+    if (std::optional<StreamInfo::ProxyStatusError> proxy_status =
+            StreamInfo::ProxyStatusUtils::fromStreamInfo(stream_info);
+        proxy_status.has_value()) {
+      response_headers.appendProxyStatus(
+          StreamInfo::ProxyStatusUtils::makeProxyStatusHeader(stream_info, *proxy_status,
+                                                              proxy_name, *proxy_status_config),
+          ", ");
+      // Apply the recommended response code, if configured and applicable.
+      if (proxy_status_config->set_recommended_response_code()) {
+        if (std::optional<Http::Code> response_code =
+                StreamInfo::ProxyStatusUtils::recommendedHttpStatusCode(*proxy_status);
+            response_code.has_value()) {
+          response_headers.setStatus(std::to_string(enumToInt(*response_code)));
+        }
+      }
+    }
   }
 }
 
@@ -493,11 +793,7 @@ ConnectionManagerUtility::maybeNormalizePath(RequestHeaderMap& request_headers,
       return NormalizePathAction::Reject;
     }
     // Check runtime override and throw away fragment from URI path
-    // TODO(yanavlasov): remove this override after deprecation period.
-    if (Runtime::runtimeFeatureEnabled(
-            "envoy.reloadable_features.http_strip_fragment_from_path_unsafe_if_disabled")) {
-      request_headers.setPath(request_headers.getPathValue().substr(0, fragment_pos));
-    }
+    request_headers.setPath(request_headers.getPathValue().substr(0, fragment_pos));
   }
 
   NormalizePathAction final_action = NormalizePathAction::Continue;
@@ -535,18 +831,18 @@ ConnectionManagerUtility::maybeNormalizePath(RequestHeaderMap& request_headers,
   return final_action;
 }
 
-absl::optional<uint32_t>
+std::optional<uint32_t>
 ConnectionManagerUtility::maybeNormalizeHost(RequestHeaderMap& request_headers,
                                              const ConnectionManagerConfig& config, uint32_t port) {
   if (config.shouldStripTrailingHostDot()) {
     HeaderUtility::stripTrailingHostDot(request_headers);
   }
   if (config.stripPortType() == Http::StripPortType::Any) {
-    return HeaderUtility::stripPortFromHost(request_headers, absl::nullopt);
+    return HeaderUtility::stripPortFromHost(request_headers, std::nullopt);
   } else if (config.stripPortType() == Http::StripPortType::MatchingHost) {
     return HeaderUtility::stripPortFromHost(request_headers, port);
   }
-  return absl::nullopt;
+  return std::nullopt;
 }
 
 } // namespace Http

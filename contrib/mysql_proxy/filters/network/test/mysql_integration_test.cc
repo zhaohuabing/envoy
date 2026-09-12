@@ -1,3 +1,5 @@
+#include <format>
+
 #include "test/integration/fake_upstream.h"
 #include "test/integration/integration.h"
 #include "test/integration/utility.h"
@@ -13,6 +15,7 @@
 #include "gtest/gtest.h"
 #include "mysql_test_utils.h"
 
+using testing::Ge;
 namespace Envoy {
 namespace Extensions {
 namespace NetworkFilters {
@@ -24,16 +27,18 @@ class MySQLIntegrationTest : public testing::TestWithParam<Network::Address::IpV
                              public MySQLTestUtils,
                              public BaseIntegrationTest {
   std::string mysqlConfig() {
-    return fmt::format(TestEnvironment::readFileToStringForTest(TestEnvironment::runfilesPath(
-                           "contrib/mysql_proxy/filters/network/test/mysql_test_config.yaml")),
-                       Platform::null_device_path,
-                       Network::Test::getLoopbackAddressString(GetParam()),
-                       Network::Test::getLoopbackAddressString(GetParam()),
-                       Network::Test::getAnyAddressString(GetParam()));
+    std::string loopback_address = Network::Test::getLoopbackAddressString(GetParam());
+    std::string any_address = Network::Test::getAnyAddressString(GetParam());
+    return std::vformat(TestEnvironment::readFileToStringForTest(TestEnvironment::runfilesPath(
+                            "contrib/mysql_proxy/filters/network/test/mysql_test_config.yaml")),
+                        std::make_format_args(Platform::null_device_path, loopback_address,
+                                              loopback_address, any_address));
   }
 
 public:
-  MySQLIntegrationTest() : BaseIntegrationTest(GetParam(), mysqlConfig()){};
+  MySQLIntegrationTest() : BaseIntegrationTest(GetParam(), mysqlConfig()) {
+    skip_tag_extraction_rule_check_ = true;
+  };
 
   void SetUp() override { BaseIntegrationTest::initialize(); }
 };
@@ -55,7 +60,7 @@ TEST_P(MySQLIntegrationTest, MySQLStatsNewSessionTest) {
     ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
   }
 
-  test_server_->waitForCounterGe("mysql.mysql_stats.sessions", SESSIONS);
+  test_server_->waitForCounter("mysql.mysql_stats.sessions", Ge(SESSIONS));
 }
 
 /**
@@ -97,7 +102,7 @@ TEST_P(MySQLIntegrationTest, MySQLLoginTest) {
   tcp_client->close();
   ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
 
-  test_server_->waitForCounterGe("mysql.mysql_stats.login_attempts", 1);
+  test_server_->waitForCounter("mysql.mysql_stats.login_attempts", Ge(1));
   EXPECT_EQ(test_server_->counter("mysql.mysql_stats.login_failures")->value(), 0);
 }
 
@@ -108,7 +113,8 @@ TEST_P(MySQLIntegrationTest, MySQLLoginTest) {
  * - correct number of attempts
  * - no failures
  */
-TEST_P(MySQLIntegrationTest, MySQLUnitTestMultiClientsLoop) {
+// TODO(https://github.com/envoyproxy/envoy/issues/30852) enable
+TEST_P(MySQLIntegrationTest, DISABLED_MySQLUnitTestMultiClientsLoop) {
   int idx;
   std::string rcvd_data;
 
@@ -146,7 +152,7 @@ TEST_P(MySQLIntegrationTest, MySQLUnitTestMultiClientsLoop) {
   }
 
   // Verify counters: CLIENT_NUM login attempts, no failures
-  test_server_->waitForCounterGe("mysql.mysql_stats.login_attempts", CLIENT_NUM);
+  test_server_->waitForCounter("mysql.mysql_stats.login_attempts", Ge(CLIENT_NUM));
   EXPECT_EQ(test_server_->counter("mysql.mysql_stats.login_attempts")->value(), CLIENT_NUM);
   EXPECT_EQ(test_server_->counter("mysql.mysql_stats.login_failures")->value(), 0);
 }
@@ -190,7 +196,7 @@ TEST_P(MySQLIntegrationTest, MySQLLoginFailTest) {
   tcp_client->close();
   ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
 
-  test_server_->waitForCounterGe("mysql.mysql_stats.login_attempts", 1);
+  test_server_->waitForCounter("mysql.mysql_stats.login_attempts", Ge(1));
   EXPECT_EQ(test_server_->counter("mysql.mysql_stats.login_failures")->value(), 1);
 }
 

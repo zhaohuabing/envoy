@@ -2,34 +2,12 @@ load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_contrib_extension",
     "envoy_cc_library",
-    "envoy_cmake",
     "envoy_contrib_package",
-)
-load(
-    "//contrib:all_contrib_extensions.bzl",
-    "envoy_contrib_linux_x86_64_constraints",
 )
 
 licenses(["notice"])  # Apache 2
 
 envoy_contrib_package()
-
-envoy_cmake(
-    name = "ipp-crypto",
-    cache_entries = {
-        "BORINGSSL": "on",
-    },
-    defines = [
-        "OPENSSL_USE_STATIC_LIBS=TRUE",
-    ],
-    lib_source = "@com_github_intel_ipp_crypto_crypto_mb//:all",
-    out_static_libs = ["libcrypto_mb.a"],
-    tags = ["skip_on_windows"],
-    target_compatible_with = envoy_contrib_linux_x86_64_constraints(),
-    visibility = ["//visibility:private"],
-    working_directory = "sources/ippcp/crypto_mb",
-    deps = ["@boringssl//:ssl"],
-)
 
 envoy_cc_library(
     name = "ipp_crypto_wrapper_lib",
@@ -50,7 +28,7 @@ envoy_cc_library(
     repository = "@envoy",
     deps = select({
         "//bazel:linux_x86_64": [
-            ":ipp-crypto",
+            "//bazel/deps:ipp-crypto",
         ],
         "//conditions:default": [],
     }),
@@ -68,6 +46,7 @@ envoy_cc_library(
     repository = "@envoy",
     visibility = ["//visibility:public"],
     deps = [
+        ":cryptomb_stats_lib",
         ":ipp_crypto_wrapper_lib",
         "//envoy/api:api_interface",
         "//envoy/event:dispatcher_interface",
@@ -80,6 +59,22 @@ envoy_cc_library(
         "//source/common/common:thread_lib",
         "//source/common/config:datasource_lib",
         "@envoy_api//contrib/envoy/extensions/private_key_providers/cryptomb/v3alpha:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "cryptomb_stats_lib",
+    srcs = [
+        "cryptomb_stats.cc",
+    ],
+    hdrs = [
+        "cryptomb_stats.h",
+    ],
+    deps = [
+        "//envoy/stats:stats_interface",
+        "//envoy/stats:stats_macros",
+        "//source/common/stats:symbol_table_lib",
+        "//source/common/stats:utility_lib",
     ],
 )
 

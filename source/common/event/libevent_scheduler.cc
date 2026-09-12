@@ -1,6 +1,10 @@
 #include "source/common/event/libevent_scheduler.h"
 
+#include <algorithm>
+#include <chrono>
+
 #include "source/common/common/assert.h"
+#include "source/common/event/evwatch_observer_manager_impl.h"
 #include "source/common/event/schedulable_cb_impl.h"
 #include "source/common/event/timer_impl.h"
 
@@ -15,7 +19,7 @@ void recordTimeval(Stats::Histogram& histogram, const timeval& tv) {
 }
 } // namespace
 
-LibeventScheduler::LibeventScheduler() {
+LibeventScheduler::LibeventScheduler(TimeSource& time_source) : time_source_(time_source) {
 #ifdef WIN32
   event_config* event_config = event_config_new();
   RELEASE_ASSERT(event_config != nullptr,
@@ -33,6 +37,30 @@ LibeventScheduler::LibeventScheduler() {
 
   // The dispatcher won't work as expected if libevent hasn't been configured to use threads.
   RELEASE_ASSERT(Libevent::Global::initialized(), "");
+
+  evwatch_manager_ = std::make_unique<EvwatchObserverManagerImpl>(*libevent_, time_source_);
+}
+
+LibeventScheduler::LibeventScheduler(TimeSource& time_source,
+                                     EvwatchObserverManagerPtr evwatch_manager)
+    : LibeventScheduler(time_source) {
+  if (evwatch_manager != nullptr) {
+    evwatch_manager_ = std::move(evwatch_manager);
+  }
+}
+
+LibeventScheduler::~LibeventScheduler() = default;
+
+void LibeventScheduler::registerEvwatchObserver(Evwatch::Observer& observer) {
+  if (evwatch_manager_ != nullptr) {
+    evwatch_manager_->registerObserver(observer);
+  }
+}
+
+void LibeventScheduler::unregisterEvwatchObserver(Evwatch::Observer& observer) {
+  if (evwatch_manager_ != nullptr) {
+    evwatch_manager_->unregisterObserver(observer);
+  }
 }
 
 TimerPtr LibeventScheduler::createTimer(const TimerCb& cb, Dispatcher& dispatcher) {
@@ -49,6 +77,7 @@ void LibeventScheduler::run(Dispatcher::RunType mode) {
   switch (mode) {
   case Dispatcher::RunType::NonBlock:
     flag = LibeventScheduler::flagsBasedOnEventType();
+    break;
   case Dispatcher::RunType::Block:
     // The default flags have 'block' behavior. See
     // http://www.wangafu.net/~nickm/libevent-book/Ref3_eventloop.html
@@ -64,10 +93,18 @@ void LibeventScheduler::loopExit() { event_base_loopexit(libevent_.get(), nullpt
 
 void LibeventScheduler::registerOnPrepareCallback(OnPrepareCallback&& callback) {
   ASSERT(callback);
-  ASSERT(!callback_);
+  ASSERT(!prepare_callback_);
 
-  callback_ = std::move(callback);
+  prepare_callback_ = std::move(callback);
   evwatch_prepare_new(libevent_.get(), &onPrepareForCallback, this);
+}
+
+void LibeventScheduler::registerOnCheckCallback(OnCheckCallback&& callback) {
+  ASSERT(callback);
+  ASSERT(!check_callback_);
+
+  check_callback_ = std::move(callback);
+  evwatch_check_new(libevent_.get(), &onCheckForCallback, this);
 }
 
 void LibeventScheduler::initializeStats(DispatcherStats* stats) {
@@ -80,7 +117,13 @@ void LibeventScheduler::initializeStats(DispatcherStats* stats) {
 void LibeventScheduler::onPrepareForCallback(evwatch*, const evwatch_prepare_cb_info*, void* arg) {
   // `self` is `this`, passed in from evwatch_prepare_new.
   auto self = static_cast<LibeventScheduler*>(arg);
-  self->callback_();
+  self->prepare_callback_();
+}
+
+void LibeventScheduler::onCheckForCallback(evwatch*, const evwatch_check_cb_info*, void* arg) {
+  // `self` is `this`, passed in from evwatch_prepare_new.
+  auto self = static_cast<LibeventScheduler*>(arg);
+  self->check_callback_();
 }
 
 void LibeventScheduler::onPrepareForStats(evwatch*, const evwatch_prepare_cb_info* info,

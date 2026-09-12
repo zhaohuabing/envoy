@@ -1,37 +1,46 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <list>
-#include <random>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "envoy/api/api.h"
 #include "envoy/buffer/buffer.h"
+#include "envoy/common/time.h"
+#include "envoy/config/subscription.h"
 #include "envoy/network/address.h"
+#include "envoy/network/dns.h"
+#include "envoy/server/factory_context.h"
+#include "envoy/server/overload/thread_local_overload_state.h"
+#include "envoy/stats/histogram.h"
+#include "envoy/stats/primitive_stats.h"
 #include "envoy/stats/stats.h"
 #include "envoy/stats/store.h"
-#include "envoy/thread/thread.h"
+#include "envoy/tracing/trace_context.h"
 #include "envoy/type/matcher/v3/string.pb.h"
 #include "envoy/type/v3/percent.pb.h"
 
-#include "source/common/buffer/buffer_impl.h"
-#include "source/common/common/c_smart_ptr.h"
+#include "source/common/common/assert.h"
 #include "source/common/common/empty_string.h"
-#include "source/common/common/thread.h"
 #include "source/common/config/decoded_resource_impl.h"
 #include "source/common/config/opaque_resource_decoder_impl.h"
 #include "source/common/http/header_map_impl.h"
+#include "source/common/protobuf/arena_wrapped_proto.h"
 #include "source/common/protobuf/message_validator_impl.h"
+#include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
-#include "source/common/stats/symbol_table_impl.h"
 
-#include "test/test_common/file_system_for_test.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/printers.h"
 #include "test/test_common/test_time_system.h"
-#include "test/test_common/thread_factory_for_test.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "gmock/gmock.h"
@@ -45,10 +54,20 @@ using testing::Invoke; //  NOLINT(misc-unused-using-decls)
 
 namespace Envoy {
 
-#if defined(__has_feature) && __has_feature(thread_sanitizer)
-#define TSAN_TIMEOUT_FACTOR 3
+namespace DeprecatedStatWaitHelpers {
+
+template <class... Args> constexpr bool always_false = false;
+
+} // namespace DeprecatedStatWaitHelpers
+
+#if defined(__has_feature) &&                                                                      \
+    (__has_feature(thread_sanitizer) || __has_feature(memory_sanitizer) ||                         \
+     __has_feature(address_sanitizer))
+#define TIMEOUT_FACTOR 3
+#elif defined(ENVOY_CONFIG_COVERAGE)
+#define TIMEOUT_FACTOR 3
 #else
-#define TSAN_TIMEOUT_FACTOR 1
+#define TIMEOUT_FACTOR 1
 #endif
 
 /*
@@ -129,18 +148,10 @@ public:
   static void callEnvoyBug() { ENVOY_BUG(false, ""); }
 };
 
-// Random number generator which logs its seed to stderr. To repeat a test run with a non-zero seed
-// one can run the test with --test_arg=--gtest_random_seed=[seed]
-class TestRandomGenerator {
-public:
-  TestRandomGenerator();
-
-  uint64_t random();
-
-private:
-  const int32_t seed_;
-  std::ranlux48 generator_;
-  RealTimeSource real_time_source_;
+// See https://github.com/envoyproxy/envoy/issues/21245.
+enum class Http1ParserImpl {
+  HttpParser, // http-parser from node.js
+  BalsaParser // Balsa from QUICHE
 };
 
 class TestUtility {
@@ -180,9 +191,10 @@ public:
    * @param buffer supplies the buffer to be fed.
    * @param n_char number of characters that should be added to the supplied buffer.
    * @param seed seeds pseudo-random number generator (default = 0).
+   * @param n_slice number of slices (default = 1).
    */
   static void feedBufferWithRandomCharacters(Buffer::Instance& buffer, uint64_t n_char,
-                                             uint64_t seed = 0);
+                                             uint64_t seed = 0, uint64_t n_slice = 1);
 
   /**
    * Finds a stat in a vector with the given name.
@@ -225,66 +237,81 @@ public:
                                                        const std::string& name);
 
   /**
-   * Wait for a counter to == a given value.
+   * Wait for a counter to match a given value matcher.
    * @param store supplies the stats store.
    * @param name supplies the name of the counter to wait for.
-   * @param value supplies the value of the counter.
+   * @param value_matcher supplies the value matcher for the counter.
    * @param time_system the time system to use for waiting.
    * @param timeout the maximum time to wait before timing out, or 0 for no timeout.
    * @param dispatcher the dispatcher to run non-blocking periodically during the wait.
-   * @return AssertionSuccess() if the counter was == to the value within the timeout, else
+   * @return AssertionSuccess() if the counter matched within the timeout, else
    * AssertionFailure().
    */
   static AssertionResult
-  waitForCounterEq(Stats::Store& store, const std::string& name, uint64_t value,
-                   Event::TestTimeSystem& time_system,
-                   std::chrono::milliseconds timeout = std::chrono::milliseconds::zero(),
-                   Event::Dispatcher* dispatcher = nullptr);
+  waitForCounter(Stats::Store& store, const std::string& name,
+                 testing::Matcher<uint64_t> value_matcher, Event::TestTimeSystem& time_system,
+                 std::chrono::milliseconds timeout = std::chrono::milliseconds::zero(),
+                 Event::Dispatcher* dispatcher = nullptr);
+
+  template <class... Args> static AssertionResult waitForCounterEq(Args&&...) {
+    static_assert(DeprecatedStatWaitHelpers::always_false<Args...>,
+                  "TestUtility::waitForCounterEq was removed; use "
+                  "TestUtility::waitForCounter(..., testing::Eq(value), ...) instead.");
+    return AssertionFailure();
+  }
+
+  template <class... Args> static AssertionResult waitForCounterGe(Args&&...) {
+    static_assert(DeprecatedStatWaitHelpers::always_false<Args...>,
+                  "TestUtility::waitForCounterGe was removed; use "
+                  "TestUtility::waitForCounter(..., testing::Ge(value), ...) instead.");
+    return AssertionFailure();
+  }
 
   /**
-   * Wait for a counter to >= a given value.
-   * @param store supplies the stats store.
-   * @param name counter name.
-   * @param value target value.
+   * Wait for a proactive resource usage in the overload manager to be == a given value.
+   * @param overload_state used to lookup corresponding proactive resource.
+   * @param resource_name name of the proactive resource to lookup.
+   * @param expected_value target resource usage value.
    * @param time_system the time system to use for waiting.
-   * @param timeout the maximum time to wait before timing out, or 0 for no timeout.
-   * @return AssertionSuccess() if the counter was >= to the value within the timeout, else
+   * @param dispatcher the dispatcher to run non-blocking periodically during the wait.
+   * @param timeout the maximum time to wait before timing out.
+   * @return AssertionSuccess() if the resource usage was == to the value within the timeout, else
    * AssertionFailure().
    */
-  static AssertionResult
-  waitForCounterGe(Stats::Store& store, const std::string& name, uint64_t value,
-                   Event::TestTimeSystem& time_system,
-                   std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+  static AssertionResult waitForProactiveOverloadResourceUsageEq(
+      Server::ThreadLocalOverloadState& overload_state,
+      const Server::OverloadProactiveResourceName resource_name, int64_t expected_value,
+      Event::TestTimeSystem& time_system, Event::Dispatcher& dispatcher,
+      std::chrono::milliseconds timeout);
 
   /**
-   * Wait for a gauge to >= a given value.
+   * Wait for a gauge to match a given value matcher.
    * @param store supplies the stats store.
    * @param name gauge name.
-   * @param value target value.
+   * @param value_matcher supplies the value matcher for the gauge.
    * @param time_system the time system to use for waiting.
    * @param timeout the maximum time to wait before timing out, or 0 for no timeout.
-   * @return AssertionSuccess() if the counter gauge >= to the value within the timeout, else
+   * @return AssertionSuccess() if the gauge matched within the timeout, else
    * AssertionFailure().
    */
   static AssertionResult
-  waitForGaugeGe(Stats::Store& store, const std::string& name, uint64_t value,
-                 Event::TestTimeSystem& time_system,
-                 std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+  waitForGauge(Stats::Store& store, const std::string& name,
+               testing::Matcher<uint64_t> value_matcher, Event::TestTimeSystem& time_system,
+               std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
 
-  /**
-   * Wait for a gauge to == a given value.
-   * @param store supplies the stats store.
-   * @param name gauge name.
-   * @param value target value.
-   * @param time_system the time system to use for waiting.
-   * @param timeout the maximum time to wait before timing out, or 0 for no timeout.
-   * @return AssertionSuccess() if the gauge was == to the value within the timeout, else
-   * AssertionFailure().
-   */
-  static AssertionResult
-  waitForGaugeEq(Stats::Store& store, const std::string& name, uint64_t value,
-                 Event::TestTimeSystem& time_system,
-                 std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+  template <class... Args> static AssertionResult waitForGaugeEq(Args&&...) {
+    static_assert(DeprecatedStatWaitHelpers::always_false<Args...>,
+                  "TestUtility::waitForGaugeEq was removed; use "
+                  "TestUtility::waitForGauge(..., testing::Eq(value), ...) instead.");
+    return AssertionFailure();
+  }
+
+  template <class... Args> static AssertionResult waitForGaugeGe(Args&&...) {
+    static_assert(DeprecatedStatWaitHelpers::always_false<Args...>,
+                  "TestUtility::waitForGaugeGe was removed; use "
+                  "TestUtility::waitForGauge(..., testing::Ge(value), ...) instead.");
+    return AssertionFailure();
+  }
 
   /**
    * Wait for a gauge to be destroyed.
@@ -312,6 +339,20 @@ public:
       std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
 
   /**
+   * Wait for a histogram to have samples.
+   * @param store supplies the stats store.
+   * @param name histogram name.
+   * @param time_system the time system to use for waiting.
+   * @param timeout the maximum time to wait before timing out, or 0 for no timeout.
+   * @return AssertionSuccess() if the histogram was populated within the timeout, else
+   * AssertionFailure().
+   */
+  static AssertionResult waitForNumHistogramSamplesGe(
+      Stats::Store& store, const std::string& name, uint64_t min_sample_count_required,
+      Event::TestTimeSystem& time_system, Event::Dispatcher& main_dispatcher,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+
+  /**
    * Read a histogram's sample count from the main thread.
    * @param store supplies the stats store.
    * @param name histogram name.
@@ -319,6 +360,14 @@ public:
    */
   static uint64_t readSampleCount(Event::Dispatcher& main_dispatcher,
                                   const Stats::ParentHistogram& histogram);
+  /**
+   * Read a histogram's sum from the main thread.
+   * @param store supplies the stats store.
+   * @param name histogram name.
+   * @return double the sample sum.
+   */
+  static double readSampleSum(Event::Dispatcher& main_dispatcher,
+                              const Stats::ParentHistogram& histogram);
 
   /**
    * Find a readout in a stats store.
@@ -350,11 +399,9 @@ public:
    *
    * @return a filename based on the process id and current time.
    */
+  static std::string uniqueFilename(absl::string_view prefix = "");
 
-  static std::string uniqueFilename() {
-    return absl::StrCat(getpid(), "_", std::chrono::system_clock::now().time_since_epoch().count());
-  }
-
+#if defined(ENVOY_ENABLE_FULL_PROTOS)
   /**
    * Compare two protos of the same type for equality.
    *
@@ -396,25 +443,7 @@ public:
            lhs.version() == rhs.version() && lhs.hasResource() == rhs.hasResource() &&
            (!lhs.hasResource() || protoEqual(lhs.resource(), rhs.resource()));
   }
-
-  /**
-   * Compare two JSON strings serialized from ProtobufWkt::Struct for equality. When two identical
-   * ProtobufWkt::Struct are serialized into JSON strings, the results have the same set of
-   * properties (values), but the positions may be different.
-   *
-   * @param lhs JSON string on LHS.
-   * @param rhs JSON string on RHS.
-   * @param support_root_array Whether to support parsing JSON arrays.
-   * @return bool indicating whether the JSON strings are equal.
-   */
-  static bool jsonStringEqual(const std::string& lhs, const std::string& rhs,
-                              bool support_root_array = false) {
-    if (!support_root_array) {
-      return protoEqual(jsonToStruct(lhs), jsonToStruct(rhs));
-    }
-
-    return protoEqual(jsonArrayToStruct(lhs), jsonArrayToStruct(rhs));
-  }
+#endif
 
   /**
    * Symmetrically pad a string with '=' out to a desired length.
@@ -443,6 +472,7 @@ public:
   static std::vector<std::string> split(const std::string& source, const std::string& split,
                                         bool keep_empty_string = false);
 
+#if defined(ENVOY_ENABLE_FULL_PROTOS)
   /**
    * Compare two RepeatedPtrFields of the same type for equality.
    *
@@ -507,6 +537,7 @@ public:
 
     return AssertionSuccess();
   }
+#endif
 
   /**
    * Returns a "novel" IPv4 loopback address, if available.
@@ -523,15 +554,19 @@ public:
 #endif
   }
 
-  /**
-   * Return typed proto message object for YAML.
-   * @param yaml YAML string.
-   * @return MessageType parsed from yaml.
-   */
-  template <class MessageType> static MessageType parseYaml(const std::string& yaml) {
-    MessageType message;
-    TestUtility::loadFromYaml(yaml, message);
-    return message;
+  // Allows pretty printed test names.
+  static std::string http1ParserImplToString(Http1ParserImpl impl) {
+    switch (impl) {
+    case Http1ParserImpl::HttpParser:
+      return "HttpParser";
+    case Http1ParserImpl::BalsaParser:
+      return "BalsaParser";
+    }
+    return "UnknownHttp1Impl";
+  }
+
+  static std::string ipVersionToString(Network::Address::IpVersion ip_version) {
+    return ip_version == Network::Address::IpVersion::v4 ? "IPv4" : "IPv6";
   }
 
   // Allows pretty printed test names for TEST_P using TestEnvironment::getIpVersionsForTest().
@@ -540,7 +575,7 @@ public:
   // instead of IpVersions/SslSocketTest.HalfClose/1
   static std::string
   ipTestParamsToString(const ::testing::TestParamInfo<Network::Address::IpVersion>& params) {
-    return params.param == Network::Address::IpVersion::v4 ? "IPv4" : "IPv6";
+    return ipVersionToString(params.param);
   }
 
   /**
@@ -565,7 +600,8 @@ public:
   static std::string convertTime(const std::string& input, const std::string& input_format,
                                  const std::string& output_format);
 
-  static constexpr std::chrono::milliseconds DefaultTimeout = std::chrono::milliseconds(10000);
+  static constexpr std::chrono::milliseconds DefaultTimeout =
+      std::chrono::milliseconds(10000) * TIMEOUT_FACTOR;
 
   /**
    * Return a prefix string matcher.
@@ -619,65 +655,19 @@ public:
    */
   static std::string nonZeroedGauges(const std::vector<Stats::GaugeSharedPtr>& gauges);
 
-  // Strict variants of Protobuf::MessageUtil
-  static void loadFromJson(const std::string& json, Protobuf::Message& message) {
-    MessageUtil::loadFromJson(json, message, ProtobufMessage::getStrictValidationVisitor());
-  }
-
-  static void loadFromJson(const std::string& json, ProtobufWkt::Struct& message) {
-    MessageUtil::loadFromJson(json, message);
-  }
-
-  static void loadFromYaml(const std::string& yaml, Protobuf::Message& message) {
-    MessageUtil::loadFromYaml(yaml, message, ProtobufMessage::getStrictValidationVisitor());
-  }
-
-  static void loadFromFile(const std::string& path, Protobuf::Message& message, Api::Api& api) {
-    MessageUtil::loadFromFile(path, message, ProtobufMessage::getStrictValidationVisitor(), api);
-  }
-
-  template <class MessageType>
-  static inline MessageType anyConvert(const ProtobufWkt::Any& message) {
+  template <class MessageType> static inline MessageType anyConvert(const Protobuf::Any& message) {
     return MessageUtil::anyConvert<MessageType>(message);
   }
 
   template <class MessageType>
-  static void loadFromYamlAndValidate(const std::string& yaml, MessageType& message) {
-    MessageUtil::loadFromYamlAndValidate(yaml, message,
-                                         ProtobufMessage::getStrictValidationVisitor());
-  }
-
-  template <class MessageType> static void validate(const MessageType& message) {
-    MessageUtil::validate(message, ProtobufMessage::getStrictValidationVisitor());
+  static void validate(const MessageType& message, bool recurse_into_any = false) {
+    MessageUtil::validate(message, ProtobufMessage::getStrictValidationVisitor(), recurse_into_any);
   }
 
   template <class MessageType>
   static const MessageType& downcastAndValidate(const Protobuf::Message& config) {
     return MessageUtil::downcastAndValidate<MessageType>(
         config, ProtobufMessage::getStrictValidationVisitor());
-  }
-
-  static void jsonConvert(const Protobuf::Message& source, Protobuf::Message& dest) {
-    // Explicit round-tripping to support conversions inside tests between arbitrary messages as a
-    // convenience.
-    ProtobufWkt::Struct tmp;
-    MessageUtil::jsonConvert(source, tmp);
-    MessageUtil::jsonConvert(tmp, ProtobufMessage::getStrictValidationVisitor(), dest);
-  }
-
-  static ProtobufWkt::Struct jsonToStruct(const std::string& json) {
-    ProtobufWkt::Struct message;
-    MessageUtil::loadFromJson(json, message);
-    return message;
-  }
-
-  static ProtobufWkt::Struct jsonArrayToStruct(const std::string& json) {
-    // Hacky: add a surrounding root message, allowing JSON to be parsed into a struct.
-    std::string root_message = absl::StrCat("{ \"testOnlyArrayRoot\": ", json, "}");
-
-    ProtobufWkt::Struct message;
-    MessageUtil::loadFromJson(root_message, message);
-    return message;
   }
 
   /**
@@ -688,7 +678,7 @@ public:
   static std::string getProtobufBinaryStringFromMessage(const Protobuf::Message& message) {
     std::string pb_binary_str;
     pb_binary_str.reserve(message.ByteSizeLong());
-    message.SerializeToString(&pb_binary_str);
+    std::ignore = message.SerializeToString(&pb_binary_str);
     return pb_binary_str;
   }
 
@@ -698,7 +688,7 @@ public:
                   const std::string& name_field = "name") {
     Config::DecodedResourcesWrapper decoded_resources;
     for (const auto& resource : resources) {
-      auto owned_resource = std::make_unique<MessageType>(resource);
+      auto owned_resource = ArenaWrappedProto<MessageType>(resource);
       decoded_resources.owned_resources_.emplace_back(new Config::DecodedResourceImpl(
           std::move(owned_resource), MessageUtil::getStringField(resource, name_field), {}, ""));
       decoded_resources.refvec_.emplace_back(*decoded_resources.owned_resources_.back());
@@ -711,7 +701,7 @@ public:
                                                          const std::string& name_field = "name") {
     Config::DecodedResourcesWrapper decoded_resources;
     for (const auto& resource : resources) {
-      auto owned_resource = std::make_unique<MessageType>(resource);
+      auto owned_resource = ArenaWrappedProto<MessageType>(resource);
       decoded_resources.owned_resources_.emplace_back(new Config::DecodedResourceImpl(
           std::move(owned_resource), MessageUtil::getStringField(resource, name_field), {}, ""));
       decoded_resources.refvec_.emplace_back(*decoded_resources.owned_resources_.back());
@@ -721,10 +711,28 @@ public:
 
   template <class MessageType>
   static Config::DecodedResourcesWrapper
-  decodeResources(const Protobuf::RepeatedPtrField<ProtobufWkt::Any>& resources,
+  decodeResources(absl::flat_hash_map<std::string, MessageType> resources) {
+    Config::DecodedResourcesWrapper decoded_resources;
+    for (const auto& [name, resource] : resources) {
+      auto owned_resource = ArenaWrappedProto<MessageType>(resource);
+      decoded_resources.owned_resources_.emplace_back(
+          new Config::DecodedResourceImpl(std::move(owned_resource), name, {}, ""));
+      decoded_resources.refvec_.emplace_back(*decoded_resources.owned_resources_.back());
+    }
+    return decoded_resources;
+  }
+
+  template <class MessageType>
+  static Config::DecodedResourcesWrapper
+  decodeResources(const Protobuf::RepeatedPtrField<Protobuf::Any>& resources,
                   const std::string& version, const std::string& name_field = "name") {
     TestOpaqueResourceDecoderImpl<MessageType> resource_decoder(name_field);
-    return Config::DecodedResourcesWrapper(resource_decoder, resources, version);
+    std::unique_ptr<Config::DecodedResourcesWrapper> tmp_wrapper =
+        *Config::DecodedResourcesWrapper::create(resource_decoder, resources, version);
+    Config::DecodedResourcesWrapper ret;
+    ret.owned_resources_ = std::move(tmp_wrapper->owned_resources_);
+    ret.refvec_ = std::move(tmp_wrapper->refvec_);
+    return ret;
   }
 
   template <class MessageType>
@@ -773,9 +781,88 @@ public:
     case envoy::config::core::v3::ApiVersion::V3:
       return "V3";
     default:
-      NOT_REACHED_GCOVR_EXCL_LINE;
+      PANIC("reached unexpected code");
     }
   }
+
+#ifdef ENVOY_ENABLE_YAML
+  /**
+   * Compare two JSON strings serialized from Protobuf::Struct for equality. When two identical
+   * Protobuf::Struct are serialized into JSON strings, the results have the same set of
+   * properties (values), but the positions may be different.
+   *
+   * @param lhs JSON string on LHS.
+   * @param rhs JSON string on RHS.
+   * @param support_root_array Whether to support parsing JSON arrays.
+   * @return bool indicating whether the JSON strings are equal.
+   */
+  static bool jsonStringEqual(const std::string& lhs, const std::string& rhs,
+                              bool support_root_array = false) {
+    if (!support_root_array) {
+      return protoEqual(jsonToStruct(lhs), jsonToStruct(rhs));
+    }
+
+    return protoEqual(jsonArrayToStruct(lhs), jsonArrayToStruct(rhs));
+  }
+
+  /**
+   * Return typed proto message object for YAML.
+   * @param yaml YAML string.
+   * @return MessageType parsed from yaml.
+   */
+  template <class MessageType> static MessageType parseYaml(const std::string& yaml) {
+    MessageType message;
+    TestUtility::loadFromYaml(yaml, message);
+    return message;
+  }
+
+  // Strict variants of Protobuf::MessageUtil
+  static void loadFromJson(const std::string& json, Protobuf::Message& message) {
+    MessageUtil::loadFromJson(json, message, ProtobufMessage::getStrictValidationVisitor());
+  }
+
+  static void loadFromJson(const std::string& json, Protobuf::Struct& message) {
+    MessageUtil::loadFromJson(json, message);
+  }
+
+  static void loadFromYaml(const std::string& yaml, Protobuf::Message& message) {
+    MessageUtil::loadFromYaml(yaml, message, ProtobufMessage::getStrictValidationVisitor());
+  }
+
+  static void loadFromFile(const std::string& path, Protobuf::Message& message, Api::Api& api) {
+    THROW_IF_NOT_OK(MessageUtil::loadFromFile(path, message,
+                                              ProtobufMessage::getStrictValidationVisitor(), api));
+  }
+
+  static void jsonConvert(const Protobuf::Message& source, Protobuf::Message& dest) {
+    // Explicit round-tripping to support conversions inside tests between arbitrary messages as a
+    // convenience.
+    Protobuf::Struct tmp;
+    MessageUtil::jsonConvert(source, tmp);
+    MessageUtil::jsonConvert(tmp, ProtobufMessage::getStrictValidationVisitor(), dest);
+  }
+
+  static Protobuf::Struct jsonToStruct(const std::string& json) {
+    Protobuf::Struct message;
+    MessageUtil::loadFromJson(json, message);
+    return message;
+  }
+
+  static Protobuf::Struct jsonArrayToStruct(const std::string& json) {
+    // Hacky: add a surrounding root message, allowing JSON to be parsed into a struct.
+    std::string root_message = absl::StrCat("{ \"testOnlyArrayRoot\": ", json, "}");
+
+    Protobuf::Struct message;
+    MessageUtil::loadFromJson(root_message, message);
+    return message;
+  }
+
+  template <class MessageType>
+  static void loadFromYamlAndValidate(const std::string& yaml, MessageType& message) {
+    MessageUtil::loadFromYamlAndValidate(yaml, message,
+                                         ProtobufMessage::getStrictValidationVisitor());
+  }
+#endif
 };
 
 /**
@@ -821,13 +908,27 @@ namespace Tracing {
 
 class TestTraceContextImpl : public Tracing::TraceContext {
 public:
+  TestTraceContextImpl() = default;
   TestTraceContextImpl(const std::initializer_list<std::pair<std::string, std::string>>& values) {
     for (const auto& value : values) {
       context_map_[value.first] = value.second;
     }
+    // Backwards compatibility for tracing tests.
+    if (context_map_.contains(":protocol")) {
+      context_protocol_ = context_map_[":protocol"];
+    }
+    if (context_map_.contains(":authority")) {
+      context_host_ = context_map_[":authority"];
+    }
+    if (context_map_.contains(":path")) {
+      context_path_ = context_map_[":path"];
+    }
+    if (context_map_.contains(":method")) {
+      context_method_ = context_map_[":method"];
+    }
   }
   absl::string_view protocol() const override { return context_protocol_; }
-  absl::string_view authority() const override { return context_authority_; }
+  absl::string_view host() const override { return context_host_; }
   absl::string_view path() const override { return context_path_; }
   absl::string_view method() const override { return context_method_; }
   void forEach(IterateCallback callback) const override {
@@ -837,26 +938,57 @@ public:
       }
     }
   }
-  absl::optional<absl::string_view> getByKey(absl::string_view key) const override {
+  std::optional<absl::string_view> get(absl::string_view key) const override {
     auto iter = context_map_.find(key);
     if (iter == context_map_.end()) {
-      return absl::nullopt;
+      return std::nullopt;
     }
     return iter->second;
   }
-  void setByKey(absl::string_view key, absl::string_view val) override {
+
+  void set(absl::string_view key, absl::string_view val) override {
     context_map_.insert({std::string(key), std::string(val)});
   }
-  void setByReferenceKey(absl::string_view key, absl::string_view val) override {
-    setByKey(key, val);
-  }
-  void setByReference(absl::string_view key, absl::string_view val) override { setByKey(key, val); }
+  void remove(absl::string_view key) override { context_map_.erase(std::string(key)); }
 
   std::string context_protocol_;
-  std::string context_authority_;
+  std::string context_host_;
   std::string context_path_;
   std::string context_method_;
   absl::flat_hash_map<std::string, std::string> context_map_;
+};
+
+class TestRequestHeaderTraceContextImpl : public Tracing::TraceContext {
+public:
+  TestRequestHeaderTraceContextImpl(Http::RequestHeaderMap& request_headers)
+      : request_headers_(request_headers) {}
+
+  absl::string_view protocol() const override { return request_headers_.getProtocolValue(); }
+  absl::string_view host() const override { return request_headers_.getHostValue(); }
+  absl::string_view path() const override { return request_headers_.getPathValue(); }
+  absl::string_view method() const override { return request_headers_.getMethodValue(); }
+  void forEach(IterateCallback callback) const override {
+    request_headers_.iterate([cb = std::move(callback)](const Http::HeaderEntry& entry) {
+      if (cb(entry.key().getStringView(), entry.value().getStringView())) {
+        return Http::HeaderMap::Iterate::Continue;
+      }
+      return Http::HeaderMap::Iterate::Break;
+    });
+  }
+  std::optional<absl::string_view> get(absl::string_view key) const override {
+    Http::LowerCaseString lower_key{std::string(key)};
+    const auto entry = request_headers_.get(lower_key);
+    if (!entry.empty()) {
+      return entry[0]->value().getStringView();
+    }
+    return std::nullopt;
+  }
+  void set(absl::string_view, absl::string_view) override {}
+  void remove(absl::string_view) override {}
+  OptRef<const Http::RequestHeaderMap> requestHeaders() const override { return request_headers_; };
+  OptRef<Http::RequestHeaderMap> requestHeaders() override { return request_headers_; };
+
+  Http::RequestHeaderMap& request_headers_;
 };
 
 } // namespace Tracing
@@ -915,6 +1047,19 @@ public:
     }
     header_map_->verifyByteSizeInternalForTest();
   }
+  TestHeaderMapImplBase(const std::initializer_list<std::pair<std::string, std::string>>& values,
+                        const uint32_t max_headers_kb, const uint32_t max_headers_count) {
+    if (header_map_) {
+      header_map_.reset();
+    }
+    header_map_ = Impl::create(max_headers_kb, max_headers_count);
+
+    for (auto& value : values) {
+      header_map_->addCopy(LowerCaseString(value.first), value.second);
+    }
+    header_map_->verifyByteSizeInternalForTest();
+  }
+
   TestHeaderMapImplBase(const TestHeaderMapImplBase& rhs)
       : TestHeaderMapImplBase(*rhs.header_map_) {}
   TestHeaderMapImplBase(const HeaderMap& rhs) {
@@ -957,6 +1102,9 @@ public:
   // HeaderMap
   bool operator==(const HeaderMap& rhs) const override { return header_map_->operator==(rhs); }
   bool operator!=(const HeaderMap& rhs) const override { return header_map_->operator!=(rhs); }
+
+  bool operator==(const TestHeaderMapImplBase& rhs) const { return header_map_->operator==(rhs); }
+  bool operator!=(const TestHeaderMapImplBase& rhs) const { return header_map_->operator!=(rhs); }
   void addViaMove(HeaderString&& key, HeaderString&& value) override {
     header_map_->addViaMove(std::move(key), std::move(value));
     header_map_->verifyByteSizeInternalForTest();
@@ -997,6 +1145,8 @@ public:
     header_map_->verifyByteSizeInternalForTest();
   }
   uint64_t byteSize() const override { return header_map_->byteSize(); }
+  uint32_t maxHeadersKb() const override { return header_map_->maxHeadersKb(); }
+  uint32_t maxHeadersCount() const override { return header_map_->maxHeadersCount(); }
   HeaderMap::GetResult get(const LowerCaseString& key) const override {
     return header_map_->get(key);
   }
@@ -1074,37 +1224,6 @@ public:
   INLINE_REQ_NUMERIC_HEADERS(DEFINE_TEST_INLINE_NUMERIC_HEADER_FUNCS)
   INLINE_REQ_RESP_STRING_HEADERS(DEFINE_TEST_INLINE_STRING_HEADER_FUNCS)
   INLINE_REQ_RESP_NUMERIC_HEADERS(DEFINE_TEST_INLINE_NUMERIC_HEADER_FUNCS)
-
-  // Tracing::TraceContext
-  absl::string_view protocol() const override { return header_map_->getProtocolValue(); }
-  absl::string_view authority() const override { return header_map_->getHostValue(); }
-  absl::string_view path() const override { return header_map_->getPathValue(); }
-  absl::string_view method() const override { return header_map_->getMethodValue(); }
-  void forEach(IterateCallback callback) const override {
-    ASSERT(header_map_);
-    header_map_->iterate([cb = std::move(callback)](const HeaderEntry& entry) {
-      if (cb(entry.key().getStringView(), entry.value().getStringView())) {
-        return HeaderMap::Iterate::Continue;
-      }
-      return HeaderMap::Iterate::Break;
-    });
-  }
-  absl::optional<absl::string_view> getByKey(absl::string_view key) const override {
-    ASSERT(header_map_);
-    return header_map_->getByKey(key);
-  }
-  void setByKey(absl::string_view key, absl::string_view value) override {
-    ASSERT(header_map_);
-    header_map_->setByKey(key, value);
-  }
-  void setByReference(absl::string_view key, absl::string_view val) override {
-    ASSERT(header_map_);
-    header_map_->setByReference(key, val);
-  }
-  void setByReferenceKey(absl::string_view key, absl::string_view val) override {
-    ASSERT(header_map_);
-    header_map_->setByReferenceKey(key, val);
-  }
 };
 
 using TestRequestTrailerMapImpl = TestHeaderMapImplBase<RequestTrailerMap, RequestTrailerMapImpl>;
@@ -1156,10 +1275,16 @@ ApiPtr createApiForTest(Stats::Store& stat_store, Event::TimeSystem& time_system
 class MessageTrackedObject : public ScopeTrackedObject {
 public:
   MessageTrackedObject(absl::string_view sv) : sv_(sv) {}
+  MessageTrackedObject(absl::string_view sv, const StreamInfo::StreamInfo& tracked_stream)
+      : sv_(sv), tracked_stream_(tracked_stream) {}
+
+  OptRef<const StreamInfo::StreamInfo> trackedStream() const override { return tracked_stream_; }
+
   void dumpState(std::ostream& os, int /*indent_level*/) const override { os << sv_; }
 
 private:
   absl::string_view sv_;
+  OptRef<const StreamInfo::StreamInfo> tracked_stream_;
 };
 
 MATCHER_P(HeaderMapEqualIgnoreOrder, expected, "") {
@@ -1176,6 +1301,7 @@ MATCHER_P(HeaderMapEqualIgnoreOrder, expected, "") {
   return equal;
 }
 
+#if defined(ENVOY_ENABLE_FULL_PROTOS)
 MATCHER_P(ProtoEq, expected, "") {
   const bool equal =
       TestUtility::protoEqual(arg, expected, /*ignore_repeated_field_ordering=*/false);
@@ -1272,6 +1398,9 @@ MATCHER_P(Percent, rhs, "") {
   return TestUtility::protoEqual(expected, arg, /*ignore_repeated_field_ordering=*/false);
 }
 
+#endif
+
+#ifdef ENVOY_ENABLE_YAML
 MATCHER_P(JsonStringEq, expected, "") {
   const bool equal = TestUtility::jsonStringEqual(arg, expected);
   if (!equal) {
@@ -1285,5 +1414,29 @@ MATCHER_P(JsonStringEq, expected, "") {
   }
   return equal;
 }
+#endif
+
+#ifdef WIN32
+#define DISABLE_UNDER_WINDOWS return
+#else
+#define DISABLE_UNDER_WINDOWS                                                                      \
+  do {                                                                                             \
+  } while (0)
+#endif
+
+/**
+ * ScopedThreadLocalSingletonSetter is a helper class for setting a thread local server context for
+ * the duration of the lifetime of the object. The backing instance of singleton is owned by the
+ * caller.
+ */
+class ScopedThreadLocalServerContextSetter {
+public:
+  ~ScopedThreadLocalServerContextSetter() {
+    Server::Configuration::ServerFactoryContextInstance::clear();
+  }
+  ScopedThreadLocalServerContextSetter(Server::Configuration::ServerFactoryContext& context) {
+    Server::Configuration::ServerFactoryContextInstance::initialize(&context);
+  }
+};
 
 } // namespace Envoy

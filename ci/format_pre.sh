@@ -1,4 +1,6 @@
-#!/bin/bash -E
+#!/usr/bin/env bash
+
+set -E
 
 # Pre-checks for validation and linting
 #
@@ -10,9 +12,10 @@ CURRENT=""
 # AZP appears to make lines with this prefix red
 BASH_ERR_PREFIX="##[error]: "
 
-DIFF_OUTPUT="${DIFF_OUTPUT:-/build/fix_format_pre.diff}"
+DIFF_OUTPUT="${DIFF_OUTPUT:-/build/fix_format.diff}"
 
-read -ra BAZEL_BUILD_OPTIONS <<< "${BAZEL_BUILD_OPTIONS:-}"
+read -ra BAZEL_STARTUP_OPTIONS <<< "${BAZEL_STARTUP_OPTION_LIST:-}"
+read -ra BAZEL_BUILD_OPTIONS <<< "${BAZEL_BUILD_OPTION_LIST:-}"
 
 
 trap_errors () {
@@ -26,12 +29,12 @@ trap_errors () {
             FAILED+=("  > ${sub}@ ${file} :${line}")
         else
             FAILED+=("${sub}@ ${file} :${line}${command}")
-            if [[ "$CURRENT" == "glint" ]]; then
+            if [[ "$CURRENT" == "check" ]]; then
+                # shellcheck disable=SC2016
                 FAILED+=(
-                    "    Please fix your editor to ensure:"
-                    "      - no trailing whitespace"
-                    "      - no mixed tabs/spaces"
-                    "      - all files end with a newline")
+                    ""
+                    '   *Code formatting check failed*: please search above logs for `CodeChecker ERROR`'
+                    "")
             fi
         fi
         ((frame++))
@@ -42,33 +45,42 @@ trap_errors () {
 trap trap_errors ERR
 trap exit 1 INT
 
-# TODO: move these to bazel
-CURRENT=glint
-"${ENVOY_SRCDIR}"/tools/code_format/glint.sh
-
-CURRENT=shellcheck
-"${ENVOY_SRCDIR}"/tools/code_format/check_shellcheck_format.sh check
-
-CURRENT=configs
-bazel run "${BAZEL_BUILD_OPTIONS[@]}" //configs:example_configs_validation
-
-CURRENT=python
-bazel run "${BAZEL_BUILD_OPTIONS[@]}" //tools/code_format:python_check -- --diff-file="$DIFF_OUTPUT" --fix
-
-CURRENT=extensions
-bazel run "${BAZEL_BUILD_OPTIONS[@]}" //tools/extensions:extensions_check
+CURRENT=check
+# This test runs code check with:
+#   bazel run //tools/code:check -- --fix -v warn -x mobile/dist/envoy-pom.xml
+# see: /tools/code/BUILD
+bazel "${BAZEL_STARTUP_OPTIONS[@]}" test "${BAZEL_BUILD_OPTIONS[@]}" //tools/code:check_test
 
 CURRENT=spelling
-"${ENVOY_SRCDIR}"/tools/spelling/check_spelling_pedantic.py --mark check
+bazel "${BAZEL_STARTUP_OPTIONS[@]}" run "${BAZEL_BUILD_OPTIONS[@]}" //tools/spelling:check_spelling_pedantic -- --mark check --target_root="$PWD"
 
-CURRENT=rst
-# TODO(phlax): Move this to general docs checking of all rst files
-bazel run "${BAZEL_BUILD_OPTIONS[@]}" //tools/docs:rst_check
+CURRENT=rustfmt
+RUSTFMT_PRE="$(git diff | md5sum)"
+bazel "${BAZEL_STARTUP_OPTIONS[@]}" run "${BAZEL_BUILD_OPTIONS[@]}" @rules_rust//:rustfmt
+RUSTFMT_POST="$(git diff | md5sum)"
+if [[ "$RUSTFMT_PRE" != "$RUSTFMT_POST" ]]; then
+    echo "ERROR: rustfmt produced changes — Rust code is unformatted." >&2
+    echo "Run: bazel run @rules_rust//:rustfmt" >&2
+    false
+fi
+
+CURRENT=check_format
+bazel "${BAZEL_STARTUP_OPTIONS[@]}" run "${BAZEL_BUILD_OPTIONS[@]}" //tools/code_format:check_format -- fix --fail_on_diff
 
 if [[ "${#FAILED[@]}" -ne "0" ]]; then
     echo "${BASH_ERR_PREFIX}TESTS FAILED:" >&2
     for failed in "${FAILED[@]}"; do
         echo "${BASH_ERR_PREFIX} $failed" >&2
     done
+    if [[ $(git status --porcelain -- . ":(exclude,glob)**/MODULE.bazel.lock") ]]; then
+        git diff -- . ":(exclude,glob)**/MODULE.bazel.lock" > "$DIFF_OUTPUT"
+        echo >&2
+        echo "Applying the following diff should fix (some) problems" >&2
+        echo >&2
+        cat "$DIFF_OUTPUT" >&2
+        echo >&2
+        echo "Diff file with (some) fixes will be uploaded. Please check the artefacts for this PR run in the azure pipeline." >&2
+        echo >&2
+    fi
     exit 1
 fi

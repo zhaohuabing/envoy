@@ -1,29 +1,62 @@
-load("@rules_cc//cc:defs.bzl", "cc_library", "cc_proto_library")
-load("//bazel:envoy_build_system.bzl", "envoy_package")
-load("//bazel:envoy_internal.bzl", "envoy_select_force_libcpp")
-load("//bazel:utils.bzl", "json_data")
 load("@bazel_skylib//lib:selects.bzl", "selects")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load(":repository_locations.bzl", "REPOSITORY_LOCATIONS_SPEC")
+load("@envoy_toolshed//:utils.bzl", "json_merge")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_java//toolchains:default_java_toolchain.bzl", "default_java_toolchain")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_shell//shell:sh_library.bzl", "sh_library")
+load("//bazel:envoy_build_system.bzl", "envoy_package")
+load(":deprecated_features.bzl", "check_removed_fips_define", "check_removed_wasm_defines")
 
 licenses(["notice"])  # Apache 2
 
 envoy_package()
 
+# TODO(jwendell): Remove after https://github.com/protocolbuffers/protobuf/issues/20760 is fixed.
+default_java_toolchain(
+    name = "envoy_java_toolchain",
+    java_runtime = "@rules_java//toolchains:remotejdk_25",
+    javabuilder_jvm_opts = ["--sun-misc-unsafe-memory-access=allow"],
+    source_version = "11",
+    target_version = "11",
+)
+
 exports_files([
     "gen_sh_test_runner.sh",
     "sh_test_wrapper.sh",
     "test_for_benchmark_wrapper.sh",
-    "repository_locations.bzl",
+    "deps.yaml",
+    "gazelle.patch",
+    "googleapis.patch",
+    "rules_go.patch",
+    "exported_symbols.txt",
+    "exported_symbols_apple.txt",
 ])
+
+sh_library(
+    name = "volatile_env",
+    srcs = ["volatile_env.sh"],
+)
+
+# Stamp derived from tree hash + dirty status if `BAZEL_VOLATILE_DIRTY`
+# is set, otherwise the git commit
+genrule(
+    name = "volatile-scm-hash",
+    outs = ["volatile-scm-hash.txt"],
+    cmd = """
+    grep BUILD_SCM_HASH bazel-out/volatile-status.txt > $@
+    """,
+    stamp = 1,
+    tags = ["no-remote-exec"],
+)
 
 genrule(
     name = "gnu_build_id",
     outs = ["gnu_build_id.ldscript"],
     cmd = """
       echo --build-id=0x$$(
-          grep BUILD_SCM_REVISION bazel-out/volatile-status.txt \\
-        | sed 's/^BUILD_SCM_REVISION //') \\
+          grep -E "^BUILD_SCM_REVISION" bazel-out/volatile-status.txt \
+        | sed 's/^BUILD_SCM_REVISION //') \
         > $@
     """,
     # Undocumented attr to depend on workspace status files.
@@ -36,8 +69,8 @@ genrule(
     name = "raw_build_id",
     outs = ["raw_build_id.ldscript"],
     cmd = """
-      grep BUILD_SCM_REVISION bazel-out/volatile-status.txt \\
-    | sed 's/^BUILD_SCM_REVISION //' \\
+      grep -E "^BUILD_SCM_REVISION" bazel-out/volatile-status.txt \
+    | sed 's/^BUILD_SCM_REVISION //' \
     | tr -d '\\n' \\
     > $@
     """,
@@ -46,23 +79,20 @@ genrule(
     stamp = 1,
 )
 
-# A target to optionally link C++ standard library dynamically in sanitizer runs.
-# TSAN doesn't support libc/libstdc++ static linking per doc:
-#   http://releases.llvm.org/8.0.1/tools/clang/docs/ThreadSanitizer.html
-cc_library(
-    name = "dynamic_stdlib",
-    linkopts = envoy_select_force_libcpp(
-        ["-lc++"],
-        ["-lstdc++"],
-    ),
-)
-
 cc_library(
     name = "static_stdlib",
     linkopts = select({
         "//bazel:linux": ["-static-libgcc"],
         "//conditions:default": [],
     }),
+)
+
+config_setting(
+    name = "sockmap_enabled",
+    constraint_values = [
+        "@platforms//os:linux",
+    ],
+    define_values = {"sockmap": "enabled"},
 )
 
 config_setting(
@@ -150,6 +180,14 @@ config_setting(
 )
 
 config_setting(
+    name = "local_asan_build",
+    flag_values = {
+        "@envoy_repo//:use_local_llvm_flag": "True",
+    },
+    values = {"define": "ENVOY_CONFIG_ASAN=1"},
+)
+
+config_setting(
     name = "tsan_build",
     values = {"define": "ENVOY_CONFIG_TSAN=1"},
 )
@@ -177,34 +215,10 @@ config_setting(
 )
 
 config_setting(
-    name = "gcc_build_gcc",
+    name = "gcc_build",
     flag_values = {
         "@bazel_tools//tools/cpp:compiler": "gcc",
     },
-)
-
-# This is needed due to a Bazel bug (https://github.com/bazelbuild/bazel/issues/12707)
-config_setting(
-    name = "gcc_build_compiler",
-    flag_values = {
-        "@bazel_tools//tools/cpp:compiler": "compiler",
-    },
-)
-
-selects.config_setting_group(
-    name = "gcc_build_compiler_on_linux",
-    match_all = [
-        ":gcc_build_compiler",
-        ":linux",
-    ],
-)
-
-selects.config_setting_group(
-    name = "gcc_build",
-    match_any = [
-        ":gcc_build_gcc",
-        ":gcc_build_compiler_on_linux",
-    ],
 )
 
 config_setting(
@@ -229,59 +243,24 @@ config_setting(
     values = {"define": "tcmalloc=gperftools"},
 )
 
-# As select() can't be nested we need these specialized settings to avoid ambiguity when choosing
-# tcmalloc's flavor for x86_64 and aarch64 builds.
-config_setting(
-    name = "disable_tcmalloc_on_linux_x86_64",
-    values = {
-        "define": "tcmalloc=disabled",
-        "cpu": "k8",
-    },
+bool_flag(
+    name = "jemalloc",
+    build_setting_default = False,
 )
 
 config_setting(
-    name = "gperftools_tcmalloc_on_linux_x86_64",
-    values = {
-        "define": "tcmalloc=gperftools",
-        "cpu": "k8",
-    },
-)
-
-config_setting(
-    name = "debug_tcmalloc_on_linux_x86_64",
-    values = {
-        "define": "tcmalloc=debug",
-        "cpu": "k8",
-    },
-)
-
-config_setting(
-    name = "disable_tcmalloc_on_linux_aarch64",
-    values = {
-        "define": "tcmalloc=disabled",
-        "cpu": "aarch64",
-    },
-)
-
-config_setting(
-    name = "gperftools_tcmalloc_on_linux_aarch64",
-    values = {
-        "define": "tcmalloc=gperftools",
-        "cpu": "aarch64",
-    },
-)
-
-config_setting(
-    name = "debug_tcmalloc_on_linux_aarch64",
-    values = {
-        "define": "tcmalloc=debug",
-        "cpu": "aarch64",
-    },
+    name = "jemalloc_enabled",
+    flag_values = {":jemalloc": "True"},
 )
 
 config_setting(
     name = "disable_signal_trace",
     values = {"define": "signal_trace=disabled"},
+)
+
+config_setting(
+    name = "disable_library_autolink",
+    values = {"define": "library_autolink=disabled"},
 )
 
 config_setting(
@@ -294,10 +273,19 @@ config_setting(
     values = {"define": "deprecated_features=disabled"},
 )
 
+selects.config_setting_group(
+    name = "disable_hot_restart_or_admin",
+    match_any = [
+        "//bazel:disable_hot_restart",
+        "//bazel:disable_admin_functionality",
+    ],
+)
+
 bool_flag(
     name = "http3",
     build_setting_default = True,
-    visibility = ["//visibility:private"],
+    # TODO(keith): make private again https://github.com/bazelbuild/bazel-skylib/issues/404
+    # visibility = ["//visibility:private"],
 )
 
 config_setting(
@@ -305,21 +293,172 @@ config_setting(
     flag_values = {
         ":http3": "False",
     },
-    visibility = ["//visibility:private"],
+    # TODO(keith): make private again https://github.com/bazelbuild/bazel-skylib/issues/404
+    # visibility = ["//visibility:private"],
 )
 
 selects.config_setting_group(
     name = "disable_http3",
     match_any = [
         ":disable_http3_setting",
-        ":boringssl_fips",
     ],
+)
+
+selects.config_setting_group(
+    name = "disable_http3_on_linux_ppc",
+    match_all = [
+        ":disable_http3",
+        ":linux_ppc",
+    ],
+)
+
+selects.config_setting_group(
+    name = "disable_http3_on_linux_ppc64le",
+    match_all = [
+        ":disable_http3",
+        ":linux_ppc64le",
+    ],
+)
+
+selects.config_setting_group(
+    name = "disable_http3_on_linux_x86_64",
+    match_all = [
+        ":disable_http3",
+        ":linux_x86_64",
+    ],
+)
+
+selects.config_setting_group(
+    name = "disable_http3_on_not_x86_ppc",
+    match_all = [
+        ":disable_http3",
+        ":not_x86_ppc",
+    ],
+)
+
+selects.config_setting_group(
+    name = "disable_http3_on_windows_x86_64",
+    match_all = [
+        ":disable_http3",
+        ":windows_x86_64",
+    ],
+)
+
+bool_flag(
+    name = "enabled",
+    build_setting_default = True,
+    visibility = ["//visibility:private"],
+)
+
+bool_flag(
+    name = "disabled",
+    build_setting_default = False,
+    visibility = ["//visibility:private"],
+)
+
+# Alias equal to "not(":disable_http3")" (if "not()" existed).
+alias(
+    name = "enable_http3_setting",
+    actual = select({
+        ":disable_http3": ":disabled",
+        "//conditions:default": ":enabled",
+    }),
+)
+
+config_setting(
+    name = "enable_http3",
+    flag_values = {":enable_http3_setting": "True"},
+)
+
+selects.config_setting_group(
+    name = "http3_enabled_and_linux",
+    match_all = [
+        "//bazel:linux",
+        "//bazel:enable_http3",
+    ],
+)
+
+selects.config_setting_group(
+    name = "enable_http3_on_linux_ppc",
+    match_all = [
+        ":enable_http3",
+        ":linux_ppc",
+    ],
+)
+
+selects.config_setting_group(
+    name = "enable_http3_on_linux_ppc64le",
+    match_all = [
+        ":enable_http3",
+        ":linux_ppc64le",
+    ],
+)
+
+selects.config_setting_group(
+    name = "enable_http3_on_windows_x86_64",
+    match_all = [
+        ":enable_http3",
+        ":windows_x86_64",
+    ],
+)
+
+config_setting(
+    name = "disable_admin_html",
+    values = {"define": "admin_html=disabled"},
+)
+
+config_setting(
+    name = "disable_static_extension_registration",
+    values = {"define": "static_extension_registration=disabled"},
+)
+
+config_setting(
+    name = "disable_envoy_mobile_xds",
+    values = {"define": "envoy_mobile_xds=disabled"},
+)
+
+config_setting(
+    name = "disable_yaml",
+    values = {"define": "envoy_yaml=disabled"},
+)
+
+# The goal here is to allow Envoy to build with this option but it is not yet
+# complete.  See https://github.com/envoyproxy/envoy/issues/27412
+config_setting(
+    name = "disable_exceptions",
+    values = {"define": "envoy_exceptions=disabled"},
+)
+
+config_setting(
+    name = "disable_full_protos",
+    values = {"define": "envoy_full_protos=disabled"},
+)
+
+config_setting(
+    name = "disable_envoy_mobile_listener",
+    values = {"define": "envoy_mobile_listener=disabled"},
+)
+
+config_setting(
+    name = "disable_http_datagrams",
+    values = {"define": "envoy_enable_http_datagrams=disabled"},
+)
+
+config_setting(
+    name = "disable_logging",
+    values = {"define": "enable_logging=disabled"},
+)
+
+config_setting(
+    name = "disable_admin_functionality",
+    values = {"define": "admin_functionality=disabled"},
 )
 
 config_setting(
     name = "disable_hot_restart_setting",
     values = {"define": "hot_restart=disabled"},
-    visibility = ["//visibility:private"],
+    # TODO(keith): make private again https://github.com/bazelbuild/bazel-skylib/issues/404
+    # visibility = ["//visibility:private"],
 )
 
 selects.config_setting_group(
@@ -331,6 +470,11 @@ selects.config_setting_group(
 )
 
 config_setting(
+    name = "disable_nghttp2",
+    values = {"define": "nghttp2=disabled"},
+)
+
+config_setting(
     name = "disable_google_grpc",
     values = {"define": "google_grpc=disabled"},
 )
@@ -338,11 +482,6 @@ config_setting(
 config_setting(
     name = "enable_path_normalization_by_default",
     values = {"define": "path_normalization_by_default=true"},
-)
-
-cc_proto_library(
-    name = "grpc_health_proto",
-    deps = ["@com_github_grpc_grpc//src/proto/grpc/health/v1:_health_proto_only"],
 )
 
 config_setting(
@@ -371,92 +510,185 @@ config_setting(
 )
 
 config_setting(
+    name = "enable_execution_context",
+    values = {"define": "execution_context=enabled"},
+)
+
+config_setting(
+    name = "enable_perf_tracing",
+    values = {"define": "perf_tracing=enabled"},
+)
+
+config_setting(
     name = "force_libcpp",
     values = {"define": "force_libcpp=enabled"},
 )
 
+# SSL library selection using label_flag and bool_flag
+label_flag(
+    name = "ssl",
+    build_setting_default = "@boringssl//:ssl",
+)
+
+label_flag(
+    name = "crypto",
+    build_setting_default = "@boringssl//:crypto",
+)
+
+# wee8 engine: envoy_toolshed prebuilt by default, source for configs the
+# prebuilt is incompatible with (gcc libstdc++ ABI; sanitizers need instrumented deps).
+alias(
+    name = "wee8_engine",
+    actual = select({
+        ":gcc_build": "@proxy-wasm-cpp-host//bazel:wee8_no_pointer_compression",
+        ":asan_build": "@proxy-wasm-cpp-host//bazel:wee8_no_pointer_compression",
+        ":msan_build": "@proxy-wasm-cpp-host//bazel:wee8_no_pointer_compression",
+        ":tsan_build": "@proxy-wasm-cpp-host//bazel:wee8_no_pointer_compression",
+        "//conditions:default": "@envoy_toolshed//v8:wee8",
+    }),
+)
+
+bool_flag(
+    name = "fips",
+    build_setting_default = False,
+)
+
+bool_flag(
+    name = "openssl",
+    build_setting_default = False,
+)
+
 config_setting(
-    name = "boringssl_fips",
-    constraint_values = [
-        "@bazel_tools//platforms:linux",
-        "@bazel_tools//platforms:x86_64",
+    name = "fips_build",
+    flag_values = {":fips": "True"},
+)
+
+config_setting(
+    name = "using_boringssl",
+    flag_values = {":ssl": "@boringssl//:ssl"},
+)
+
+config_setting(
+    name = "using_boringssl_fips",
+    flag_values = {":ssl": "@boringssl-fips//:ssl"},
+)
+
+config_setting(
+    name = "using_openssl",
+    flag_values = {":openssl": "True"},
+)
+
+# Convenience grouping for any FIPS SSL library
+selects.config_setting_group(
+    name = "using_fips_ssl",
+    match_any = [
+        ":using_boringssl_fips",
     ],
-    values = {"define": "boringssl=fips"},
 )
 
-config_setting(
-    name = "boringssl_disabled",
-    values = {"define": "boringssl=disabled"},
+check_removed_fips_define(
+    name = "check_removed_fips_define",
+    build_setting_default = "",
+    visibility = ["//visibility:public"],
 )
 
-config_setting(
-    name = "zlib_ng",
-    constraint_values = [
-        "@bazel_tools//platforms:linux",
-    ],
-    values = {"define": "zlib=ng"},
+check_removed_wasm_defines(
+    name = "check_removed_wasm_defines",
+    build_setting_default = "",
+    visibility = ["//visibility:public"],
 )
 
-# TODO: consider converting WAVM VM support to an extension (https://github.com/envoyproxy/envoy/issues/12574)
-config_setting(
-    name = "wasm_wavm",
-    values = {"define": "wasm=wavm"},
+label_flag(
+    name = "zlib",
+    build_setting_default = "@zlib-ng",
 )
 
+# Wasm engine config settings. The single source of truth for engine selection
+# is @proxy-wasm-cpp-host//bazel:engine (a string_flag defined in that repo).
+# Use --@proxy-wasm-cpp-host//bazel:engine=<value> to select the engine.
 config_setting(
     name = "wasm_v8",
-    values = {"define": "wasm=v8"},
+    flag_values = {"@proxy-wasm-cpp-host//bazel:engine": "v8"},
 )
 
 config_setting(
     name = "wasm_wamr",
-    values = {"define": "wasm=wamr"},
+    flag_values = {"@proxy-wasm-cpp-host//bazel:engine": "wamr"},
 )
 
 config_setting(
     name = "wasm_wasmtime",
-    values = {"define": "wasm=wasmtime"},
+    flag_values = {"@proxy-wasm-cpp-host//bazel:engine": "wasmtime"},
 )
 
 config_setting(
-    name = "wasm_none",
-    values = {"define": "wasm=disabled"},
+    name = "wasm_disabled",
+    flag_values = {"@proxy-wasm-cpp-host//bazel:engine": "disabled"},
 )
 
-# Alias pointing to the selected version of BoringSSL:
-# - BoringSSL FIPS from @boringssl_fips//:ssl,
-# - non-FIPS BoringSSL from @boringssl//:ssl.
-alias(
-    name = "boringssl",
-    actual = select({
-        "//bazel:boringssl_fips": "@boringssl_fips//:ssl",
-        "//conditions:default": "@boringssl//:ssl",
-    }),
+# This config setting enables Universal Header Validator and disables
+# HTTP header compliance checks in codecs.
+# This setting is temporary to transition header validation into UHV without
+# impacting production builds of Envoy.
+# This setting is enabled for the bazel.compile_time_options CI target.
+config_setting(
+    name = "uhv_enabled",
+    values = {"define": "uhv=enabled"},
 )
 
 config_setting(
     name = "linux_x86_64",
-    values = {"cpu": "k8"},
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
 )
 
 config_setting(
     name = "linux_aarch64",
-    values = {"cpu": "aarch64"},
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
 )
 
 config_setting(
     name = "linux_ppc",
-    values = {"cpu": "ppc"},
+    constraint_values = [
+        "@platforms//cpu:ppc",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "linux_ppc64le",
+    constraint_values = [
+        "@platforms//cpu:ppc64le",
+        "@platforms//os:linux",
+    ],
 )
 
 config_setting(
     name = "linux_s390x",
-    values = {"cpu": "s390x"},
+    constraint_values = [
+        "@platforms//cpu:s390x",
+        "@platforms//os:linux",
+    ],
 )
 
 config_setting(
     name = "linux_mips64",
-    values = {"cpu": "mips64"},
+    constraint_values = [
+        "@platforms//cpu:mips64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "linux",
+    constraint_values = [
+        "@platforms//os:linux",
+    ],
 )
 
 config_setting(
@@ -473,12 +705,18 @@ config_setting(
 
 config_setting(
     name = "darwin_x86_64",
-    values = {"cpu": "darwin_x86_64"},
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:macos",
+    ],
 )
 
 config_setting(
     name = "darwin_arm64",
-    values = {"cpu": "darwin_arm64"},
+    constraint_values = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:macos",
+    ],
 )
 
 config_setting(
@@ -507,6 +745,11 @@ config_setting(
 )
 
 config_setting(
+    name = "ios_sim_arm64",
+    values = {"cpu": "ios_sim_arm64"},
+)
+
+config_setting(
     name = "ios_arm64e",
     values = {"cpu": "ios_arm64e"},
 )
@@ -517,8 +760,28 @@ config_setting(
 )
 
 config_setting(
+    name = "android",
+    constraint_values = [
+        "@platforms//os:android",
+    ],
+)
+
+selects.config_setting_group(
+    name = "android_opt",
+    match_all = [
+        ":opt_build",
+        ":android",
+    ],
+)
+
+config_setting(
     name = "android_logger",
     values = {"define": "logger=android"},
+)
+
+config_setting(
+    name = "android_system_helper",
+    values = {"define": "system-helper=android"},
 )
 
 config_setting(
@@ -548,6 +811,27 @@ alias(
     }),
 )
 
+config_setting(
+    name = "engflow_rbe",
+    define_values = {"engflow_rbe": "true"},
+)
+
+selects.config_setting_group(
+    name = "engflow_rbe_x86_64",
+    match_all = [
+        ":engflow_rbe",
+        ":linux_x86_64",
+    ],
+)
+
+selects.config_setting_group(
+    name = "engflow_rbe_aarch64",
+    match_all = [
+        ":engflow_rbe",
+        ":linux_aarch64",
+    ],
+)
+
 selects.config_setting_group(
     name = "apple",
     match_any = [
@@ -559,18 +843,49 @@ selects.config_setting_group(
         ":ios_armv7",
         ":ios_armv7s",
         ":ios_i386",
+        ":ios_sim_arm64",
         ":ios_x86_64",
     ],
 )
 
 selects.config_setting_group(
-    name = "linux",
+    name = "darwin_any",
     match_any = [
-        ":linux_aarch64",
-        ":linux_mips64",
-        ":linux_ppc",
-        ":linux_s390x",
-        ":linux_x86_64",
+        ":darwin",
+        ":darwin_arm64",
+        ":darwin_x86_64",
+    ],
+)
+
+selects.config_setting_group(
+    name = "apple_dbg",
+    match_all = [
+        ":apple",
+        ":dbg_build",
+    ],
+)
+
+selects.config_setting_group(
+    name = "apple_opt",
+    match_all = [
+        ":opt_build",
+        ":apple",
+    ],
+)
+
+selects.config_setting_group(
+    name = "apple_fastbuild",
+    match_all = [
+        ":apple",
+        ":fastbuild_build",
+    ],
+)
+
+selects.config_setting_group(
+    name = "apple_non_opt",
+    match_any = [
+        ":apple_dbg",
+        ":apple_fastbuild",
     ],
 )
 
@@ -584,9 +899,59 @@ selects.config_setting_group(
     ],
 )
 
+selects.config_setting_group(
+    name = "not_x86_ppc",
+    match_any = [
+        ":darwin_arm64",
+        ":ios_arm64",
+        ":ios_arm64e",
+        ":ios_armv7",
+        ":ios_armv7s",
+        ":ios_i386",
+        ":ios_sim_arm64",
+        ":linux_aarch64",
+        ":linux_mips64",
+        ":linux_s390x",
+    ],
+)
+
+selects.config_setting_group(
+    name = "not_ppc",
+    match_any = [
+        ":not_x86_ppc",
+        ":x86",
+    ],
+)
+
+selects.config_setting_group(
+    name = "not_x86",
+    match_any = [
+        ":darwin_arm64",
+        ":ios_arm64",
+        ":ios_arm64e",
+        ":ios_armv7",
+        ":ios_armv7s",
+        ":ios_i386",
+        ":ios_sim_arm64",
+        ":linux_aarch64",
+        ":linux_mips64",
+        ":linux_ppc",
+        ":linux_ppc64le",
+        ":linux_s390x",
+    ],
+)
+
+selects.config_setting_group(
+    name = "not_x86_or_wasm_disabled",
+    match_any = [
+        ":not_x86",
+        ":wasm_disabled",
+    ],
+)
+
 alias(
     name = "remote_jdk11",
-    actual = "@bazel_tools//tools/jdk:remote_jdk11",
+    actual = "@rules_java//toolchains:remote_jdk11",
 )
 
 alias(
@@ -594,7 +959,137 @@ alias(
     actual = "@bazel_tools//src/conditions:windows",
 )
 
-json_data(
-    name = "repository_locations",
-    data = REPOSITORY_LOCATIONS_SPEC,
+json_merge(
+    name = "all_repository_locations",
+    srcs = [
+        "@envoy_mod_graph//:deps.json",
+    ],
+    filter = """
+    .
+    | .[0] as $modules
+    | .[1] as $metadata1
+    | .[2] as $metadata2
+    | ($metadata1 * $metadata2) as $metadata
+    | def module_source($dep):
+        if $modules[$dep] then
+          ($modules[$dep] + {module_name: $dep})
+        elif ($dep | startswith("com_google_")) and $modules[$dep | sub("^com_google_"; "")] then
+          (($dep | sub("^com_google_"; "")) as $m | $modules[$m] + {module_name: $m})
+        elif $modules[$dep | gsub("_"; "-")] then
+          ($dep | gsub("_"; "-")) as $m | $modules[$m] + {module_name: $m}
+        elif ($metadata[$dep].apparent_name // null) as $a | $a and $modules[$a] then
+          ($metadata[$dep].apparent_name) as $m | $modules[$m] + {module_name: $m}
+        else null end;
+      def dependency_source($dep):
+        module_source($dep);
+      $metadata
+      | keys
+      | reduce .[] as $k ({};
+          (dependency_source($k)) as $source
+          | if $source then
+              . + {($k): (
+                ($source + ($metadata[$k] // {}))
+                | .version as $ver
+                | if .license_url and $ver then
+                    .license_url |= (
+                      gsub("{version}"; $ver)
+                      | gsub("{dash_version}"; ($ver | gsub("[.]"; "-")))
+                      | gsub("{underscore_version}"; ($ver | gsub("[.]"; "_")))
+                    )
+                  else . end
+              )}
+            else . + {($k): $metadata[$k]}
+            end
+        )
+    """,
+    visibility = ["//visibility:public"],
+    yaml_srcs = [
+        ":deps.yaml",
+        "@envoy_api//bazel:deps.yaml",
+    ],
+)
+
+py_test(
+    name = "all_repository_locations_test",
+    srcs = ["all_repository_locations_test.py"],
+    args = ["$(location :all_repository_locations)"],
+    data = [":all_repository_locations"],
+)
+
+# A dependency required by python protobuf
+# Envoy does not have any C++ code that includes python.h so this dummy
+# target is enough. However if such code is added in the future when this
+# should be changed to alias "@system_python//:python_headers"
+cc_library(
+    name = "python_headers",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "tcmalloc_all_libs",
+    visibility = ["//visibility:public"],
+    deps = selects.with_or({
+        ("//bazel:linux_x86_64", "//bazel:linux_aarch64"): [
+            "@tcmalloc//tcmalloc",
+            "@tcmalloc//tcmalloc:profile_marshaler",
+            "@tcmalloc//tcmalloc:malloc_extension",
+        ],
+        "//conditions:default": ["//bazel/external:gperftools"],
+    }),
+)
+
+cc_library(
+    name = "tcmalloc_lib",
+    visibility = ["//visibility:public"],
+    deps = selects.with_or({
+        (
+            "//bazel:linux_x86_64",
+            "//bazel:linux_aarch64",
+        ): ["@tcmalloc//tcmalloc"],
+        "//conditions:default": ["//bazel/external:gperftools"],
+    }),
+)
+
+bool_flag(
+    name = "enable_liburing",
+    build_setting_default = True,
+)
+
+config_setting(
+    name = "liburing_enabled",
+    constraint_values = [
+        "@platforms//os:linux",
+    ],
+    flag_values = {
+        ":enable_liburing": "True",
+    },
+)
+
+bool_flag(
+    name = "libc++",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "libc++_enabled",
+    flag_values = {
+        ":libc++": "True",
+    },
+)
+
+bool_flag(
+    name = "libstdc++",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "libstdc++_enabled",
+    flag_values = {
+        ":libstdc++": "True",
+    },
+)
+
+alias(
+    name = "cpp_runfiles",
+    actual = "@bazel_tools//tools/cpp/runfiles",
 )

@@ -13,23 +13,28 @@ namespace BufferFilter {
 /**
  * Config registration for the buffer filter.
  */
-class BufferFilterFactory
-    : public Common::FactoryBase<envoy::extensions::filters::http::buffer::v3::Buffer,
-                                 envoy::extensions::filters::http::buffer::v3::BufferPerRoute> {
+class BufferFilterFactory : public Common::UnifiedFactoryBase<
+                                envoy::extensions::filters::http::buffer::v3::Buffer,
+                                envoy::extensions::filters::http::buffer::v3::BufferPerRoute> {
 public:
-  BufferFilterFactory() : FactoryBase("envoy.filters.http.buffer") {}
+  BufferFilterFactory() : UnifiedFactoryBase("envoy.filters.http.buffer") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Envoy::Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::buffer::v3::Buffer& proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::buffer::v3::BufferPerRoute&,
       Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) override;
 };
 
+using UpstreamBufferFilterFactory = BufferFilterFactory;
+
 DECLARE_FACTORY(BufferFilterFactory);
+DECLARE_FACTORY(UpstreamBufferFilterFactory);
 
 } // namespace BufferFilter
 } // namespace HttpFilters

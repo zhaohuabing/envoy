@@ -12,10 +12,10 @@
 #include "source/common/http/headers.h"
 #include "source/common/json/json_loader.h"
 #include "source/common/router/config_impl.h"
-#include "source/common/stats/symbol_table_impl.h"
+#include "source/common/stats/symbol_table.h"
 #include "source/common/stream_info/stream_info_impl.h"
 
-#include "test/mocks/server/instance.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/global.h"
 #include "test/test_common/printers.h"
 #include "test/test_common/utility.h"
@@ -72,7 +72,8 @@ public:
    * @param expected_route_json tool config json file.
    * @return bool if all routes match what is expected.
    */
-  bool compareEntries(const std::string& expected_routes);
+  std::vector<envoy::RouterCheckToolSchema::ValidationItemResult>
+  compareEntries(const std::string& expected_routes);
 
   /**
    * Set whether to print out match case details.
@@ -84,14 +85,20 @@ public:
    */
   void setOnlyShowFailures() { only_show_failures_ = true; }
 
-  float coverage(bool detailed) {
-    return detailed ? coverage_.detailedReport() : coverage_.report();
+  /**
+   * Set whether to print out detailed coverage report.
+   */
+  void setDetailedCoverageReport() { detailed_coverage_report_ = true; }
+
+  float coverage(bool comprehensive_coverage) {
+    return comprehensive_coverage ? coverage_.comprehensiveReport()
+                                  : coverage_.report(detailed_coverage_report_);
   }
 
 private:
   RouterCheckTool(
       std::unique_ptr<NiceMock<Server::Configuration::MockServerFactoryContext>> factory_context,
-      std::unique_ptr<Router::ConfigImpl> config, std::unique_ptr<Stats::IsolatedStoreImpl> stats,
+      std::shared_ptr<Router::ConfigImpl> config, std::unique_ptr<Stats::IsolatedStoreImpl> stats,
       Api::ApiPtr api, Coverage coverage);
 
   /**
@@ -114,34 +121,53 @@ private:
   /*
    * Performs direct-response reply actions for a response entry.
    */
-  void sendLocalReply(ToolConfig& tool_config, const Router::DirectResponseEntry& entry);
+  void sendLocalReply(ToolConfig& tool_config, const Router::DirectResponseEntry& entry,
+                      Envoy::StreamInfo::StreamInfoImpl& stream_info);
 
-  bool compareCluster(ToolConfig& tool_config, const std::string& expected);
+  /**
+   * Apply dynamic metadata to stream_info, similar to how the set_metadata filter works.
+   */
+  void applyDynamicMetadata(
+      Envoy::StreamInfo::StreamInfoImpl& stream_info,
+      const Envoy::Protobuf::RepeatedPtrField<
+          envoy::extensions::filters::http::set_metadata::v3::Metadata>& dynamic_metadata);
+
   bool compareCluster(ToolConfig& tool_config,
-                      const envoy::RouterCheckToolSchema::ValidationAssert& expected);
-  bool compareVirtualCluster(ToolConfig& tool_config, const std::string& expected);
+                      const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                      envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareVirtualCluster(ToolConfig& tool_config,
-                             const envoy::RouterCheckToolSchema::ValidationAssert& expected);
-  bool compareVirtualHost(ToolConfig& tool_config, const std::string& expected);
+                             const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                             envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareVirtualHost(ToolConfig& tool_config,
-                          const envoy::RouterCheckToolSchema::ValidationAssert& expected);
-  bool compareRewriteHost(ToolConfig& tool_config, const std::string& expected);
+                          const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                          envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareRewriteHost(ToolConfig& tool_config,
-                          const envoy::RouterCheckToolSchema::ValidationAssert& expected);
-  bool compareRewritePath(ToolConfig& tool_config, const std::string& expected);
+                          const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                          envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareRewritePath(ToolConfig& tool_config,
-                          const envoy::RouterCheckToolSchema::ValidationAssert& expected);
-  bool compareRedirectPath(ToolConfig& tool_config, const std::string& expected);
+                          const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                          envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareRedirectPath(ToolConfig& tool_config,
-                           const envoy::RouterCheckToolSchema::ValidationAssert& expected);
+                           const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                           envoy::RouterCheckToolSchema::ValidationFailure& failure,
+                           const StreamInfo::StreamInfo& stream_info);
+  bool compareRedirectCode(ToolConfig& tool_config,
+                           const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                           envoy::RouterCheckToolSchema::ValidationFailure& failure);
+  bool compareTimeout(ToolConfig& tool_config,
+                      const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                      envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareRequestHeaderFields(ToolConfig& tool_config,
-                                  const envoy::RouterCheckToolSchema::ValidationAssert& expected);
+                                  const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                                  envoy::RouterCheckToolSchema::ValidationFailure& failure);
   bool compareResponseHeaderFields(ToolConfig& tool_config,
-                                   const envoy::RouterCheckToolSchema::ValidationAssert& expected);
+                                   const envoy::RouterCheckToolSchema::ValidationAssert& expected,
+                                   envoy::RouterCheckToolSchema::ValidationFailure& failure);
   template <typename HeaderMap>
   bool matchHeaderField(const HeaderMap& header_map,
                         const envoy::config::route::v3::HeaderMatcher& header,
-                        const std::string test_type);
+                        const std::string test_type,
+                        envoy::RouterCheckToolSchema::HeaderMatchFailure& header_match_failure);
 
   /**
    * Compare the expected and actual route parameter values. Print out match details if details_
@@ -151,11 +177,13 @@ private:
    * @param expect_match negates the expectation if false.
    * @return bool if actual and expected match.
    */
-  bool compareResults(const std::string& actual, const std::string& expected,
-                      const std::string& test_type, const bool expect_match = true);
+  template <typename U, typename V>
+  bool compareResults(const U& actual, const V& expected, const std::string& test_type,
+                      const bool expect_match = true);
 
-  void reportFailure(const std::string& actual, const std::string& expected,
-                     const std::string& test_type, const bool expect_match = true);
+  template <typename U, typename V>
+  void reportFailure(const U& actual, const V& expected, const std::string& test_type,
+                     const bool expect_match = true);
 
   void printResults();
 
@@ -168,13 +196,15 @@ private:
 
   bool only_show_failures_{false};
 
+  bool detailed_coverage_report_{false};
+
   // The first member of each pair is the name of the test.
   // The second member is a list of any failing results for that test as strings.
   std::vector<std::pair<std::string, std::vector<std::string>>> tests_;
 
   // TODO(hennna): Switch away from mocks following work done by @rlazarus in github issue #499.
   std::unique_ptr<NiceMock<Server::Configuration::MockServerFactoryContext>> factory_context_;
-  std::unique_ptr<Router::ConfigImpl> config_;
+  std::shared_ptr<Router::ConfigImpl> config_;
   std::unique_ptr<Stats::IsolatedStoreImpl> stats_;
   Api::ApiPtr api_;
   std::string active_runtime_;
@@ -223,6 +253,16 @@ public:
    */
   bool disableDeprecationCheck() const { return disable_deprecation_check_; }
 
+  /**
+   * @return true if detailed coverage report is displayed.
+   */
+  bool detailedCoverageReport() const { return detailed_coverage_report_; }
+
+  /**
+   * @return the path to save tests results.
+   */
+  const std::string& outputPath() const { return output_path_; }
+
 private:
   std::string test_path_;
   std::string config_path_;
@@ -231,5 +271,7 @@ private:
   bool is_detailed_;
   bool only_show_failures_;
   bool disable_deprecation_check_;
+  bool detailed_coverage_report_;
+  std::string output_path_;
 };
 } // namespace Envoy

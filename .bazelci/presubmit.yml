@@ -2,21 +2,21 @@
 tasks:
   rbe:
     name: "RBE"
-    platform: ubuntu1804
+    platform: ubuntu2004
     test_targets:
     - "//test/common/common/..."
     - "//test/integration/..."
     - "//test/exe/..."
     test_flags:
-    - "--config=remote-clang-libc++"
+    - "--config=clang"
     - "--config=remote-ci"
-    - "--define=wasm=disabled"
+    - "--@proxy-wasm-cpp-host//bazel:engine=disabled"
     - "--jobs=75"
   coverage:
     name: "Coverage"
-    platform: ubuntu1804
+    platform: ubuntu2004
     shell_commands:
-    - "bazel/setup_clang.sh /usr/lib/llvm-10"
+    - "sudo apt -y update && sudo apt -y install automake autotools-dev cmake libtool m4 ninja-build"
     test_targets:
     - "//test/common/common/..."
     - "//test/integration/..."

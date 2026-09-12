@@ -12,17 +12,19 @@ envoy_contrib_package()
 #package(default_visibility = ["//visibility:public"])
 
 # PostgresSQL proxy L7 network filter.
-# Public docs: docs/root/configuration/network_filters/postgres_proxy_filter.rst
+# Public docs: https://envoyproxy.io/docs/envoy/latest/configuration/listeners/network_filters/postgres_proxy_filter
 
 envoy_cc_library(
     name = "filter",
     srcs = [
         "postgres_decoder.cc",
+        "postgres_encoder.cc",
         "postgres_filter.cc",
         "postgres_message.cc",
     ],
     hdrs = [
         "postgres_decoder.h",
+        "postgres_encoder.h",
         "postgres_filter.h",
         "postgres_message.h",
         "postgres_session.h",
@@ -30,6 +32,7 @@ envoy_cc_library(
     repository = "@envoy",
     deps = [
         "//contrib/common/sqlutils/source:sqlutils_lib",
+        "//contrib/postgres/protocol:postgres_protocol_lib",
         "//envoy/network:filter_interface",
         "//envoy/server:filter_config_interface",
         "//envoy/stats:stats_interface",
@@ -37,6 +40,7 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/network:filter_lib",
         "//source/extensions/filters/network:well_known_names",
+        "@envoy_api//contrib/envoy/extensions/filters/network/postgres_proxy/v3alpha:pkg_cc_proto",
     ],
 )
 

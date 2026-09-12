@@ -2,12 +2,17 @@
 #include "envoy/config/cluster/v3/cluster.pb.h"
 
 #include "source/common/network/address_impl.h"
-#include "source/common/upstream/load_balancer_impl.h"
+#include "source/common/upstream/load_balancer_context_base.h"
 
 #include "test/config/utility.h"
 #include "test/integration/clusters/cluster_factory_config.pb.h"
 #include "test/integration/clusters/custom_static_cluster.h"
 #include "test/integration/http_integration.h"
+
+#include "gmock/gmock.h"
+using testing::Contains;
+using testing::Key;
+using testing::UnorderedElementsAre;
 
 namespace Envoy {
 namespace {
@@ -33,16 +38,24 @@ public:
       envoy::config::cluster::v3::Cluster::CustomClusterType cluster_type;
       cluster_type.set_name(cluster_provided_lb_ ? "envoy.clusters.custom_static_with_lb"
                                                  : "envoy.clusters.custom_static");
-      test::integration::clusters::CustomStaticConfig config;
-      config.set_priority(10);
-      config.set_address(Network::Test::getLoopbackAddressString(ipVersion()));
-      config.set_port_value(fake_upstreams_[UpstreamIndex]->localAddress()->ip()->port());
-      cluster_type.mutable_typed_config()->PackFrom(config);
+      if (!cluster_provided_lb_) {
+        test::integration::clusters::CustomStaticConfig1 config;
+        config.set_priority(10);
+        config.set_address(Network::Test::getLoopbackAddressString(ipVersion()));
+        config.set_port_value(fake_upstreams_[UpstreamIndex]->localAddress()->ip()->port());
+        std::ignore = cluster_type.mutable_typed_config()->PackFrom(config);
+      } else {
+        test::integration::clusters::CustomStaticConfig2 config;
+        config.set_priority(10);
+        config.set_address(Network::Test::getLoopbackAddressString(ipVersion()));
+        config.set_port_value(fake_upstreams_[UpstreamIndex]->localAddress()->ip()->port());
+        std::ignore = cluster_type.mutable_typed_config()->PackFrom(config);
+      }
 
       cluster_0->mutable_cluster_type()->CopyFrom(cluster_type);
     });
     HttpIntegrationTest::initialize();
-    test_server_->waitForGaugeGe("cluster_manager.active_clusters", 1);
+    test_server_->waitForGauge("cluster_manager.active_clusters", testing::Ge(1));
   }
 
   Network::Address::IpVersion ipVersion() const { return version_; }
@@ -69,8 +82,7 @@ TEST_P(CustomClusterIntegrationTest, TestCustomConfig) {
 
   // Verify the cluster is correctly setup with the custom priority
   const auto& cluster_maps = test_server_->server().clusterManager().clusters();
-  EXPECT_EQ(1, cluster_maps.active_clusters_.size());
-  EXPECT_EQ(1, cluster_maps.active_clusters_.count("cluster_0"));
+  EXPECT_THAT(cluster_maps.active_clusters_, UnorderedElementsAre(Key("cluster_0")));
   const auto& cluster_ref = cluster_maps.active_clusters_.find("cluster_0")->second;
   const auto& hostset_per_priority = cluster_ref.get().prioritySet().hostSetsPerPriority();
   EXPECT_EQ(11, hostset_per_priority.size());

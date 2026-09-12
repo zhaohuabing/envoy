@@ -1,25 +1,40 @@
+#ifndef WIN32
+#include <sys/resource.h>
+#endif
+#include <algorithm>
 #include <memory>
+#include <vector>
 
+#include "envoy/common/logger.h"
 #include "envoy/common/scope_tracker.h"
 #include "envoy/config/core/v3/base.pb.h"
+#include "envoy/config/xds_config_tracker.h"
 #include "envoy/network/exception.h"
 #include "envoy/server/bootstrap_extension_config.h"
 #include "envoy/server/fatal_action_config.h"
 
 #include "source/common/common/assert.h"
+#include "source/common/common/notification.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/listen_socket_impl.h"
 #include "source/common/network/socket_option_impl.h"
 #include "source/common/protobuf/protobuf.h"
+#include "source/common/runtime/runtime_features.h"
+#include "source/common/stats/allocator_impl.h"
+#include "source/common/stats/symbol_table.h"
+#include "source/common/stats/thread_local_store.h"
 #include "source/common/thread_local/thread_local_impl.h"
 #include "source/common/version/version.h"
+#include "source/server/instance_impl.h"
 #include "source/server/process_context_impl.h"
-#include "source/server/server.h"
 
 #include "test/common/config/dummy_config.pb.h"
 #include "test/common/stats/stat_test_utility.h"
 #include "test/config/v2_link_hacks.h"
 #include "test/integration/server.h"
+#include "test/mocks/api/mocks.h"
+#include "test/mocks/config/mocks.h"
+#include "test/mocks/config/xds_manager.h"
 #include "test/mocks/server/bootstrap_extension_factory.h"
 #include "test/mocks/server/fatal_action_factory.h"
 #include "test/mocks/server/hot_restart.h"
@@ -28,18 +43,24 @@
 #include "test/mocks/server/overload_manager.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/test_common/environment.h"
+#include "test/test_common/file_system_for_test.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/status_utility.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/test_time.h"
+#include "test/test_common/threadsafe_singleton_injector.h"
 #include "test/test_common/utility.h"
 
 #include "absl/synchronization/notification.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "openssl/crypto.h"
 
 using testing::_;
 using testing::Assign;
+using testing::Eq;
 using testing::HasSubstr;
 using testing::InSequence;
 using testing::Invoke;
@@ -55,6 +76,7 @@ namespace {
 TEST(ServerInstanceUtil, flushHelper) {
   InSequence s;
 
+  NiceMock<Upstream::MockClusterManager> cm;
   Stats::TestUtil::TestStore store;
   Event::SimulatedTimeSystem time_system;
   Stats::Counter& c = store.counter("hello");
@@ -64,7 +86,7 @@ TEST(ServerInstanceUtil, flushHelper) {
   store.textReadout("text").set("is important");
 
   std::list<Stats::SinkPtr> sinks;
-  InstanceUtil::flushMetricsToSinks(sinks, store, time_system);
+  InstanceUtil::flushMetricsToSinks(sinks, store, cm, time_system);
   // Make sure that counters have been latched even if there are no sinks.
   EXPECT_EQ(1UL, c.value());
   EXPECT_EQ(0, c.latch());
@@ -85,21 +107,99 @@ TEST(ServerInstanceUtil, flushHelper) {
     EXPECT_EQ(snapshot.textReadouts()[0].get().value(), "is important");
   }));
   c.inc();
-  InstanceUtil::flushMetricsToSinks(sinks, store, time_system);
+  InstanceUtil::flushMetricsToSinks(sinks, store, cm, time_system);
 
   // Histograms don't currently work with the isolated store so test those with a mock store.
   NiceMock<Stats::MockStore> mock_store;
   Stats::ParentHistogramSharedPtr parent_histogram(new Stats::MockParentHistogram());
   std::vector<Stats::ParentHistogramSharedPtr> parent_histograms = {parent_histogram};
-  ON_CALL(mock_store, histograms).WillByDefault(Return(parent_histograms));
+  ON_CALL(mock_store, forEachSinkedHistogram)
+      .WillByDefault([&](std::function<void(std::size_t)> f_size,
+                         std::function<void(Stats::ParentHistogram&)> f_stat) {
+        if (f_size != nullptr) {
+          f_size(parent_histograms.size());
+        }
+        for (auto& histogram : parent_histograms) {
+          f_stat(*histogram);
+        }
+      });
   EXPECT_CALL(*sink, flush(_)).WillOnce(Invoke([](Stats::MetricSnapshot& snapshot) {
     EXPECT_TRUE(snapshot.counters().empty());
     EXPECT_TRUE(snapshot.gauges().empty());
     EXPECT_EQ(snapshot.histograms().size(), 1);
     EXPECT_TRUE(snapshot.textReadouts().empty());
   }));
-  InstanceUtil::flushMetricsToSinks(sinks, mock_store, time_system);
+  InstanceUtil::flushMetricsToSinks(sinks, mock_store, cm, time_system);
 }
+
+TEST(ServerInstanceUtil, flushImportModeUninitializedGauges) {
+  InSequence s;
+
+  NiceMock<Upstream::MockClusterManager> cm;
+  Stats::TestUtil::TestStore store;
+  Event::SimulatedTimeSystem time_system;
+  Stats::Counter& c = store.counter("hello");
+  c.inc();
+  store.gauge("world", Stats::Gauge::ImportMode::Accumulate).set(5);
+  store.gauge("again", Stats::Gauge::ImportMode::Uninitialized).set(10);
+
+  std::list<Stats::SinkPtr> sinks;
+  InstanceUtil::flushMetricsToSinks(sinks, store, cm, time_system);
+  // Make sure that counters have been latched even if there are no sinks.
+  EXPECT_EQ(1UL, c.value());
+  EXPECT_EQ(0, c.latch());
+
+  Stats::MockSink* sink = new StrictMock<Stats::MockSink>();
+  sinks.emplace_back(sink);
+  EXPECT_CALL(*sink, flush(_)).WillOnce(Invoke([](Stats::MetricSnapshot& snapshot) {
+    ASSERT_EQ(snapshot.counters().size(), 1);
+    EXPECT_EQ(snapshot.counters()[0].counter_.get().name(), "hello");
+    EXPECT_EQ(snapshot.counters()[0].delta_, 1);
+
+    ASSERT_EQ(snapshot.gauges().size(), 2);
+    auto world_it = std::find_if(snapshot.gauges().begin(), snapshot.gauges().end(),
+                                 [](const std::reference_wrapper<const Stats::Gauge>& gauge) {
+                                   return gauge.get().name().compare("world") == 0;
+                                 });
+    ASSERT_TRUE(world_it != snapshot.gauges().end());
+    EXPECT_EQ(world_it->get().value(), 5);
+
+    auto again_it = std::find_if(snapshot.gauges().begin(), snapshot.gauges().end(),
+                                 [](const std::reference_wrapper<const Stats::Gauge>& gauge) {
+                                   return gauge.get().name().compare("again") == 0;
+                                 });
+    ASSERT_TRUE(again_it != snapshot.gauges().end());
+    EXPECT_EQ(again_it->get().value(), 10);
+
+    ASSERT_EQ(snapshot.textReadouts().size(), 0);
+  }));
+  c.inc();
+  InstanceUtil::flushMetricsToSinks(sinks, store, cm, time_system);
+}
+
+#ifndef WIN32
+TEST(ServerInstanceUtil, RaiseFileLimits) {
+  struct rlimit rlim;
+  EXPECT_EQ(::getrlimit(RLIMIT_NOFILE, &rlim), 0);
+  ASSERT_GT(rlim.rlim_max, 1);
+  // Set the soft limit lower than the hard limit.
+  rlim.rlim_cur = rlim.rlim_max / 2;
+  InstanceUtil::raiseFileLimits();
+  EXPECT_EQ(::getrlimit(RLIMIT_NOFILE, &rlim), 0);
+  EXPECT_EQ(rlim.rlim_cur, rlim.rlim_max);
+}
+
+TEST(ServerInstanceUtil, RaiseFileLimitsAlreadyMaxed) {
+  struct rlimit rlim;
+  EXPECT_EQ(::getrlimit(RLIMIT_NOFILE, &rlim), 0);
+  rlim.rlim_cur = rlim.rlim_max;
+  EXPECT_EQ(::setrlimit(RLIMIT_NOFILE, &rlim), 0);
+  // Verify that limits remain unchanged when they are the same.
+  InstanceUtil::raiseFileLimits();
+  EXPECT_EQ(::getrlimit(RLIMIT_NOFILE, &rlim), 0);
+  EXPECT_EQ(rlim.rlim_cur, rlim.rlim_max);
+}
+#endif
 
 class RunHelperTest : public testing::Test {
 public:
@@ -116,19 +216,21 @@ public:
     EXPECT_CALL(cm_, setInitializedCb(_)).WillOnce(SaveArg<0>(&cm_init_callback_));
     ON_CALL(server_, shutdown()).WillByDefault(Assign(&shutdown_, true));
 
-    helper_ = std::make_unique<RunHelper>(server_, options_, dispatcher_, cm_, access_log_manager_,
-                                          init_manager_, overload_manager_,
-                                          [this] { start_workers_.ready(); });
+    helper_ = std::make_unique<RunHelper>(
+        server_, options_, dispatcher_, xds_manager_, cm_, access_log_manager_, init_manager_,
+        overload_manager_, null_overload_manager_, mock_workers_start_cb_.AsStdFunction());
   }
 
   NiceMock<MockInstance> server_;
   testing::NiceMock<MockOptions> options_;
   NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<Config::MockXdsManager> xds_manager_;
   NiceMock<Upstream::MockClusterManager> cm_;
   NiceMock<AccessLog::MockAccessLogManager> access_log_manager_;
   NiceMock<MockOverloadManager> overload_manager_;
+  NiceMock<MockOverloadManager> null_overload_manager_;
   Init::ManagerImpl init_manager_{""};
-  ReadyWatcher start_workers_;
+  testing::MockFunction<void()> mock_workers_start_cb_;
   std::unique_ptr<RunHelper> helper_;
   std::function<void()> cm_init_callback_;
 #ifndef WIN32
@@ -141,14 +243,14 @@ public:
 };
 
 TEST_F(RunHelperTest, Normal) {
-  EXPECT_CALL(start_workers_, ready());
+  EXPECT_CALL(mock_workers_start_cb_, Call);
   cm_init_callback_();
 }
 
 // no signals on Windows
 #ifndef WIN32
 TEST_F(RunHelperTest, ShutdownBeforeCmInitialize) {
-  EXPECT_CALL(start_workers_, ready()).Times(0);
+  EXPECT_CALL(mock_workers_start_cb_, Call).Times(0);
   sigterm_->callback_();
   EXPECT_CALL(server_, isShutdown()).WillOnce(Return(shutdown_));
   cm_init_callback_();
@@ -158,7 +260,7 @@ TEST_F(RunHelperTest, ShutdownBeforeCmInitialize) {
 // no signals on Windows
 #ifndef WIN32
 TEST_F(RunHelperTest, ShutdownBeforeInitManagerInit) {
-  EXPECT_CALL(start_workers_, ready()).Times(0);
+  EXPECT_CALL(mock_workers_start_cb_, Call).Times(0);
   Init::ExpectableTargetImpl target;
   init_manager_.add(target);
   EXPECT_CALL(target, initialize());
@@ -199,12 +301,12 @@ protected:
                                              : std::make_unique<Init::ManagerImpl>("Server");
 
     server_ = std::make_unique<InstanceImpl>(
-        *init_manager_, options_, time_system_,
-        std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"), hooks, restart_,
-        stats_store_, fakelock_, component_factory_,
+        *init_manager_, options_, time_system_, hooks, restart_, stats_store_, fakelock_,
         std::make_unique<NiceMock<Random::MockRandomGenerator>>(), *thread_local_,
         Thread::threadFactoryForTest(), Filesystem::fileSystemForTest(),
         std::move(process_context_));
+    server_->initialize(std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"),
+                        component_factory_);
     EXPECT_TRUE(server_->api().fileSystem().fileExists(std::string(Platform::null_device_path)));
   }
 
@@ -218,11 +320,11 @@ protected:
     thread_local_ = std::make_unique<ThreadLocal::InstanceImpl>();
     init_manager_ = std::make_unique<Init::ManagerImpl>("Server");
     server_ = std::make_unique<InstanceImpl>(
-        *init_manager_, options_, time_system_,
-        std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"), hooks_, restart_,
-        stats_store_, fakelock_, component_factory_,
+        *init_manager_, options_, time_system_, hooks_, restart_, stats_store_, fakelock_,
         std::make_unique<NiceMock<Random::MockRandomGenerator>>(), *thread_local_,
         Thread::threadFactoryForTest(), Filesystem::fileSystemForTest(), nullptr);
+    server_->initialize(std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"),
+                        component_factory_);
 
     EXPECT_TRUE(server_->api().fileSystem().fileExists(std::string(Platform::null_device_path)));
   }
@@ -305,15 +407,16 @@ private:
 class CustomStatsSinkFactory : public Server::Configuration::StatsSinkFactory {
 public:
   // StatsSinkFactory
-  Stats::SinkPtr createStatsSink(const Protobuf::Message&,
-                                 Server::Configuration::ServerFactoryContext& server) override {
+  absl::StatusOr<Stats::SinkPtr>
+  createStatsSink(const Protobuf::Message&,
+                  Server::Configuration::ServerFactoryContext& server) override {
     return std::make_unique<CustomStatsSink>(server.scope());
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { return "envoy.custom_stats_sink"; }
@@ -427,6 +530,66 @@ TEST_P(ServerInstanceImplTest, WithCustomInlineHeaders) {
   }
 }
 
+// Boots a server backed by a real ThreadLocalStoreImpl (the production store type, unlike the base
+// fixture's TestIsolatedStoreImpl) and verifies the explicit-tags decision made during
+// initialization, observed via ThreadLocalStoreImpl::useExplicitTags(). These live in the
+// ServerInstanceImplTest suite, after WithCustomInlineHeaders, because booting a server finalizes
+// the process-global custom-inline-header registry that the inline-header tests must populate
+// first.
+//
+// With the runtime guard enabled and a default stats config (no custom tags), server initialization
+// turns on the explicit-tags logic on the real stats store. Guards against a regression where an
+// early scope creation would silently cause setUseExplicitTags() to be ignored.
+TEST_P(ServerInstanceImplTest, ExplicitTagsEnabledByRuntimeGuard) {
+  Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.enable_stats_explicit_tags", true);
+  Stats::SymbolTableImpl symbol_table;
+  Stats::AllocatorImpl allocator(symbol_table);
+  auto real_store = std::make_unique<Stats::ThreadLocalStoreImpl>(allocator);
+
+  options_.config_path_ = TestEnvironment::temporaryFileSubstitute(
+      "test/server/test_data/server/empty_bootstrap.yaml", {}, version_);
+  thread_local_ = std::make_unique<ThreadLocal::InstanceImpl>();
+  init_manager_ = std::make_unique<Init::ManagerImpl>("Server");
+  server_ = std::make_unique<InstanceImpl>(
+      *init_manager_, options_, time_system_, hooks_, restart_, *real_store, fakelock_,
+      std::make_unique<NiceMock<Random::MockRandomGenerator>>(), *thread_local_,
+      Thread::threadFactoryForTest(), Filesystem::fileSystemForTest(), nullptr);
+  server_->initialize(std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"),
+                      component_factory_);
+  EXPECT_TRUE(real_store->useExplicitTags());
+
+  // Tear down the server (which shuts down threading on real_store) before real_store is destroyed,
+  // and restore the process-global runtime flag so it does not leak into other tests.
+  server_.reset();
+  real_store.reset();
+  thread_local_.reset();
+  Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.enable_stats_explicit_tags", false);
+}
+
+// With the runtime guard at its default (false), the explicit-tags logic stays off after init.
+TEST_P(ServerInstanceImplTest, ExplicitTagsDisabledByDefault) {
+  Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.enable_stats_explicit_tags", false);
+  Stats::SymbolTableImpl symbol_table;
+  Stats::AllocatorImpl allocator(symbol_table);
+  auto real_store = std::make_unique<Stats::ThreadLocalStoreImpl>(allocator);
+
+  options_.config_path_ = TestEnvironment::temporaryFileSubstitute(
+      "test/server/test_data/server/empty_bootstrap.yaml", {}, version_);
+  thread_local_ = std::make_unique<ThreadLocal::InstanceImpl>();
+  init_manager_ = std::make_unique<Init::ManagerImpl>("Server");
+  server_ = std::make_unique<InstanceImpl>(
+      *init_manager_, options_, time_system_, hooks_, restart_, *real_store, fakelock_,
+      std::make_unique<NiceMock<Random::MockRandomGenerator>>(), *thread_local_,
+      Thread::threadFactoryForTest(), Filesystem::fileSystemForTest(), nullptr);
+  server_->initialize(std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"),
+                      component_factory_);
+  EXPECT_FALSE(real_store->useExplicitTags());
+
+  server_.reset();
+  real_store.reset();
+  thread_local_.reset();
+}
+
 // Validates that server stats are flushed even when server is stuck with initialization.
 TEST_P(ServerInstanceImplTest, StatsFlushWhenServerIsStillInitializing) {
   CustomStatsSinkFactory factory;
@@ -436,7 +599,7 @@ TEST_P(ServerInstanceImplTest, StatsFlushWhenServerIsStillInitializing) {
       startTestServer("test/server/test_data/server/stats_sink_bootstrap.yaml", true);
 
   // Wait till stats are flushed to custom sink and validate that the actual flush happens.
-  TestUtility::waitForCounterEq(stats_store_, "stats.flushed", 1, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(stats_store_, "stats.flushed", Eq(1), time_system_));
   EXPECT_EQ(3L, TestUtility::findGauge(stats_store_, "server.state")->value());
   EXPECT_EQ(Init::Manager::State::Initializing, server_->initManager().state());
 
@@ -471,13 +634,6 @@ TEST_P(ServerInstanceImplTest, ValidateFIPSModeStat) {
 
   server_->dispatcher().post([&] { server_->shutdown(); });
   server_thread->join();
-}
-
-// Validate the the Envoy FIPS compilation flags are consistent with the FIPS
-// mode of the underlying BoringSSL build.
-TEST_P(ServerInstanceImplTest, ValidateFIPSModeConsistency) {
-  bool isFIPS = (FIPS_mode() != 0);
-  EXPECT_EQ(isFIPS, VersionInfo::sslFipsCompliant());
 }
 
 TEST_P(ServerInstanceImplTest, EmptyShutdownLifecycleNotifications) {
@@ -532,16 +688,18 @@ TEST_P(ServerInstanceImplTest, LifecycleNotifications) {
       post_init = true;
       post_init_fired.Notify();
     });
-    auto handle3 = server_->registerCallback(ServerLifecycleNotifier::Stage::ShutdownExit, [&] {
-      shutdown = true;
-      shutdown_begin.Notify();
-    });
+    ServerLifecycleNotifier::HandlePtr handle3 =
+        server_->registerCallback(ServerLifecycleNotifier::Stage::ShutdownExit, [&] {
+          shutdown = true;
+          shutdown_begin.Notify();
+          handle3 = nullptr;
+        });
     auto handle4 = server_->registerCallback(ServerLifecycleNotifier::Stage::ShutdownExit,
                                              [&](Event::PostCb completion_cb) {
                                                // Block till we're told to complete
                                                completion_block.WaitForNotification();
                                                shutdown_with_completion = true;
-                                               server_->dispatcher().post(completion_cb);
+                                               server_->dispatcher().post(std::move(completion_cb));
                                                completion_done.Notify();
                                              });
     auto handle5 =
@@ -553,7 +711,7 @@ TEST_P(ServerInstanceImplTest, LifecycleNotifications) {
     server_->run();
     handle1 = nullptr;
     handle2 = nullptr;
-    handle3 = nullptr;
+    // handle3 is nulled out in the callback itself, to test that works as well
     handle4 = nullptr;
     server_ = nullptr;
     thread_local_ = nullptr;
@@ -583,35 +741,80 @@ TEST_P(ServerInstanceImplTest, LifecycleNotifications) {
   server_thread->join();
 }
 
-TEST_P(ServerInstanceImplTest, DrainParentListenerAfterWorkersStarted) {
-  bool workers_started = false;
-  absl::Notification workers_started_fired, workers_started_block;
-  // Expect drainParentListeners not to be called before workers start.
-  EXPECT_CALL(restart_, drainParentListeners).Times(0);
+class ServerInstanceImplWorkersTest : public ServerInstanceImplTest {
+protected:
+  ServerInstanceImplWorkersTest() {
+    bool workers_started = false;
 
-  // Run the server in a separate thread so we can test different lifecycle stages.
-  auto server_thread = Thread::threadFactoryForTest().createThread([&] {
-    auto hooks = CustomListenerHooks([&]() {
-      workers_started = true;
-      workers_started_fired.Notify();
-      workers_started_block.WaitForNotification();
+    // Expect drainParentListeners not to be called before workers start.
+    EXPECT_CALL(restart_, drainParentListeners).Times(0);
+
+    // Run the server in a separate thread so we can test different lifecycle stages.
+    server_thread_ = Thread::threadFactoryForTest().createThread([&] {
+      auto hooks = CustomListenerHooks([&]() {
+        workers_started = true;
+        workers_started_fired_.Notify();
+        workers_started_block_.WaitForNotification();
+      });
+      initialize("test/server/test_data/server/node_bootstrap.yaml", false, hooks);
+      server_->run();
+      server_ = nullptr;
+      thread_local_ = nullptr;
     });
-    initialize("test/server/test_data/server/node_bootstrap.yaml", false, hooks);
-    server_->run();
-    server_ = nullptr;
-    thread_local_ = nullptr;
-  });
 
-  workers_started_fired.WaitForNotification();
-  EXPECT_TRUE(workers_started);
+    workers_started_fired_.WaitForNotification();
+    EXPECT_TRUE(workers_started);
+    EXPECT_CALL(restart_, drainParentListeners);
+  }
+
+  ~ServerInstanceImplWorkersTest() override {
+    server_->dispatcher().post([&] { server_->shutdown(); });
+    server_thread_->join();
+  }
+
+  absl::Notification workers_started_fired_;
+  absl::Notification workers_started_block_;
+  Thread::ThreadPtr server_thread_;
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, ServerInstanceImplWorkersTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+TEST_P(ServerInstanceImplWorkersTest, DrainParentListenerAfterWorkersStarted) {
   EXPECT_TRUE(TestUtility::findGauge(stats_store_, "server.state")->used());
   EXPECT_EQ(0L, TestUtility::findGauge(stats_store_, "server.state")->value());
+  workers_started_block_.Notify();
+}
 
-  EXPECT_CALL(restart_, drainParentListeners);
-  workers_started_block.Notify();
+TEST_P(ServerInstanceImplWorkersTest, DrainCloseAfterWorkersStarted) {
+  absl::Notification drain_closes_started, drain_complete;
+  workers_started_block_.Notify();
 
-  server_->dispatcher().post([&] { server_->shutdown(); });
-  server_thread->join();
+  DrainManager& drain_manager = server_->drainManager();
+
+  // To reproduce the race condition from
+  // https://github.com/envoyproxy/envoy/issues/31457 we make sure that the
+  // infinite drainClose spin-loop (mimicing high traffic) is running before we
+  // initiate the drain sequence.
+  auto drain_thread = Thread::threadFactoryForTest().createThread([&] {
+    bool closed = drain_manager.drainClose(Network::DrainDirection::All);
+    drain_closes_started.Notify();
+    while (!closed) {
+      closed = drain_manager.drainClose(Network::DrainDirection::All);
+    }
+  });
+  drain_closes_started.WaitForNotification();
+
+  // Now that we are starting to try to call drainClose, we'll start the drain sequence, then
+  // wait for that to complete.
+  server_->dispatcher().post([&] {
+    drain_manager.startDrainSequence(Network::DrainDirection::All,
+                                     [&drain_complete]() { drain_complete.Notify(); });
+  });
+
+  drain_complete.WaitForNotification();
+  drain_thread->join();
 }
 
 // A test target which never signals that it is ready.
@@ -690,6 +893,10 @@ TEST_P(ServerInstanceImplTest, Stats) {
   EXPECT_EQ(2L, TestUtility::findGauge(stats_store_, "server.concurrency")->value());
   EXPECT_EQ(3L, TestUtility::findGauge(stats_store_, "server.hot_restart_epoch")->value());
 
+  ENVOY_NOTIFICATION("name", "stuff");
+  ENVOY_NOTIFICATION("name1", "stuff1");
+  ENVOY_NOTIFICATION("name3", "stuff3");
+  EXPECT_EQ(3L, TestUtility::findCounter(stats_store_, "server.envoy_notifications")->value());
 // The ENVOY_BUG stat works in release mode.
 #if defined(NDEBUG)
   // Test exponential back-off on a fixed line ENVOY_BUG.
@@ -791,11 +998,43 @@ TEST_P(ServerInstanceImplTest, FlushStatsOnAdmin) {
   // Flush via admin.
   Http::TestResponseHeaderMapImpl response_headers;
   std::string body;
-  EXPECT_EQ(Http::Code::OK, server_->admin().request("/stats", "GET", response_headers, body));
+  EXPECT_EQ(Http::Code::OK, server_->admin()->request("/stats", "GET", response_headers, body));
   EXPECT_EQ(1L, counter->value());
 
   time_system_.advanceTimeWait(std::chrono::seconds(6));
   EXPECT_EQ(1L, counter->value());
+
+  server_->dispatcher().post([&] { server_->shutdown(); });
+  server_thread->join();
+}
+
+TEST_P(ServerInstanceImplTest, EvictStats) {
+  CustomStatsSinkFactory factory;
+  Registry::InjectFactory<Server::Configuration::StatsSinkFactory> registered(factory);
+  auto server_thread =
+      startTestServer("test/server/test_data/server/stats_evict_bootstrap.yaml", true);
+  EXPECT_EQ(2, server_->statsConfig().evictOnFlush());
+  EXPECT_EQ(std::chrono::seconds(5), server_->statsConfig().flushInterval());
+
+  auto counter = TestUtility::findCounter(stats_store_, "stats.flushed");
+
+  time_system_.advanceTimeWait(std::chrono::seconds(6));
+  EXPECT_EQ(1L, counter->value());
+  EXPECT_EQ(0, stats_store_.evictionCount());
+
+  // Eviction applied here: side-effect is that c1 is now marked as unused.
+  time_system_.advanceTimeWait(std::chrono::seconds(6));
+  EXPECT_EQ(2L, counter->value());
+  EXPECT_EQ(1, stats_store_.evictionCount());
+
+  time_system_.advanceTimeWait(std::chrono::seconds(6));
+  EXPECT_EQ(3L, counter->value());
+  EXPECT_EQ(1, stats_store_.evictionCount());
+
+  // Second pass of eviction deletes the counter.
+  time_system_.advanceTimeWait(std::chrono::seconds(6));
+  EXPECT_EQ(4L, counter->value());
+  EXPECT_EQ(2, stats_store_.evictionCount());
 
   server_->dispatcher().post([&] { server_->shutdown(); });
   server_thread->join();
@@ -829,12 +1068,12 @@ TEST_P(ServerInstanceImplTest, ConcurrentFlushes) {
     server_->flushStats();
   });
 
-  EXPECT_TRUE(
-      TestUtility::waitForCounterEq(stats_store_, "server.dropped_stat_flushes", 2, time_system_));
+  EXPECT_TRUE(TestUtility::waitForCounter(stats_store_, "server.dropped_stat_flushes", Eq(2),
+                                          time_system_));
 
   server_->dispatcher().post([&] { stats_store_.runMergeCallback(); });
 
-  EXPECT_TRUE(TestUtility::waitForCounterEq(stats_store_, "stats.flushed", 1, time_system_));
+  EXPECT_TRUE(TestUtility::waitForCounter(stats_store_, "stats.flushed", Eq(1), time_system_));
 
   // Trigger another flush after the first one finished. This should go through an no drops should
   // be recorded.
@@ -842,10 +1081,10 @@ TEST_P(ServerInstanceImplTest, ConcurrentFlushes) {
 
   server_->dispatcher().post([&] { stats_store_.runMergeCallback(); });
 
-  EXPECT_TRUE(TestUtility::waitForCounterEq(stats_store_, "stats.flushed", 2, time_system_));
+  EXPECT_TRUE(TestUtility::waitForCounter(stats_store_, "stats.flushed", Eq(2), time_system_));
 
-  EXPECT_TRUE(
-      TestUtility::waitForCounterEq(stats_store_, "server.dropped_stat_flushes", 2, time_system_));
+  EXPECT_TRUE(TestUtility::waitForCounter(stats_store_, "server.dropped_stat_flushes", Eq(2),
+                                          time_system_));
 
   server_->dispatcher().post([&] { server_->shutdown(); });
   server_thread->join();
@@ -856,12 +1095,11 @@ TEST_P(ServerInstanceImplTest, ValidationDefault) {
   options_.service_cluster_name_ = "some_cluster_name";
   options_.service_node_name_ = "some_node_name";
   EXPECT_NO_THROW(initialize("test/server/test_data/server/empty_bootstrap.yaml"));
-  EXPECT_THAT_THROWS_MESSAGE(
-      server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo"),
-      EnvoyException, "Protobuf message (foo) has unknown fields");
+  EXPECT_EQ(
+      server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo").message(),
+      "Protobuf message (foo) has unknown fields");
   EXPECT_EQ(0, TestUtility::findCounter(stats_store_, "server.static_unknown_fields")->value());
-  EXPECT_NO_THROW(
-      server_->messageValidationContext().dynamicValidationVisitor().onUnknownField("bar"));
+  EXPECT_OK(server_->messageValidationContext().dynamicValidationVisitor().onUnknownField("bar"));
   EXPECT_EQ(1, TestUtility::findCounter(stats_store_, "server.dynamic_unknown_fields")->value());
 }
 
@@ -871,11 +1109,9 @@ TEST_P(ServerInstanceImplTest, ValidationAllowStatic) {
   options_.service_node_name_ = "some_node_name";
   options_.allow_unknown_static_fields_ = true;
   EXPECT_NO_THROW(initialize("test/server/test_data/server/empty_bootstrap.yaml"));
-  EXPECT_NO_THROW(
-      server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo"));
+  EXPECT_OK(server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo"));
   EXPECT_EQ(1, TestUtility::findCounter(stats_store_, "server.static_unknown_fields")->value());
-  EXPECT_NO_THROW(
-      server_->messageValidationContext().dynamicValidationVisitor().onUnknownField("bar"));
+  EXPECT_OK(server_->messageValidationContext().dynamicValidationVisitor().onUnknownField("bar"));
   EXPECT_EQ(1, TestUtility::findCounter(stats_store_, "server.dynamic_unknown_fields")->value());
 }
 
@@ -886,13 +1122,15 @@ TEST_P(ServerInstanceImplTest, ValidationRejectDynamic) {
   options_.reject_unknown_dynamic_fields_ = true;
   options_.ignore_unknown_dynamic_fields_ = true; // reject takes precedence over ignore
   EXPECT_NO_THROW(initialize("test/server/test_data/server/empty_bootstrap.yaml"));
-  EXPECT_THAT_THROWS_MESSAGE(
-      server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo"),
-      EnvoyException, "Protobuf message (foo) has unknown fields");
+  EXPECT_EQ(
+      server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo").message(),
+      "Protobuf message (foo) has unknown fields");
   EXPECT_EQ(0, TestUtility::findCounter(stats_store_, "server.static_unknown_fields")->value());
-  EXPECT_THAT_THROWS_MESSAGE(
-      server_->messageValidationContext().dynamicValidationVisitor().onUnknownField("bar"),
-      EnvoyException, "Protobuf message (bar) has unknown fields");
+  EXPECT_EQ(server_->messageValidationContext()
+                .dynamicValidationVisitor()
+                .onUnknownField("bar")
+                .message(),
+            "Protobuf message (bar) has unknown fields");
   EXPECT_EQ(0, TestUtility::findCounter(stats_store_, "server.dynamic_unknown_fields")->value());
 }
 
@@ -903,12 +1141,13 @@ TEST_P(ServerInstanceImplTest, ValidationAllowStaticRejectDynamic) {
   options_.allow_unknown_static_fields_ = true;
   options_.reject_unknown_dynamic_fields_ = true;
   EXPECT_NO_THROW(initialize("test/server/test_data/server/empty_bootstrap.yaml"));
-  EXPECT_NO_THROW(
-      server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo"));
+  EXPECT_OK(server_->messageValidationContext().staticValidationVisitor().onUnknownField("foo"));
   EXPECT_EQ(1, TestUtility::findCounter(stats_store_, "server.static_unknown_fields")->value());
-  EXPECT_THAT_THROWS_MESSAGE(
-      server_->messageValidationContext().dynamicValidationVisitor().onUnknownField("bar"),
-      EnvoyException, "Protobuf message (bar) has unknown fields");
+  EXPECT_EQ(server_->messageValidationContext()
+                .dynamicValidationVisitor()
+                .onUnknownField("bar")
+                .message(),
+            "Protobuf message (bar) has unknown fields");
   EXPECT_EQ(0, TestUtility::findCounter(stats_store_, "server.dynamic_unknown_fields")->value());
 }
 
@@ -1020,7 +1259,6 @@ TEST_P(ServerInstanceImplTest, BootstrapNodeWithOptionsOverride) {
 TEST_P(ServerInstanceImplTest, BootstrapRuntime) {
   options_.service_cluster_name_ = "some_service";
   initialize("test/server/test_data/server/runtime_bootstrap.yaml");
-  EXPECT_FALSE(server_->enableReusePortDefault());
   EXPECT_EQ("bar", server_->runtime().snapshot().get("foo").value().get());
   // This should access via the override/some_service overlay.
   EXPECT_EQ("fozz", server_->runtime().snapshot().get("fizz").value().get());
@@ -1034,11 +1272,11 @@ TEST_P(ServerInstanceImplTest, RuntimeNoAdminLayer) {
   Http::TestResponseHeaderMapImpl response_headers;
   std::string response_body;
   EXPECT_EQ(Http::Code::OK,
-            server_->admin().request("/runtime", "GET", response_headers, response_body));
+            server_->admin()->request("/runtime", "GET", response_headers, response_body));
   EXPECT_THAT(response_body, HasSubstr("fozz"));
-  EXPECT_EQ(
-      Http::Code::ServiceUnavailable,
-      server_->admin().request("/runtime_modify?foo=bar", "POST", response_headers, response_body));
+  EXPECT_EQ(Http::Code::ServiceUnavailable,
+            server_->admin()->request("/runtime_modify?foo=bar", "POST", response_headers,
+                                      response_body));
   EXPECT_EQ("No admin layer specified", response_body);
 }
 
@@ -1056,6 +1294,19 @@ TEST_P(ServerInstanceImplTest, BootstrapRtdsThroughAdsViaEdsFails) {
   options_.service_node_name_ = "some_node_name";
   EXPECT_THROW_WITH_REGEX(initialize("test/server/test_data/server/runtime_bootstrap_ads_eds.yaml"),
                           EnvoyException, "Unknown gRPC client cluster");
+}
+
+// Verify that RTDS over ADS initializes successfully and doesn't crash on shutdown.
+TEST_P(ServerInstanceImplTest, RtdsOverAdsShutdown) {
+  Config::MockXdsConfigTrackerFactory factory;
+  Registry::InjectFactory<Config::XdsConfigTrackerFactory> registered(factory);
+
+  options_.service_cluster_name_ = "some_service";
+  options_.service_node_name_ = "some_node_name";
+  auto server_thread =
+      startTestServer("test/server/test_data/server/runtime_bootstrap_rtds_ads.yaml", false);
+  server_->shutdown();
+  server_thread->join();
 }
 
 // Validate invalid runtime in bootstrap is rejected.
@@ -1091,14 +1342,6 @@ TEST_P(ServerInstanceImplTest, InvalidLayeredBootstrapNoLayerSpecifier) {
 TEST_P(ServerInstanceImplTest, BootstrapClusterManagerInitializationFail) {
   EXPECT_THROW_WITH_MESSAGE(initialize("test/server/test_data/server/cluster_dupe_bootstrap.yaml"),
                             EnvoyException, "cluster manager: duplicate cluster 'service_google'");
-}
-
-// Regression tests for SdsApi throwing exceptions in initialize().
-TEST_P(ServerInstanceImplTest, BadSdsConfigSource) {
-  EXPECT_THROW_WITH_MESSAGE(
-      initialize("test/server/test_data/server/bad_sds_config_source.yaml"), EnvoyException,
-      "envoy.config.core.v3.ApiConfigSource must have a statically defined non-EDS cluster: "
-      "'sds-grpc' does not exist, was added via api, or is an EDS cluster");
 }
 
 // Test for protoc-gen-validate constraint on invalid timeout entry of a health check config entry.
@@ -1139,7 +1382,7 @@ TEST_P(ServerInstanceImplTest, BootstrapNodeNoAdmin) {
   // Admin::addListenerToHandler() calls one of handler's methods after checking that the Admin
   // has a listener. So, the fact that passing a nullptr doesn't cause a segfault establishes
   // that there is no listener.
-  server_->admin().addListenerToHandler(/*handler=*/nullptr);
+  server_->admin()->addListenerToHandler(/*handler=*/nullptr);
 }
 
 namespace {
@@ -1161,7 +1404,7 @@ TEST_P(ServerInstanceImplTest, BootstrapNodeWithSocketOptions) {
   // Start Envoy instance with admin port with SO_REUSEPORT option.
   ASSERT_NO_THROW(
       initialize("test/server/test_data/server/node_bootstrap_with_admin_socket_options.yaml"));
-  const auto address = server_->admin().socket().connectionInfoProvider().localAddress();
+  const auto address = server_->admin()->socket().connectionInfoProvider().localAddress();
 
   // First attempt to bind and listen socket should fail due to the lack of SO_REUSEPORT socket
   // options.
@@ -1217,14 +1460,14 @@ TEST_P(ServerInstanceImplTest, LogToFile) {
   GET_MISC_LOGGER().set_level(spdlog::level::info);
   ENVOY_LOG_MISC(warn, "LogToFile test string");
   Logger::Registry::getSink()->flush();
-  std::string log = server_->api().fileSystem().fileReadToEnd(path);
+  std::string log = server_->api().fileSystem().fileReadToEnd(path).value();
   EXPECT_GT(log.size(), 0);
-  EXPECT_TRUE(log.find("LogToFile test string") != std::string::npos);
+  EXPECT_THAT(log, HasSubstr("LogToFile test string"));
 
   // Test that critical messages get immediately flushed
   ENVOY_LOG_MISC(critical, "LogToFile second test string");
-  log = server_->api().fileSystem().fileReadToEnd(path);
-  EXPECT_TRUE(log.find("LogToFile second test string") != std::string::npos);
+  log = server_->api().fileSystem().fileReadToEnd(path).value();
+  EXPECT_THAT(log, HasSubstr("LogToFile second test string"));
 }
 
 TEST_P(ServerInstanceImplTest, LogToFileError) {
@@ -1244,16 +1487,30 @@ TEST_P(ServerInstanceImplTest, LogToFileError) {
 TEST_P(ServerInstanceImplTest, NoOptionsPassed) {
   thread_local_ = std::make_unique<ThreadLocal::InstanceImpl>();
   init_manager_ = std::make_unique<Init::ManagerImpl>("Server");
+  server_ = std::make_unique<InstanceImpl>(
+      *init_manager_, options_, time_system_, hooks_, restart_, stats_store_, fakelock_,
+      std::make_unique<NiceMock<Random::MockRandomGenerator>>(), *thread_local_,
+      Thread::threadFactoryForTest(), Filesystem::fileSystemForTest(), nullptr);
   EXPECT_THROW_WITH_MESSAGE(
-      server_.reset(new InstanceImpl(*init_manager_, options_, time_system_,
-                                     std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"),
-                                     hooks_, restart_, stats_store_, fakelock_, component_factory_,
-                                     std::make_unique<NiceMock<Random::MockRandomGenerator>>(),
-                                     *thread_local_, Thread::threadFactoryForTest(),
-                                     Filesystem::fileSystemForTest(), nullptr)),
+      server_->initialize(std::make_shared<Network::Address::Ipv4Instance>("127.0.0.1"),
+                          component_factory_),
       EnvoyException,
       "At least one of --config-path or --config-yaml or Options::configProto() should be "
       "non-empty");
+}
+
+TEST_P(ServerInstanceImplTest, ServerContextSingleton) {
+  thread_local_ = std::make_unique<ThreadLocal::InstanceImpl>();
+  init_manager_ = std::make_unique<Init::ManagerImpl>("Server");
+  server_ = std::make_unique<InstanceImpl>(
+      *init_manager_, options_, time_system_, hooks_, restart_, stats_store_, fakelock_,
+      std::make_unique<NiceMock<Random::MockRandomGenerator>>(), *thread_local_,
+      Thread::threadFactoryForTest(), Filesystem::fileSystemForTest(), nullptr);
+
+  EXPECT_EQ(&server_->serverFactoryContext(),
+            Configuration::ServerFactoryContextInstance::getExisting());
+  server_ = nullptr;
+  EXPECT_EQ(nullptr, Configuration::ServerFactoryContextInstance::getExisting());
 }
 
 // Validate that when std::exception is unexpectedly thrown, we exit safely.
@@ -1348,14 +1605,16 @@ TEST_P(ServerInstanceImplTest, WithBootstrapExtensions) {
   EXPECT_CALL(mock_factory, createBootstrapExtension(_, _))
       .WillOnce(
           Invoke([](const Protobuf::Message& config, Configuration::ServerFactoryContext& ctx) {
-            const auto* proto = dynamic_cast<const test::common::config::DummyConfig*>(&config);
+            const auto* proto =
+                Envoy::Protobuf::DynamicCastMessage<test::common::config::DummyConfig>(&config);
             EXPECT_NE(nullptr, proto);
             EXPECT_EQ(proto->a(), "foo");
             auto mock_extension = std::make_unique<MockBootstrapExtension>();
-            EXPECT_CALL(*mock_extension, onServerInitialized()).WillOnce(Invoke([&ctx]() {
+            EXPECT_CALL(*mock_extension, onServerInitialized(_)).WillOnce(Invoke([&ctx]() {
               // call to cluster manager, to make sure it is not nullptr.
               ctx.clusterManager().clusters();
             }));
+            EXPECT_CALL(*mock_extension, onWorkerThreadInitialized());
             return mock_extension;
           }));
 
@@ -1385,9 +1644,10 @@ TEST_P(ServerInstanceImplTest, WithBootstrapExtensionsThrowingError) {
 }
 
 TEST_P(ServerInstanceImplTest, WithUnknownBootstrapExtensions) {
-  EXPECT_THROW_WITH_REGEX(
-      initialize("test/server/test_data/server/bootstrap_extensions.yaml"), EnvoyException,
-      "Didn't find a registered implementation for name: 'envoy_test.bootstrap.foo'");
+  EXPECT_THROW_WITH_REGEX(initialize("test/server/test_data/server/bootstrap_extensions.yaml"),
+                          EnvoyException,
+                          "Didn't find a registered implementation for 'envoy_test.bootstrap.foo' "
+                          "with type URL: 'test.common.config.DummyConfig'");
 }
 
 // Insufficient support on Windows.
@@ -1424,7 +1684,7 @@ TEST_P(ServerInstanceImplTest, WithFatalActions) {
   // Inject Unsafe Factory
   NiceMock<Configuration::MockFatalActionFactory> mock_unsafe_factory;
   EXPECT_CALL(mock_unsafe_factory, createEmptyConfigProto()).WillRepeatedly(Invoke([]() {
-    return std::make_unique<envoy::config::bootstrap::v3::FatalAction>();
+    return std::make_unique<Protobuf::Struct>();
   }));
   EXPECT_CALL(mock_unsafe_factory, name()).WillRepeatedly(Return("envoy_test.fatal_action.unsafe"));
 
@@ -1530,8 +1790,8 @@ public:
   void onHistogramComplete(const Stats::Histogram&, uint64_t) override {}
 
   // Upstream::ClusterUpdateCallbacks
-  void onClusterAddOrUpdate(Upstream::ThreadLocalCluster&) override {}
-  void onClusterRemoval(const std::string&) override {}
+  void onClusterAddOrUpdate(absl::string_view, Upstream::ThreadLocalClusterCommand&) override {}
+  void onClusterRemoval(absl::string_view) override {}
 
 private:
   Upstream::ClusterUpdateCallbacksHandlePtr cluster_removal_cb_handle_;
@@ -1541,15 +1801,16 @@ private:
 class CallbacksStatsSinkFactory : public Server::Configuration::StatsSinkFactory {
 public:
   // StatsSinkFactory
-  Stats::SinkPtr createStatsSink(const Protobuf::Message&,
-                                 Server::Configuration::ServerFactoryContext& server) override {
+  absl::StatusOr<Stats::SinkPtr>
+  createStatsSink(const Protobuf::Message&,
+                  Server::Configuration::ServerFactoryContext& server) override {
     return std::make_unique<CallbacksStatsSink>(server);
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { return "envoy.callbacks_stats_sink"; }
@@ -1570,7 +1831,7 @@ TEST_P(ServerInstanceImplTest, CallbacksStatsSinkTest) {
 
 // Validate that disabled extension is reflected in the list of Node extensions.
 TEST_P(ServerInstanceImplTest, DisabledExtension) {
-  OptionsImpl::disableExtensions({"envoy.filters.http/envoy.filters.http.buffer"});
+  OptionsImplBase::disableExtensions({"envoy.filters.http/envoy.filters.http.buffer"});
   initialize("test/server/test_data/server/node_bootstrap.yaml");
   bool disabled_filter_found = false;
   for (const auto& extension : server_->localInfo().node().extensions()) {
@@ -1600,6 +1861,82 @@ TEST_P(ServerInstanceImplTest, AdminAccessLogFilter) {
   options_.service_cluster_name_ = "some_cluster_name";
   options_.service_node_name_ = "some_node_name";
   EXPECT_NO_THROW(initialize("test/server/test_data/server/access_log_filter_bootstrap.yaml"));
+}
+
+TEST_P(ServerInstanceImplTest, BootstrapApplicationLogsAndCLIThrows) {
+  EXPECT_CALL(options_, logFormatSet()).WillRepeatedly(Return(true));
+  EXPECT_THROW_WITH_MESSAGE(
+      initialize("test/server/test_data/server/json_application_log.yaml"), EnvoyException,
+      "Only one of ApplicationLogConfig.log_format or CLI option --log-format can be specified.");
+}
+
+TEST_P(ServerInstanceImplTest, JsonApplicationLog) {
+  EXPECT_NO_THROW(initialize("test/server/test_data/server/json_application_log.yaml"));
+
+  Envoy::Logger::Registry::setLogLevel(Logger::Levels::info);
+  MockLogSink sink(Envoy::Logger::Registry::getSink());
+  EXPECT_CALL(sink, log(_, _)).WillOnce(Invoke([](auto msg, auto& log) {
+    EXPECT_OK(Json::Factory::loadFromString(std::string(msg)).status());
+    EXPECT_THAT(msg, HasSubstr("{\"MessageFromProto\":\"hello\"}"));
+    EXPECT_EQ(log.logger_name, "misc");
+  }));
+
+  ENVOY_LOG_MISC(info, "hello");
+}
+
+TEST_P(ServerInstanceImplTest, JsonApplicationLogFailWithForbiddenFlagv) {
+  EXPECT_THROW_WITH_MESSAGE(
+      initialize("test/server/test_data/server/json_application_log_forbidden_flagv.yaml"),
+      EnvoyException,
+      "setJsonLogFormat error: INVALID_ARGUMENT: Usage of %v is unavailable for JSON log formats");
+}
+
+TEST_P(ServerInstanceImplTest, JsonApplicationLogFailWithForbiddenFlagUnderscore) {
+  EXPECT_THROW_WITH_MESSAGE(
+      initialize("test/server/test_data/server/json_application_log_forbidden_flag_.yaml"),
+      EnvoyException,
+      "setJsonLogFormat error: INVALID_ARGUMENT: Usage of %_ is unavailable for JSON log formats");
+}
+
+TEST_P(ServerInstanceImplTest, TextApplicationLog) {
+  EXPECT_NO_THROW(initialize("test/server/test_data/server/text_application_log.yaml"));
+
+  Envoy::Logger::Registry::setLogLevel(Logger::Levels::info);
+  MockLogSink sink(Envoy::Logger::Registry::getSink());
+  EXPECT_CALL(sink, log(_, _)).WillOnce(Invoke([](auto msg, auto& log) {
+    EXPECT_THAT(msg, HasSubstr("[lvl: info][msg: hello]"));
+    EXPECT_EQ(log.logger_name, "misc");
+  }));
+
+  ENVOY_LOG_MISC(info, "hello");
+}
+
+// Test that deprecated runtime key warning is logged when skip_deprecated_logs is false
+TEST_P(ServerInstanceImplTest, DeprecatedRuntimeKeyWarningWhenNotSkipped) {
+  // Set skip_deprecated_logs to false (default)
+  ON_CALL(options_, skipDeprecatedLogs()).WillByDefault(Return(false));
+
+  EXPECT_LOG_CONTAINS(
+      "warn",
+      "Usage of the deprecated runtime key overload.global_downstream_max_connections, consider "
+      "switching to "
+      "`envoy.resource_monitors.global_downstream_max_connections` instead."
+      "This runtime key will be removed in future.",
+      { initialize("test/server/test_data/server/deprecated_runtime_key_bootstrap.yaml"); });
+}
+
+// Test that deprecated runtime key warning is suppressed when skip_deprecated_logs is true
+TEST_P(ServerInstanceImplTest, DeprecatedRuntimeKeyWarningWhenSkipped) {
+  // Set skip_deprecated_logs to true
+  ON_CALL(options_, skipDeprecatedLogs()).WillByDefault(Return(true));
+
+  EXPECT_LOG_NOT_CONTAINS(
+      "warn",
+      "Usage of the deprecated runtime key overload.global_downstream_max_connections, consider "
+      "switching to "
+      "`envoy.resource_monitors.global_downstream_max_connections` instead."
+      "This runtime key will be removed in future.",
+      { initialize("test/server/test_data/server/deprecated_runtime_key_bootstrap.yaml"); });
 }
 
 } // namespace

@@ -1,20 +1,29 @@
 load(":type_whisperer.bzl", "type_whisperer_aspect")
+load(":utils.bzl", "normalize_workspace_name")
 
 def _type_database_impl(ctx):
     type_db_deps = []
     for target in ctx.attr.targets:
         type_db_deps.append(target[OutputGroupInfo].types_pb_text)
     type_db_deps = depset(transitive = type_db_deps)
+    proto_repositories = ctx.attr.proto_repositories
 
-    args = [ctx.outputs.pb_text.path]
-    for dep in type_db_deps.to_list():
-        ws_name = dep.owner.workspace_name
-        if (not ws_name) or ws_name in ctx.attr.proto_repositories:
-            args.append(dep.path)
+    def _descriptor_set(dep):
+        ws_name = normalize_workspace_name(dep.owner.workspace_name)
+        if (not ws_name) or ws_name in proto_repositories:
+            return dep.path
+
+    args = ctx.actions.args()
+    args.add(ctx.outputs.pb_text)
+    args.add_all(
+        type_db_deps,
+        map_each = _descriptor_set,
+        allow_closure = True,
+    )
 
     ctx.actions.run(
         executable = ctx.executable._type_db_gen,
-        arguments = args,
+        arguments = [args],
         inputs = type_db_deps,
         outputs = [ctx.outputs.pb_text],
         mnemonic = "TypeDbGen",

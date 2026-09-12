@@ -1,6 +1,9 @@
+#include <optional>
+
 #include "envoy/thread/thread.h"
 #include "envoy/thread_local/thread_local.h"
 
+#include "test/mocks/thread/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/test_common/thread_factory_for_test.h"
 
@@ -19,15 +22,9 @@ namespace {
 
 class MockUpstreamKafkaConfiguration : public UpstreamKafkaConfiguration {
 public:
-  MOCK_METHOD(absl::optional<ClusterConfig>, computeClusterConfigForTopic, (const std::string&),
+  MOCK_METHOD(std::optional<ClusterConfig>, computeClusterConfigForTopic, (const std::string&),
               (const));
   MOCK_METHOD((std::pair<std::string, int32_t>), getAdvertisedAddress, (), (const));
-};
-
-class MockThreadFactory : public Thread::ThreadFactory {
-public:
-  MOCK_METHOD(Thread::ThreadPtr, createThread, (std::function<void()>, Thread::OptionsOptConstRef));
-  MOCK_METHOD(Thread::ThreadId, currentThreadId, ());
 };
 
 TEST(UpstreamKafkaFacadeTest, shouldCreateProducerOnlyOnceForTheSameCluster) {
@@ -36,7 +33,8 @@ TEST(UpstreamKafkaFacadeTest, shouldCreateProducerOnlyOnceForTheSameCluster) {
   const std::string topic2 = "topic2";
 
   MockUpstreamKafkaConfiguration configuration;
-  const ClusterConfig cluster_config = {"cluster", 1, {{"bootstrap.servers", "localhost:9092"}}};
+  const ClusterConfig cluster_config = {
+      "cluster", 1, {{"bootstrap.servers", "localhost:9092"}}, {}};
   EXPECT_CALL(configuration, computeClusterConfigForTopic(topic1)).WillOnce(Return(cluster_config));
   EXPECT_CALL(configuration, computeClusterConfigForTopic(topic2)).WillOnce(Return(cluster_config));
   ThreadLocal::MockInstance slot_allocator;
@@ -61,10 +59,12 @@ TEST(UpstreamKafkaFacadeTest, shouldCreateDifferentProducersForDifferentClusters
 
   MockUpstreamKafkaConfiguration configuration;
   // Notice it's the cluster name that matters, not the producer config.
-  const ClusterConfig cluster_config1 = {"cluster1", 1, {{"bootstrap.servers", "localhost:9092"}}};
+  const ClusterConfig cluster_config1 = {
+      "cluster1", 1, {{"bootstrap.servers", "localhost:9092"}}, {}};
   EXPECT_CALL(configuration, computeClusterConfigForTopic(topic1))
       .WillOnce(Return(cluster_config1));
-  const ClusterConfig cluster_config2 = {"cluster2", 1, {{"bootstrap.servers", "localhost:9092"}}};
+  const ClusterConfig cluster_config2 = {
+      "cluster2", 1, {{"bootstrap.servers", "localhost:9092"}}, {}};
   EXPECT_CALL(configuration, computeClusterConfigForTopic(topic2))
       .WillOnce(Return(cluster_config2));
   ThreadLocal::MockInstance slot_allocator;
@@ -87,8 +87,9 @@ TEST(UpstreamKafkaFacadeTest, shouldThrowIfThereIsNoConfigurationForGivenTopic) 
   const std::string topic = "topic1";
 
   MockUpstreamKafkaConfiguration configuration;
-  const ClusterConfig cluster_config = {"cluster", 1, {{"bootstrap.servers", "localhost:9092"}}};
-  EXPECT_CALL(configuration, computeClusterConfigForTopic(topic)).WillOnce(Return(absl::nullopt));
+  const ClusterConfig cluster_config = {
+      "cluster", 1, {{"bootstrap.servers", "localhost:9092"}}, {}};
+  EXPECT_CALL(configuration, computeClusterConfigForTopic(topic)).WillOnce(Return(std::nullopt));
   ThreadLocal::MockInstance slot_allocator;
   EXPECT_CALL(slot_allocator, allocateSlot())
       .WillOnce(Invoke(&slot_allocator, &ThreadLocal::MockInstance::allocateSlotMock));

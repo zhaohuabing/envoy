@@ -20,17 +20,22 @@ namespace Stats {
 class HistogramSettingsImpl : public HistogramSettings {
 public:
   HistogramSettingsImpl() = default;
-  HistogramSettingsImpl(const envoy::config::metrics::v3::StatsConfig& config);
+  HistogramSettingsImpl(const envoy::config::metrics::v3::StatsConfig& config,
+                        Server::Configuration::CommonFactoryContext& context);
 
   // HistogramSettings
   const ConstSupportedBuckets& buckets(absl::string_view stat_name) const override;
+  std::optional<uint32_t> bins(absl::string_view stat_name) const override;
 
   static ConstSupportedBuckets& defaultBuckets();
 
 private:
-  using Config = std::pair<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>,
-                           ConstSupportedBuckets>;
-  const std::vector<Config> configs_{};
+  struct Config {
+    Matchers::StringMatcherImpl matcher_;
+    std::optional<ConstSupportedBuckets> buckets_;
+    std::optional<uint32_t> bins_;
+  };
+  const std::vector<Config> configs_;
 };
 
 /**
@@ -49,8 +54,6 @@ public:
       const histogram_t* histogram_ptr, Histogram::Unit unit = Histogram::Unit::Unspecified,
       ConstSupportedBuckets& supported_buckets = HistogramSettingsImpl::defaultBuckets());
 
-  static ConstSupportedBuckets& defaultSupportedBuckets();
-
   void refresh(const histogram_t* new_histogram_ptr);
 
   // HistogramStatistics
@@ -60,22 +63,25 @@ public:
   const std::vector<double>& computedQuantiles() const override { return computed_quantiles_; }
   ConstSupportedBuckets& supportedBuckets() const override { return supported_buckets_; }
   const std::vector<uint64_t>& computedBuckets() const override { return computed_buckets_; }
+  std::vector<uint64_t> computeDisjointBuckets() const override;
   uint64_t sampleCount() const override { return sample_count_; }
+  uint64_t outOfBoundCount() const override { return out_of_bound_count_; }
   double sampleSum() const override { return sample_sum_; }
 
 private:
   ConstSupportedBuckets& supported_buckets_;
   std::vector<double> computed_quantiles_;
   std::vector<uint64_t> computed_buckets_;
-  uint64_t sample_count_;
-  double sample_sum_;
-  const Histogram::Unit unit_;
+  uint64_t sample_count_{0};
+  uint64_t out_of_bound_count_{0};
+  double sample_sum_{0};
+  const Histogram::Unit unit_{Histogram::Unit::Unspecified};
 };
 
 class HistogramImplHelper : public MetricImpl<Histogram> {
 public:
-  HistogramImplHelper(StatName name, StatName tag_extracted_name,
-                      const StatNameTagVector& stat_name_tags, SymbolTable& symbol_table)
+  HistogramImplHelper(StatName name, StatName tag_extracted_name, StatNameTagSpan stat_name_tags,
+                      SymbolTable& symbol_table)
       : MetricImpl<Histogram>(name, tag_extracted_name, stat_name_tags, symbol_table) {}
   HistogramImplHelper(SymbolTable& symbol_table) : MetricImpl<Histogram>(symbol_table) {}
 
@@ -94,7 +100,7 @@ private:
 class HistogramImpl : public HistogramImplHelper {
 public:
   HistogramImpl(StatName name, Unit unit, Store& parent, StatName tag_extracted_name,
-                const StatNameTagVector& stat_name_tags)
+                StatNameTagSpan stat_name_tags)
       : HistogramImplHelper(name, tag_extracted_name, stat_name_tags, parent.symbolTable()),
         unit_(unit), parent_(parent) {}
   ~HistogramImpl() override {
@@ -110,6 +116,8 @@ public:
   void recordValue(uint64_t value) override { parent_.deliverHistogramToSinks(*this, value); }
 
   bool used() const override { return true; }
+  void markUnused() override {}
+  bool hidden() const override { return false; }
   SymbolTable& symbolTable() final { return parent_.symbolTable(); }
 
 private:
@@ -130,6 +138,8 @@ public:
   ~NullHistogramImpl() override { MetricImpl::clear(symbol_table_); }
 
   bool used() const override { return false; }
+  void markUnused() override {}
+  bool hidden() const override { return false; }
   SymbolTable& symbolTable() override { return symbol_table_; }
 
   Unit unit() const override { return Unit::Null; };

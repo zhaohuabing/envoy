@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <type_traits>
 
 #include "envoy/common/pure.h"
 #include "envoy/config/typed_config.h"
@@ -63,7 +64,7 @@ public:
    * @throw EnvoyException if the parsing can't be done.
    */
   virtual std::unique_ptr<const TypedMetadata::Object>
-  parse(const ProtobufWkt::Struct& data) const PURE;
+  parse(const Protobuf::Struct& data) const PURE;
 
   /**
    * Convert the google.protobuf.Any into an instance of TypedMetadata::Object.
@@ -73,8 +74,7 @@ public:
    * one doesn't implement parse() method.
    * @throw EnvoyException if the parsing can't be done.
    */
-  virtual std::unique_ptr<const TypedMetadata::Object>
-  parse(const ProtobufWkt::Any& data) const PURE;
+  virtual std::unique_ptr<const TypedMetadata::Object> parse(const Protobuf::Any& data) const PURE;
 
   std::string category() const override { return "envoy.typed_metadata"; }
 };

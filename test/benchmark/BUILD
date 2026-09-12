@@ -12,15 +12,14 @@ envoy_cc_test_library(
     name = "main",
     srcs = ["main.cc"],
     hdrs = ["main.h"],
-    external_deps = [
-        "benchmark",
-        "tclap",
-    ],
     deps = [
+        "//envoy/common:logger",
         "//source/common/common:minimal_logger_lib",
         "//source/common/common:thread_lib",
         "//test/test_common:environment_lib",
         "//test/test_common:printers_lib",
         "//test/test_common:test_runtime_lib",
+        "@benchmark",
+        "@tclap",
     ],
 )

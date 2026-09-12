@@ -11,16 +11,17 @@ namespace Extensions {
 namespace HttpFilters {
 namespace GrpcHttp1ReverseBridge {
 
-Http::FilterFactoryCb Config::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> Config::createHttpFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::grpc_http1_reverse_bridge::v3::FilterConfig& config,
-    const std::string&, Server::Configuration::FactoryContext&) {
+    Server::Configuration::ServerFactoryContext&, Server::Configuration::ExtraFactoryContext&) {
   return [config](Envoy::Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(std::make_shared<Filter>(
         config.content_type(), config.withhold_grpc_frames(), config.response_size_header()));
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr Config::createRouteSpecificFilterConfigTyped(
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+Config::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::grpc_http1_reverse_bridge::v3::FilterConfigPerRoute&
         proto_config,
     Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {

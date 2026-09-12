@@ -26,6 +26,7 @@ public:
   bool getNullVmFunction(std::string_view function_name, bool returns_word, int number_of_arguments,
                          proxy_wasm::NullPlugin* plugin, void* ptr_to_function_return) override;
   proxy_wasm::LogLevel getLogLevel() override;
+  using proxy_wasm::WasmVmIntegration::error;
   void error(std::string_view message) override;
   void trace(std::string_view message) override;
 };
@@ -38,8 +39,19 @@ public:
 
 using WasmVmPtr = std::unique_ptr<proxy_wasm::WasmVm>;
 
-// Create a new low-level Wasm VM using runtime of the given type (e.g. "envoy.wasm.runtime.wavm").
+// Create a new low-level Wasm VM using runtime of the given type (e.g.
+// "envoy.wasm.runtime.wasmtime").
 WasmVmPtr createWasmVm(absl::string_view runtime);
+
+/**
+ * @return true if the provided Wasm Engine is compiled with Envoy
+ */
+bool isWasmEngineAvailable(absl::string_view runtime);
+
+/**
+ * @return the name of the first available Wasm Engine compiled with Envoy
+ */
+absl::string_view getFirstAvailableWasmEngineName();
 
 } // namespace Wasm
 } // namespace Common

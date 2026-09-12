@@ -1,6 +1,6 @@
 #include "envoy/admin/v3/memory.pb.h"
 
-#include "source/extensions/transport_sockets/tls/context_config_impl.h"
+#include "source/common/tls/context_config_impl.h"
 
 #include "test/server/admin/admin_instance.h"
 #include "test/test_common/logging.h"
@@ -25,10 +25,11 @@ TEST_P(AdminInstanceTest, ContextThatReturnsNullCertDetails) {
   // Setup a context that returns null cert details.
   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext> factory_context;
   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext config;
-  Extensions::TransportSockets::Tls::ClientContextConfigImpl cfg(config, factory_context);
-  Stats::IsolatedStoreImpl store;
+  auto cfg =
+      *Extensions::TransportSockets::Tls::ClientContextConfigImpl::create(config, factory_context);
+  Stats::IsolatedStoreImpl store(server_.serverFactoryContext().serverScope().symbolTable());
   Envoy::Ssl::ClientContextSharedPtr client_ctx(
-      server_.sslContextManager().createSslClientContext(store, cfg, nullptr));
+      *server_.sslContextManager().createSslClientContext(*store.rootScope(), *cfg));
 
   const std::string expected_empty_json = R"EOF({
  "certificates": [
@@ -45,6 +46,7 @@ TEST_P(AdminInstanceTest, ContextThatReturnsNullCertDetails) {
   EXPECT_TRUE(client_ctx->getCertChainInformation().empty());
   EXPECT_EQ(Http::Code::OK, getCallback("/certs", header_map, response));
   EXPECT_EQ(expected_empty_json, response.toString());
+  server_.sslContextManager().removeContext(client_ctx);
 }
 
 TEST_P(AdminInstanceTest, Memory) {
@@ -59,6 +61,19 @@ TEST_P(AdminInstanceTest, Memory) {
                                   Property(&envoy::admin::v3::Memory::pageheap_unmapped, Ge(0)),
                                   Property(&envoy::admin::v3::Memory::pageheap_free, Ge(0)),
                                   Property(&envoy::admin::v3::Memory::total_thread_cache, Ge(0))));
+}
+
+TEST_P(AdminInstanceTest, MemoryTcmalloc) {
+  Http::TestResponseHeaderMapImpl header_map;
+  Buffer::OwnedImpl response;
+  auto result_code = getCallback("/memory/tcmalloc", header_map, response);
+#if defined(TCMALLOC) || defined(GPERFTOOLS_TCMALLOC)
+  EXPECT_EQ(Http::Code::OK, result_code);
+  EXPECT_THAT(response.toString(), HasSubstr("Bytes in use by application"));
+#else
+  EXPECT_EQ(Http::Code::NotImplemented, result_code);
+  EXPECT_EQ("Envoy was not built with tcmalloc.\n", response.toString());
+#endif
 }
 
 TEST_P(AdminInstanceTest, GetReadyRequest) {
@@ -124,6 +139,7 @@ TEST_P(AdminInstanceTest, GetRequest) {
     TestUtility::loadFromJson(body, server_info_proto);
     EXPECT_EQ(server_info_proto.state(), envoy::admin::v3::ServerInfo::LIVE);
     EXPECT_EQ(server_info_proto.hot_restart_version(), "foo_version");
+    EXPECT_FALSE(server_info_proto.hot_restart_initializing());
     EXPECT_EQ(server_info_proto.command_line_options().restart_epoch(), 2);
     EXPECT_EQ(server_info_proto.command_line_options().service_cluster(), local_info.clusterName());
     EXPECT_EQ(server_info_proto.command_line_options().service_cluster(),
@@ -177,6 +193,55 @@ TEST_P(AdminInstanceTest, GetRequest) {
   EXPECT_EQ(server_info_proto.command_line_options().service_zone(), "");
   EXPECT_EQ(server_info_proto.node().id(), local_info.nodeName());
   EXPECT_EQ(server_info_proto.node().locality().zone(), local_info.zoneName());
+}
+
+TEST_P(AdminInstanceTest, ServerInfoHotRestartInitializing) {
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+  EXPECT_CALL(server_, localInfo()).WillRepeatedly(ReturnRef(local_info));
+  EXPECT_CALL(server_.options_, toCommandLineOptions()).WillRepeatedly(Invoke([&local_info] {
+    Server::CommandLineOptionsPtr command_line_options =
+        std::make_unique<envoy::admin::v3::CommandLineOptions>();
+    command_line_options->set_restart_epoch(2);
+    command_line_options->set_service_cluster(local_info.clusterName());
+    return command_line_options;
+  }));
+  NiceMock<Init::MockManager> initManager;
+  ON_CALL(server_, initManager()).WillByDefault(ReturnRef(initManager));
+  ON_CALL(server_.hot_restart_, version()).WillByDefault(Return("foo_version"));
+
+  {
+    // Test when hot restart is initializing
+    Http::TestResponseHeaderMapImpl response_headers;
+    std::string body;
+
+    ON_CALL(initManager, state()).WillByDefault(Return(Init::Manager::State::Initializing));
+    ON_CALL(server_.hot_restart_, isInitializing()).WillByDefault(Return(true));
+    EXPECT_EQ(Http::Code::OK, admin_.request("/server_info", "GET", response_headers, body));
+    envoy::admin::v3::ServerInfo server_info_proto;
+    EXPECT_THAT(std::string(response_headers.getContentTypeValue()), HasSubstr("application/json"));
+
+    TestUtility::loadFromJson(body, server_info_proto);
+    EXPECT_EQ(server_info_proto.state(), envoy::admin::v3::ServerInfo::INITIALIZING);
+    EXPECT_TRUE(server_info_proto.hot_restart_initializing());
+    EXPECT_EQ(server_info_proto.hot_restart_version(), "foo_version");
+  }
+
+  {
+    // Test when hot restart is not initializing
+    Http::TestResponseHeaderMapImpl response_headers;
+    std::string body;
+
+    ON_CALL(initManager, state()).WillByDefault(Return(Init::Manager::State::Initialized));
+    ON_CALL(server_.hot_restart_, isInitializing()).WillByDefault(Return(false));
+    EXPECT_EQ(Http::Code::OK, admin_.request("/server_info", "GET", response_headers, body));
+    envoy::admin::v3::ServerInfo server_info_proto;
+    EXPECT_THAT(std::string(response_headers.getContentTypeValue()), HasSubstr("application/json"));
+
+    TestUtility::loadFromJson(body, server_info_proto);
+    EXPECT_EQ(server_info_proto.state(), envoy::admin::v3::ServerInfo::LIVE);
+    EXPECT_FALSE(server_info_proto.hot_restart_initializing());
+    EXPECT_EQ(server_info_proto.hot_restart_version(), "foo_version");
+  }
 }
 
 TEST_P(AdminInstanceTest, PostRequest) {

@@ -14,15 +14,18 @@ namespace Csrf {
  * Config registration for the CSRF filter. @see NamedHttpFilterConfigFactory.
  */
 class CsrfFilterFactory
-    : public Common::FactoryBase<envoy::extensions::filters::http::csrf::v3::CsrfPolicy> {
+    : public Common::UnifiedFactoryBase<envoy::extensions::filters::http::csrf::v3::CsrfPolicy> {
 public:
-  CsrfFilterFactory() : FactoryBase("envoy.filters.http.csrf") {}
+  CsrfFilterFactory() : UnifiedFactoryBase("envoy.filters.http.csrf") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::csrf::v3::CsrfPolicy& policy,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
+
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::csrf::v3::CsrfPolicy& policy,
       Server::Configuration::ServerFactoryContext& context,
       ProtobufMessage::ValidationVisitor& validator) override;

@@ -1,16 +1,34 @@
 licenses(["notice"])  # Apache 2
 
 exports_files([
-    "VERSION",
-    "API_VERSION",
+    "VERSION.txt",
+    "API_VERSION.txt",
+    "MODULE.bazel.lock",
     ".clang-format",
     "pytest.ini",
     ".coveragerc",
+    "CODEOWNERS",
+    "OWNERS.md",
+    ".github/config.yml",
+    "reviewers.yaml",
 ])
 
 alias(
     name = "envoy",
     actual = "//source/exe:envoy",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "envoy.stripped",
+    actual = "//source/exe:envoy-static.stripped",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "clang_tidy_config",
+    srcs = [".clang-tidy"],
+    visibility = ["//visibility:public"],
 )
 
 # These two definitions exist to help reduce Envoy upstream core code depending on extensions.
@@ -27,6 +45,7 @@ package_group(
         "//test/extensions/...",
         "//test/server",
         "//test/server/config_validation",
+        "//test/tools/...",
         "//tools/extensions/...",
     ],
 )
@@ -45,3 +64,15 @@ package_group(
         "//contrib/...",
     ],
 )
+
+package_group(
+    name = "mobile_library",
+    packages = [
+        "//mobile/...",
+    ],
+)
+
+exports_files([
+    "rustfmt.toml",
+    "envoy-maintainers-public.key",
+])

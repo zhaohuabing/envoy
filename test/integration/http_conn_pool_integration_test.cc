@@ -2,14 +2,13 @@
 
 #include "test/integration/http_protocol_integration.h"
 
+using testing::Eq;
 namespace Envoy {
 namespace {
 
 class HttpConnPoolIntegrationTest : public HttpProtocolIntegrationTest {
 public:
   void initialize() override {
-    config_helper_.addRuntimeOverride("envoy.reloadable_features.conn_pool_delete_when_idle",
-                                      "true");
     config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
       // Set pool limit so that the test can use it's stats to validate that
       // the pool is deleted.
@@ -32,6 +31,11 @@ INSTANTIATE_TEST_SUITE_P(Protocols, HttpConnPoolIntegrationTest,
 
 // Tests that conn pools are cleaned up after becoming idle due to a LocalClose
 TEST_P(HttpConnPoolIntegrationTest, PoolCleanupAfterLocalClose) {
+  if (upstreamProtocol() == Http::CodecType::HTTP3 ||
+      downstreamProtocol() == Http::CodecType::HTTP3) {
+    // TODO(#26236) - Fix test flakiness over HTTP/3.
+    return;
+  }
   config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
     // Make Envoy close the upstream connection after a single request.
     ConfigHelper::HttpProtocolOptions protocol_options;
@@ -49,7 +53,7 @@ TEST_P(HttpConnPoolIntegrationTest, PoolCleanupAfterLocalClose) {
   waitForNextUpstreamRequest();
 
   // Validate that the circuit breaker config is setup as we expect.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 1);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(1));
 
   upstream_request_->encodeHeaders(default_response_headers_, false);
   upstream_request_->encodeData(512, true);
@@ -61,7 +65,7 @@ TEST_P(HttpConnPoolIntegrationTest, PoolCleanupAfterLocalClose) {
   ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
 
   // Validate that the pool is deleted when it becomes idle.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 0);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(0));
 }
 
 // Tests that conn pools are cleaned up after becoming idle due to a RemoteClose
@@ -73,7 +77,7 @@ TEST_P(HttpConnPoolIntegrationTest, PoolCleanupAfterRemoteClose) {
   waitForNextUpstreamRequest();
 
   // Validate that the circuit breaker config is setup as we expect.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 1);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(1));
 
   upstream_request_->encodeHeaders(default_response_headers_, false);
   upstream_request_->encodeData(512, true);
@@ -85,7 +89,7 @@ TEST_P(HttpConnPoolIntegrationTest, PoolCleanupAfterRemoteClose) {
   ASSERT_TRUE(fake_upstream_connection_->close());
 
   // Validate that the pool is deleted when it becomes idle.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 0);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(0));
 }
 
 // Verify that the drainConnections() cluster manager API works correctly.
@@ -97,7 +101,7 @@ TEST_P(HttpConnPoolIntegrationTest, PoolDrainAfterDrainApiSpecificCluster) {
   waitForNextUpstreamRequest();
 
   // Validate that the circuit breaker config is setup as we expect.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 1);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(1));
 
   upstream_request_->encodeHeaders(default_response_headers_, false);
   upstream_request_->encodeData(512, true);
@@ -108,12 +112,50 @@ TEST_P(HttpConnPoolIntegrationTest, PoolDrainAfterDrainApiSpecificCluster) {
 
   // Drain connection pools via API. Need to post this to the server thread.
   test_server_->server().dispatcher().post(
-      [this] { test_server_->server().clusterManager().drainConnections("cluster_0"); });
+      [this] { test_server_->server().clusterManager().drainConnections("cluster_0", nullptr); });
 
   ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
 
   // Validate that the pool is deleted when it becomes idle.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 0);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(0));
+}
+
+// Verify the drainConnections() with a predicate is able to filter host drains.
+TEST_P(HttpConnPoolIntegrationTest, DrainConnectionsWithPredicate) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(512, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_TRUE(response->complete());
+
+  // Perform a drain request which doesn't actually do a drain.
+  test_server_->server().dispatcher().post([this] {
+    test_server_->server().clusterManager().drainConnections(
+        "cluster_0", [](const Upstream::Host&) { return false; });
+  });
+
+  // The existing upstream connection should continue to work.
+  response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(512, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_TRUE(response->complete());
+
+  // Now do a drain that matches.
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(1));
+  test_server_->server().dispatcher().post([this] {
+    test_server_->server().clusterManager().drainConnections(
+        "cluster_0", [](const Upstream::Host&) { return true; });
+  });
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(0));
 }
 
 // Verify that the drainConnections() cluster manager API works correctly.
@@ -126,21 +168,21 @@ TEST_P(HttpConnPoolIntegrationTest, PoolDrainAfterDrainApiAllClusters) {
 
   setUpstreamCount(2);
 
-  auto host = config_helper_.createVirtualHost("cluster_1.com", "/", "cluster_1");
+  auto host = config_helper_.createVirtualHost("cluster_1.lyft.com", "/", "cluster_1");
   config_helper_.addVirtualHost(host);
 
-  config_helper_.setDefaultHostAndRoute("cluster_0.com", "/");
+  config_helper_.setDefaultHostAndRoute("cluster_0.lyft.com", "/");
 
   initialize();
 
   // Request Flow to cluster_0.
   codec_client_ = makeHttpConnection(lookupPort("http"));
-  default_request_headers_.setHost("cluster_0.com");
+  default_request_headers_.setHost("cluster_0.lyft.com");
   auto response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
   waitForNextUpstreamRequest();
 
   // Validate that the circuit breaker config is setup as we expect.
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 1);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(1));
 
   upstream_request_->encodeHeaders(default_response_headers_, false);
   upstream_request_->encodeData(512, true);
@@ -154,12 +196,12 @@ TEST_P(HttpConnPoolIntegrationTest, PoolDrainAfterDrainApiAllClusters) {
 
   // Request Flow to cluster_1.
   codec_client_ = makeHttpConnection(lookupPort("http"));
-  default_request_headers_.setHost("cluster_1.com");
+  default_request_headers_.setHost("cluster_1.lyft.com");
   response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
   waitForNextUpstreamRequest(1);
 
   // Validate that the circuit breaker config is setup as we expect.
-  test_server_->waitForGaugeEq("cluster.cluster_1.circuit_breakers.default.cx_pool_open", 1);
+  test_server_->waitForGauge("cluster.cluster_1.circuit_breakers.default.cx_pool_open", Eq(1));
 
   upstream_request_->encodeHeaders(default_response_headers_, false);
   upstream_request_->encodeData(512, true);
@@ -169,14 +211,65 @@ TEST_P(HttpConnPoolIntegrationTest, PoolDrainAfterDrainApiAllClusters) {
   EXPECT_TRUE(response->complete());
 
   // Drain connection pools via API. Need to post this to the server thread.
-  test_server_->server().dispatcher().post(
-      [this] { test_server_->server().clusterManager().drainConnections(); });
+  test_server_->server().dispatcher().post([this] {
+    test_server_->server().clusterManager().drainConnections(
+        nullptr, ConnectionPool::DrainBehavior::DrainExistingConnections);
+  });
 
   ASSERT_TRUE(first_connection->waitForDisconnect());
   ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
 
-  test_server_->waitForGaugeEq("cluster.cluster_0.circuit_breakers.default.cx_pool_open", 0);
-  test_server_->waitForGaugeEq("cluster.cluster_1.circuit_breakers.default.cx_pool_open", 0);
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(0));
+  test_server_->waitForGauge("cluster.cluster_1.circuit_breakers.default.cx_pool_open", Eq(0));
+}
+
+// Verify the drainConnections() with a pool predicate is able to filter pool drains.
+TEST_P(HttpConnPoolIntegrationTest, DrainConnectionsWithPoolPredicate) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(512, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_TRUE(response->complete());
+
+  auto pool_matches_cluster = [](ConnectionPool::Instance& pool,
+                                 const std::string& expected_cluster) {
+    return pool.host()->cluster().name() == expected_cluster;
+  };
+
+  // Perform a drain request matching cluster_1 (returns false for cluster_0's pool, no drain).
+  test_server_->server().dispatcher().post([this, pool_matches_cluster] {
+    test_server_->server().clusterManager().drainOrCloseConnPools(
+        [pool_matches_cluster](ConnectionPool::Instance& pool) {
+          return pool_matches_cluster(pool, "cluster_1");
+        },
+        ConnectionPool::DrainBehavior::DrainExistingConnections);
+  });
+
+  // The existing upstream connection should continue to work.
+  response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(512, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_TRUE(response->complete());
+
+  // Now do a drain matching cluster_0 (returns true for cluster_0's pool).
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(1));
+  test_server_->server().dispatcher().post([this, pool_matches_cluster] {
+    test_server_->server().clusterManager().drainOrCloseConnPools(
+        [pool_matches_cluster](ConnectionPool::Instance& pool) {
+          return pool_matches_cluster(pool, "cluster_0");
+        },
+        ConnectionPool::DrainBehavior::DrainExistingConnections);
+  });
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+  test_server_->waitForGauge("cluster.cluster_0.circuit_breakers.default.cx_pool_open", Eq(0));
 }
 
 } // namespace

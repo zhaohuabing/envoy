@@ -21,7 +21,7 @@ envoy_extension_cc_test(
         "zipkin_tracer_impl_test.cc",
     ],
     extension_names = ["envoy.tracers.zipkin"],
-    external_deps = ["abseil_optional"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//envoy/common:time_interface",
         "//envoy/runtime:runtime_interface",
@@ -34,12 +34,10 @@ envoy_extension_cc_test(
         "//source/extensions/tracers/zipkin:zipkin_lib",
         "//test/mocks:common_lib",
         "//test/mocks/http:http_mocks",
-        "//test/mocks/local_info:local_info_mocks",
-        "//test/mocks/runtime:runtime_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/stats:stats_mocks",
-        "//test/mocks/thread_local:thread_local_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
         "//test/mocks/tracing:tracing_mocks",
-        "//test/mocks/upstream:cluster_manager_mocks",
         "//test/mocks/upstream:thread_local_cluster_mocks",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:utility_lib",
@@ -51,11 +49,26 @@ envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
     extension_names = ["envoy.tracers.zipkin"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/tracers/zipkin:config",
         "//test/mocks/server:tracer_factory_context_mocks",
         "//test/mocks/server:tracer_factory_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "zipkin_http_service_integration_test",
+    srcs = ["zipkin_http_service_integration_test.cc"],
+    extension_names = ["envoy.tracers.zipkin"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/tracers/zipkin:config",
+        "//test/integration:http_integration_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
     ],
 )

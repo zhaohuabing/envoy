@@ -46,43 +46,30 @@ absl::string_view getServiceFromName(const absl::string_view name) {
   return EMPTY_STRING;
 }
 
-absl::string_view getProtoFromName(const absl::string_view name) {
-  size_t start = name.find_first_of('.');
-  if (start != std::string::npos && ++start < name.size() - 1) {
-    if (name[start] == '_') {
-      const size_t offset = name.find_first_of('.', ++start);
-      if (start != std::string::npos && offset < name.size()) {
-        return name.substr(start, offset - start);
-      }
-    }
-  }
-  return EMPTY_STRING;
-}
-
 std::string buildServiceName(const std::string& name, const std::string& proto,
                              const std::string& domain) {
   std::string result{};
   if (name[0] != '_') {
     result += "_";
   }
-  result += name + ".";
+  absl::StrAppend(&result, name, ".");
   if (proto[0] != '_') {
     result += "_";
   }
-  result += proto + '.' + domain;
+  absl::StrAppend(&result, proto, ".", domain);
   return result;
 }
 
-absl::optional<uint16_t>
+std::optional<uint16_t>
 getAddressRecordType(const Network::Address::InstanceConstSharedPtr& ipaddr) {
   if (ipaddr->type() == Network::Address::Type::Ip) {
     if (ipaddr->ip()->ipv6() != nullptr) {
-      return absl::make_optional<uint16_t>(DNS_RECORD_TYPE_AAAA);
+      return std::make_optional<uint16_t>(DNS_RECORD_TYPE_AAAA);
     } else if (ipaddr->ip()->ipv4() != nullptr) {
-      return absl::make_optional<uint16_t>(DNS_RECORD_TYPE_A);
+      return std::make_optional<uint16_t>(DNS_RECORD_TYPE_A);
     }
   }
-  return absl::nullopt;
+  return std::nullopt;
 }
 
 absl::string_view getDomainSuffix(const absl::string_view name) {
@@ -100,6 +87,19 @@ absl::string_view getDomainSuffix(const absl::string_view name) {
   }
 
   return name.substr(pos + 1);
+}
+
+absl::string_view getVirtualDomainName(const absl::string_view domain_name) {
+  // We can use names started with '.' as wildcard records in virtual domain name config
+  // since these are not valid domain names and in this way we optimize for future search against
+  // them. We expect only names like *.foo.com as a valid wildcard records because any other
+  // wildcard usages are not considered as valid ones, i.e. **.foo.com, *foo.bar.com, foo*.bar.com
+  // are all invalid.
+  if (domain_name.starts_with("*.")) {
+    return domain_name.substr(1);
+  }
+
+  return domain_name;
 }
 
 } // namespace Utils

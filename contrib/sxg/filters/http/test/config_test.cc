@@ -5,7 +5,9 @@
 #include "source/common/protobuf/utility.h"
 #include "source/common/secret/secret_provider_impl.h"
 
+#include "test/mocks/secret/mocks.h"
 #include "test/mocks/server/factory_context.h"
+#include "test/test_common/status_utility.h"
 
 #include "contrib/envoy/extensions/filters/http/sxg/v3alpha/sxg.pb.h"
 #include "contrib/sxg/filters/http/source/config.h"
@@ -20,19 +22,23 @@ namespace SXG {
 using testing::NiceMock;
 using testing::Return;
 
+using Envoy::StatusHelpers::HasStatus;
+
 namespace {
 
 void expectCreateFilter(std::string yaml, bool is_sds_config) {
   FilterFactory factory;
   ProtobufTypes::MessagePtr proto_config = factory.createEmptyConfigProto();
   TestUtility::loadFromYaml(yaml, *proto_config);
-  Server::Configuration::MockFactoryContext context;
-  context.cluster_manager_.initializeClusters({"foo"}, {});
+  testing::NiceMock<Server::Configuration::MockFactoryContext> context;
+  context.server_factory_context_.cluster_manager_.initializeClusters({"foo"}, {});
 
   // This returns non-nullptr for certificate and private_key.
-  auto& secret_manager = context.cluster_manager_.cluster_manager_factory_.secretManager();
+  NiceMock<Secret::MockSecretManager> secret_manager;
+  ON_CALL(context.server_factory_context_, secretManager())
+      .WillByDefault(ReturnRef(secret_manager));
   if (is_sds_config) {
-    ON_CALL(secret_manager, findOrCreateGenericSecretProvider(_, _, _))
+    ON_CALL(secret_manager, findOrCreateGenericSecretProvider(_, _, _, _))
         .WillByDefault(Return(std::make_shared<Secret::GenericSecretConfigProviderImpl>(
             envoy::extensions::transport_sockets::tls::v3::GenericSecret())));
   } else {
@@ -41,12 +47,12 @@ void expectCreateFilter(std::string yaml, bool is_sds_config) {
             envoy::extensions::transport_sockets::tls::v3::GenericSecret())));
   }
   EXPECT_CALL(context, messageValidationVisitor());
-  EXPECT_CALL(context, clusterManager());
   EXPECT_CALL(context, scope());
-  EXPECT_CALL(context, timeSource());
-  EXPECT_CALL(context, api());
-  EXPECT_CALL(context, getTransportSocketFactoryContext());
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(*proto_config, "stats", context);
+  EXPECT_CALL(context.server_factory_context_, timeSource());
+  EXPECT_CALL(context.server_factory_context_, api());
+  EXPECT_CALL(context, initManager());
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(*proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
@@ -54,7 +60,7 @@ void expectCreateFilter(std::string yaml, bool is_sds_config) {
 
 // This loads one of the secrets in credentials, and fails the other one.
 void expectInvalidSecretConfig(const std::string& failed_secret_name,
-                               const std::string& exception_message) {
+                               const std::string& error_message) {
   const std::string yaml = R"YAML(
 certificate:
   name: certificate
@@ -69,14 +75,17 @@ validity_url: "/.sxg/validity.msg"
   TestUtility::loadFromYaml(yaml, *proto_config);
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
-  auto& secret_manager = context.cluster_manager_.cluster_manager_factory_.secretManager();
+  NiceMock<Secret::MockSecretManager> secret_manager;
+  ON_CALL(context.server_factory_context_, secretManager())
+      .WillByDefault(ReturnRef(secret_manager));
   ON_CALL(secret_manager, findStaticGenericSecretProvider(
                               failed_secret_name == "private_key" ? "certificate" : "private_key"))
       .WillByDefault(Return(std::make_shared<Secret::GenericSecretConfigProviderImpl>(
           envoy::extensions::transport_sockets::tls::v3::GenericSecret())));
 
-  EXPECT_THROW_WITH_MESSAGE(factory.createFilterFactoryFromProto(*proto_config, "stats", context),
-                            EnvoyException, exception_message);
+  const auto cb_or_error = factory.createFilterFactoryFromProto(*proto_config, "stats", context);
+  EXPECT_THAT(cb_or_error.status(),
+              HasStatus(absl::StatusCode::kInvalidArgument, testing::HasSubstr(error_message)));
 }
 
 } // namespace
@@ -95,12 +104,10 @@ certificate:
   name: certificate
   sds_config:
     path: "xxxx"
-    resource_api_version: V3
 private_key:
   name: private_key
   sds_config:
     path: "xxxx"
-    resource_api_version: V3
 cbor_url: "/.sxg/cert.cbor"
 validity_url: "/.sxg/validity.msg"
 )YAML";

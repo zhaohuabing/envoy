@@ -35,6 +35,8 @@ Note that although draining is a per-listener concept, it must be supported at t
 level. Currently the only filters that support graceful draining are
 :ref:`Redis <config_network_filters_redis_proxy>`,
 :ref:`Mongo <config_network_filters_mongo_proxy>`,
+:ref:`Thrift <config_network_filters_thrift_proxy>`
+(if the ``envoy.reloadable_features.thrift_connection_draining`` runtime feature is enabled),
 and :ref:`HTTP connection manager <config_http_conn_man>`.
 
 By default, the :ref:`HTTP connection manager <config_http_conn_man>` filter will
@@ -55,3 +57,11 @@ modify_only
   It may be desirable to set *modify_only* on egress listeners so they only drain during
   modifications while relying on ingress listener draining to perform full server draining when
   attempting to do a controlled shutdown.
+
+.. note::
+
+  Envoy also drains upstream connections when the upstream clusters are modified. The behavior
+  depends on the protocols used for the connection pools, and is currently passive: Envoy stops
+  issuing streams to the connection pools associated with the removed clusters, and waits for the
+  existing streams to complete.
+

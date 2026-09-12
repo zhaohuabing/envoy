@@ -1,56 +1,101 @@
+name: CodeQL/daily
+
+permissions:
+  contents: read
+
 on:
   schedule:
-  - cron: '0 12 * * 4'
+  - cron: '0 12 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}-${{ github.workflow }}
+  cancel-in-progress: true
+
 
 jobs:
   CodeQL-Build:
 
+    permissions:
+      security-events: write  # for github/codeql-action/analyze to upload SARIF results
+      pull-requests: read
     strategy:
       fail-fast: false
 
-    # CodeQL runs on ubuntu-latest and windows-latest
-    runs-on: ubuntu-latest
+    # CodeQL runs on ubuntu-24.04
+    runs-on: ubuntu-22.04
+    if: github.repository == 'envoyproxy/envoy'
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@5a4ac9002d0be2fb38bd78e4b4dbde5606d7042f # v2.3.4
+
+    - uses: envoyproxy/toolshed/actions/bind-mounts@829e692b7d80ad81378e01f737299ba785a1d14a  # actions-v0.4.25
+      if: |
+        ! github.event.repository.private
       with:
-        # We must fetch at least the immediate parents so that if this is
-        # a pull request then we can checkout the head.
-        fetch-depth: 2
+        mounts: |
+          - src: /mnt/workspace
+            target: GITHUB_WORKSPACE
+            chown: "runner:runner"
+          - src: /mnt/runner-home
+            target: /home/runner/.cache
+            chown: "runner:runner"
+    - name: Free disk space
+      if: |
+        env.BUILD_TARGETS != ''
+        && github.event.repository.private
+      uses: envoyproxy/toolshed/actions/diskspace@829e692b7d80ad81378e01f737299ba785a1d14a  # actions-v0.4.25
+      with:
+        to_remove: |
+          /usr/local/.ghcup
+          /usr/local/lib/android
 
-    # If this run was triggered by a pull request event, then checkout
-    # the head of the pull request instead of the merge commit.
-    - run: git checkout HEAD^2
-      if: ${{ github.event_name == 'pull_request' }}
+    - name: Checkout repository
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-    # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@a66b44a48a44d63acf71688c56aa168ac171d4cf # v1
-      # Override language selection by uncommenting this and choosing your languages
+      uses: github/codeql-action/init@87557b9c84dde89fdd9b10e88954ac2f4248e463  # codeql-bundle-v4.36.1
       with:
         languages: cpp
+        trap-caching: false
 
     - name: Install deps
       shell: bash
       run: |
        sudo apt-get update --error-on=any
-       sudo apt-get install --yes libtool cmake automake autoconf make ninja-build curl unzip virtualenv openjdk-11-jdk build-essential libc++1
-       mkdir -p bin/clang11
-       cd bin/clang11
-       wget https://github.com/llvm/llvm-project/releases/download/llvmorg-11.0.1/clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz
-       tar -xf clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz --strip-components 1
-       export PATH=bin/clang11/bin:$PATH
+       sudo apt-get install --yes \
+           libtool libtinfo5 automake autoconf curl unzip
+       # Note: the llvm/clang version should match the version specified in:
+       #  - bazel/toolchains.bzl
+       #  - .github/workflows/codeql-push.yml
+       #
+       # IMPORTANT: the clang bundle MUST be unpacked outside $GITHUB_WORKSPACE (we use $RUNNER_TEMP).
+       # The CodeQL C++ extractor treats anything under the source root as project code, so headers
+       # under a checkout subdirectory would be analysed as Envoy source and produce false positives
+       # (e.g. cpp/new-free-mismatch in <vector>, alert #1881). Keeping it under $RUNNER_TEMP makes
+       # CodeQL classify those headers as system headers — same as /usr/include/c++/** on a normal
+       # build. Do NOT move this back into the checkout tree.
+       mkdir -p "${RUNNER_TEMP}/clang22.1.8"
+       cd "${RUNNER_TEMP}/clang22.1.8"
+       wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz
+       tar -xf LLVM-22.1.8-Linux-X64.tar.xz --strip-components 1
 
     - name: Build
       run: |
-       bazel/setup_clang.sh bin/clang11
        bazelisk shutdown
-       bazelisk build -c fastbuild --spawn_strategy=local --discard_analysis_cache --nouse_action_cache --config clang --config libc++ //source/common/http/...
+       bazel build \
+           -c fastbuild \
+           --repo_env=BAZEL_LLVM_PATH="${RUNNER_TEMP}/clang22.1.8" \
+           --spawn_strategy=local \
+           --discard_analysis_cache \
+           --nouse_action_cache \
+           --features="-layering_check" \
+           --config=clang-local \
+           --config=ci \
+           //source/common/http/...
 
     - name: Clean Artifacts
       run: |
         git clean -xdf
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@a66b44a48a44d63acf71688c56aa168ac171d4cf # v1
+      uses: github/codeql-action/analyze@87557b9c84dde89fdd9b10e88954ac2f4248e463  # codeql-bundle-v4.36.1

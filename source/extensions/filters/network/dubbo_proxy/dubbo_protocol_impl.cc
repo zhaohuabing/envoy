@@ -44,19 +44,19 @@ bool isValidResponseStatus(ResponseStatus status) {
   case ResponseStatus::BadResponse:
   case ResponseStatus::ServiceNotFound:
   case ResponseStatus::ServiceError:
+  case ResponseStatus::ServerError:
   case ResponseStatus::ClientError:
   case ResponseStatus::ServerThreadpoolExhaustedError:
-    break;
-  default:
-    return false;
+    return true;
   }
-  return true;
+  return false;
 }
 
 void parseRequestInfoFromBuffer(Buffer::Instance& data, MessageMetadataSharedPtr metadata) {
   ASSERT(data.length() >= DubboProtocolImpl::MessageSize);
   uint8_t flag = data.peekInt<uint8_t>(FlagOffset);
   bool is_two_way = (flag & TwoWayMask) == TwoWayMask ? true : false;
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   SerializationType type = static_cast<SerializationType>(flag & SerializationTypeMask);
   if (!isValidSerializationType(type)) {
     throw EnvoyException(
@@ -73,6 +73,7 @@ void parseRequestInfoFromBuffer(Buffer::Instance& data, MessageMetadataSharedPtr
 
 void parseResponseInfoFromBuffer(Buffer::Instance& buffer, MessageMetadataSharedPtr metadata) {
   ASSERT(buffer.length() >= DubboProtocolImpl::MessageSize);
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   ResponseStatus status = static_cast<ResponseStatus>(buffer.peekInt<uint8_t>(StatusOffset));
   if (!isValidResponseStatus(status)) {
     throw EnvoyException(
@@ -90,7 +91,7 @@ DubboProtocolImpl::decodeHeader(Buffer::Instance& buffer, MessageMetadataSharedP
   }
 
   if (buffer.length() < DubboProtocolImpl::MessageSize) {
-    return std::pair<ContextSharedPtr, bool>(nullptr, false);
+    return {nullptr, false};
   }
 
   uint16_t magic_number = buffer.peekBEInt<uint16_t>();
@@ -131,7 +132,7 @@ DubboProtocolImpl::decodeHeader(Buffer::Instance& buffer, MessageMetadataSharedP
   context->setBodySize(body_size);
   context->setHeartbeat(is_event);
 
-  return std::pair<ContextSharedPtr, bool>(context, true);
+  return {context, true};
 }
 
 bool DubboProtocolImpl::decodeData(Buffer::Instance& buffer, ContextSharedPtr context,
@@ -153,6 +154,11 @@ bool DubboProtocolImpl::decodeData(Buffer::Instance& buffer, ContextSharedPtr co
     break;
   }
   case MessageType::Response: {
+    // Non `Ok` response body has no response type info and skip deserialization.
+    if (metadata->responseStatus() != ResponseStatus::Ok) {
+      metadata->setMessageType(MessageType::Exception);
+      break;
+    }
     auto ret = serializer_->deserializeRpcResult(buffer, context);
     if (!ret.second) {
       return false;
@@ -163,7 +169,7 @@ bool DubboProtocolImpl::decodeData(Buffer::Instance& buffer, ContextSharedPtr co
     break;
   }
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not handled");
   }
 
   return true;
@@ -208,9 +214,9 @@ bool DubboProtocolImpl::encode(Buffer::Instance& buffer, const MessageMetadata& 
   case MessageType::Request:
   case MessageType::Oneway:
   case MessageType::Exception:
-    NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
+    PANIC("not implemented");
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not implemented");
   }
 }
 

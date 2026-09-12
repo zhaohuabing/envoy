@@ -21,6 +21,7 @@ envoy_cc_test_library(
     hdrs = [
         "mock.h",
     ],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/filters/http/common:jwks_fetcher_lib",
         "//test/mocks/upstream:upstream_mocks",
@@ -42,19 +43,37 @@ envoy_extension_cc_test(
         "jwks_fetcher_test.cc",
     ],
     extension_names = ["envoy.filters.http.jwt_authn"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/extensions/filters/http/common:jwks_fetcher_lib",
         "//test/extensions/filters/http/common:mock_lib",
         "//test/mocks/http:http_mocks",
         "//test/mocks/server:factory_context_mocks",
+        "//test/test_common:test_runtime_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )
 
 envoy_cc_test(
+    name = "factory_base_test",
+    srcs = ["factory_base_test.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//envoy/http:filter_interface",
+        "//source/extensions/filters/http/common:factory_base_lib",
+        "//test/mocks/server:factory_context_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/filters/http/router/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
     name = "stream_rate_limiter_test",
     srcs = ["stream_rate_limiter_test.cc"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//envoy/event:dispatcher_interface",
         "//source/common/buffer:buffer_lib",
@@ -66,21 +85,8 @@ envoy_cc_test(
         "//test/common/http:common_lib",
         "//test/mocks/http:http_mocks",
         "//test/mocks/runtime:runtime_mocks",
-        "//test/mocks/stats:stats_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:simulated_time_system_lib",
-        "//test/test_common:utility_lib",
-    ],
-)
-
-envoy_cc_test(
-    name = "utility_test",
-    srcs = [
-        "utility_test.cc",
-    ],
-    deps = [
-        "//source/extensions/filters/http/common:utility_lib",
-        "//test/mocks/runtime:runtime_mocks",
         "//test/test_common:utility_lib",
     ],
 )

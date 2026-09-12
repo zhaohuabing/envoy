@@ -7,30 +7,52 @@ Extensions
   :glob:
   :maxdepth: 2
 
-  filter/filter
+  accesslog/filters
+  formatter/formatter
   accesslog/accesslog
-  rbac/rbac
-  health_checker/health_checker
-  transport_socket/transport_socket
-  dns_resolver/dns_resolver.rst
-  resource_monitor/resource_monitor
+  certificate_mappers/certificate_mappers
+  certificate_selectors/certificate_selectors
+  certificate_validators/certificate_validators
+  cluster/cluster
   common/common
   compression/compression
-  cluster/cluster
+  config_validators/config_validators
+  content_parsers/content_parsers
+  contrib/contrib
+  dns_resolver/dns_resolver
+  endpoint/endpoint
+  filter/filter
   grpc_credential/grpc_credential
-  retry/retry
+  health_check_event_sinks/health_check_event_sinks
+  health_checker/health_checker
+  http/early_header_mutation
+  http/cache_v2
+  http/custom_response
+  http/ext_proc
+  http/header_formatters
+  http/header_validators
+  http/original_ip_detection
+  http/stateful_session
+  injected_credentials/injected_credentials
+  geoip_provider/geoip_provider
   trace/trace
   internal_redirect/internal_redirect
-  endpoint/endpoint
+  path/match/path_matcher
+  path/rewrite/path_rewriter
+  quic/quic_extensions
+  descriptors/descriptors
+  rbac/rbac
+  rbac/matchers
+  request_id/request_id
+  resource_monitor/resource_monitor
+  retry/retry
+  stat_sinks/stat_sinks
+  string_matcher/string_matcher
+  transport_socket/transport_socket
   upstream/upstream
   wasm/wasm
   watchdog/watchdog
-  descriptors/descriptors
-  request_id/request_id
-  http/header_formatters
-  http/original_ip_detection
-  stat_sinks/stat_sinks
-  quic/quic_extensions
-  formatter/formatter
-  contrib/contrib
-  rbac/matchers
+  load_balancing_policies/load_balancing_policies
+  queue_policy/queue_policy
+  cluster_specifier/cluster_specifier
+  local_address_selectors/local_address_selectors

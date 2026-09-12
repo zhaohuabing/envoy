@@ -1,8 +1,11 @@
 #pragma once
 
 #include <functional>
+#include <vector>
 
 #include "envoy/event/dispatcher.h"
+#include "envoy/event/evwatch.h"
+#include "envoy/event/evwatch_observer_manager.h"
 #include "envoy/event/schedulable_cb.h"
 #include "envoy/event/timer.h"
 
@@ -57,7 +60,14 @@ namespace Event {
 class LibeventScheduler : public Scheduler, public CallbackScheduler {
 public:
   using OnPrepareCallback = std::function<void()>;
-  LibeventScheduler();
+  using OnCheckCallback = std::function<void()>;
+
+  explicit LibeventScheduler(TimeSource& time_source);
+  LibeventScheduler(TimeSource& time_source, EvwatchObserverManagerPtr evwatch_manager);
+  ~LibeventScheduler() override;
+
+  void registerEvwatchObserver(Evwatch::Observer& observer);
+  void unregisterEvwatchObserver(Evwatch::Observer& observer);
 
   // Scheduler
   TimerPtr createTimer(const TimerCb& cb, Dispatcher& dispatcher) override;
@@ -94,6 +104,14 @@ public:
   void registerOnPrepareCallback(OnPrepareCallback&& callback);
 
   /**
+   * Register callback to be called in the event loop after polling for
+   * events and prior to handling those events. Must not be called more than once. |callback| must
+   * not be null. |callback| cannot be unregistered, therefore it has to be valid throughout the
+   * lifetime of |this|.
+   */
+  void registerOnCheckCallback(OnCheckCallback&& callback);
+
+  /**
    * Start writing stats once thread-local storage is ready to receive them (see
    * ThreadLocalStoreImpl::initializeThreading).
    */
@@ -101,8 +119,11 @@ public:
 
 private:
   static void onPrepareForCallback(evwatch*, const evwatch_prepare_cb_info* info, void* arg);
+  static void onCheckForCallback(evwatch*, const evwatch_check_cb_info* info, void* arg);
   static void onPrepareForStats(evwatch*, const evwatch_prepare_cb_info* info, void* arg);
   static void onCheckForStats(evwatch*, const evwatch_check_cb_info*, void* arg);
+  static void onPrepareForObserver(evwatch*, const evwatch_prepare_cb_info* info, void* arg);
+  static void onCheckForObserver(evwatch*, const evwatch_check_cb_info* info, void* arg);
 
   static constexpr int flagsBasedOnEventType() {
     if constexpr (Event::PlatformDefaultTriggerType == FileTriggerType::Level) {
@@ -114,13 +135,16 @@ private:
     return EVLOOP_NONBLOCK;
   }
 
+  TimeSource& time_source_;
   Libevent::BasePtr libevent_;
   DispatcherStats* stats_{}; // stats owned by the containing DispatcherImpl
   bool timeout_set_{};       // whether there is a poll timeout in the current event loop iteration
   timeval timeout_{};        // the poll timeout for the current event loop iteration, if available
   timeval prepare_time_{};   // timestamp immediately before polling
   timeval check_time_{};     // timestamp immediately after polling
-  OnPrepareCallback callback_; // callback to be called from onPrepareForCallback()
+  OnPrepareCallback prepare_callback_; // callback to be called from onPrepareForCallback()
+  OnCheckCallback check_callback_;     // callback to be called from onCheckForCallback()
+  EvwatchObserverManagerPtr evwatch_manager_;
 };
 
 } // namespace Event

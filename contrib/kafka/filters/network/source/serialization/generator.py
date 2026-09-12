@@ -35,9 +35,9 @@ def generate_code(template_name, output_file):
 
 def get_field_counts():
     """
-  Generate argument counts that should be processed by composite deserializers.
-  """
-    return range(1, 12)
+    Generate argument counts that should be processed by composite deserializers.
+    """
+    return range(1, 13)
 
 
 class RenderingHelper:
@@ -53,6 +53,7 @@ class RenderingHelper:
         # Templates are resolved relatively to main start script, due to main & test templates being
         # stored in different directories.
         env = jinja2.Environment(
+            autoescape=jinja2.select_autoescape(['html', 'xml']),
             loader=jinja2.FileSystemLoader(
                 searchpath=os.path.dirname(os.path.abspath(sys.argv[0]))))
         return env.get_template(template)

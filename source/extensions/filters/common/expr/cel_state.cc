@@ -1,8 +1,9 @@
 #include "source/extensions/filters/common/expr/cel_state.h"
 
+#include "source/extensions/filters/common/expr/flatbuffers_backed_cel_map.h"
+
 #include "eval/public/structs/cel_proto_wrapper.h"
 #include "flatbuffers/reflection.h"
-#include "tools/flatbuffers_backed_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -31,21 +32,21 @@ CelValue CelState::exprValue(Protobuf::Arena* arena, bool last) const {
       if (last) {
         return CelValue::CreateBytes(&value_);
       }
-      return CelValue::CreateMap(google::api::expr::runtime::CreateFlatBuffersBackedObject(
-          reinterpret_cast<const uint8_t*>(value_.data()), *reflection::GetSchema(schema_.data()),
-          arena));
+      return CelValue::CreateMap(
+          createFlatBuffersBackedCelMap(reinterpret_cast<const uint8_t*>(value_.data()),
+                                        *reflection::GetSchema(schema_.data()), arena));
     }
   }
   return CelValue::CreateNull();
 }
 
 ProtobufTypes::MessagePtr CelState::serializeAsProto() const {
-  auto any = std::make_unique<ProtobufWkt::Any>();
+  auto any = std::make_unique<Protobuf::Any>();
 
   if (type_ != CelStateType::Protobuf) {
-    ProtobufWkt::BytesValue value;
+    Protobuf::BytesValue value;
     value.set_value(value_);
-    any->PackFrom(value);
+    std::ignore = any->PackFrom(value);
   } else {
     any->set_type_url(std::string(schema_));
     any->set_value(value_);

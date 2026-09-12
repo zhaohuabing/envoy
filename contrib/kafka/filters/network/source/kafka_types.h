@@ -1,10 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
-
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -14,7 +15,7 @@ namespace Kafka {
 /**
  * Nullable string used by Kafka.
  */
-using NullableString = absl::optional<std::string>;
+using NullableString = std::optional<std::string>;
 
 /**
  * Bytes array used by Kafka.
@@ -24,12 +25,12 @@ using Bytes = std::vector<unsigned char>;
 /**
  * Nullable bytes array used by Kafka.
  */
-using NullableBytes = absl::optional<Bytes>;
+using NullableBytes = std::optional<Bytes>;
 
 /**
  * Kafka array of elements of type T.
  */
-template <typename T> using NullableArray = absl::optional<std::vector<T>>;
+template <typename T> using NullableArray = std::optional<std::vector<T>>;
 
 /**
  * Analogous to:
@@ -44,6 +45,11 @@ struct Uuid {
 
   bool operator==(const Uuid& rhs) const { return msb_ == rhs.msb_ && lsb_ == rhs.lsb_; };
 };
+
+/**
+ * Kafka topic-partition pair.
+ */
+using KafkaPartition = std::pair<std::string, int32_t>;
 
 } // namespace Kafka
 } // namespace NetworkFilters

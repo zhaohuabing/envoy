@@ -14,13 +14,25 @@ import "validate/validate.proto";
 option java_package = "io.envoyproxy.envoy.config.core.v3";
 option java_outer_classname = "SubstitutionFormatStringProto";
 option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/config/core/v3;corev3";
 option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
 // [#protodoc-title: Substitution format string]
 
+// Optional configuration options to be used with json_format.
+message JsonFormatOptions {
+  // The output JSON string properties will be sorted.
+  //
+  // .. note::
+  //   As the properties are always sorted, this option has no effect and is deprecated.
+  //
+  bool sort_properties = 1
+      [deprecated = true, (envoy.annotations.deprecated_at_minor_version) = "3.0"];
+}
+
 // Configuration to use multiple :ref:`command operators <config_access_log_command_operators>`
 // to generate a new string in either plain text or JSON format.
-// [#next-free-field: 7]
+// [#next-free-field: 8]
 message SubstitutionFormatString {
   oneof format {
     option (validate.required) = true;
@@ -93,22 +105,30 @@ message SubstitutionFormatString {
   //
   // * for ``text_format``, the output of the empty operator is changed from ``-`` to an
   //   empty string, so that empty values are omitted entirely.
-  // * for ``json_format`` the keys with null values are omitted in the output structure.
+  // * for ``json_format``, the keys with null values are omitted in the output structure. Nested
+  //   objects whose values are all omitted are removed as well, while empty arrays are preserved.
+  //   The root object is always emitted, so a fully empty structure is rendered as ``{}``.
+  //
+  // Defaults to false.
   bool omit_empty_values = 3;
 
-  // Specify a *content_type* field.
-  // If this field is not set then ``text/plain`` is used for *text_format* and
-  // ``application/json`` is used for *json_format*.
+  // Specify a ``content_type`` field.
+  // If this field is not set then ``text/plain`` is used for ``text_format`` and
+  // ``application/json`` is used for ``json_format``.
   //
   // .. validated-code-block:: yaml
   //   :type-name: envoy.config.core.v3.SubstitutionFormatString
   //
   //   content_type: "text/html; charset=UTF-8"
   //
-  string content_type = 4;
+  string content_type = 4
+      [(validate.rules).string = {well_known_regex: HTTP_HEADER_VALUE strict: false}];
 
   // Specifies a collection of Formatter plugins that can be called from the access log configuration.
   // See the formatters extensions documentation for details.
   // [#extension-category: envoy.formatter]
   repeated TypedExtensionConfig formatters = 6;
+
+  // If json_format is used, the options will be applied to the output JSON string.
+  JsonFormatOptions json_format_options = 7;
 }

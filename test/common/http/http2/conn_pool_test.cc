@@ -11,18 +11,22 @@
 #include "test/common/http/common.h"
 #include "test/common/upstream/utility.h"
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/http/http_server_properties_cache.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/mocks/server/overload_manager.h"
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/transport_socket_match.h"
 #include "test/test_common/printers.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/test_runtime.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using testing::_;
+using testing::AnyNumber;
 using testing::AtLeast;
 using testing::DoAll;
 using testing::InSequence;
@@ -43,13 +47,16 @@ public:
                    Upstream::HostConstSharedPtr host, Upstream::ResourcePriority priority,
                    const Network::ConnectionSocket::OptionsSharedPtr& options,
                    const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options,
-                   Envoy::Upstream::ClusterConnectivityState& state)
+                   Envoy::Upstream::ClusterConnectivityState& state,
+                   Server::OverloadManager& overload_manager)
       : FixedHttpConnPoolImpl(
             std::move(host), std::move(priority), dispatcher, options, transport_socket_options,
             random_generator, state,
-            [](HttpConnPoolImplBase* pool) { return std::make_unique<ActiveClient>(*pool); },
+            [](HttpConnPoolImplBase* pool) {
+              return std::make_unique<ActiveClient>(*pool, std::nullopt);
+            },
             [](Upstream::Host::CreateConnectionData&, HttpConnPoolImplBase*) { return nullptr; },
-            std::vector<Protocol>{Protocol::Http2}) {}
+            std::vector<Protocol>{Protocol::Http2}, overload_manager, std::nullopt, nullptr) {}
 
   CodecClientPtr createCodecClient(Upstream::Host::CreateConnectionData& data) override {
     // We expect to own the connection, but already have it, so just release it to prevent it from
@@ -78,7 +85,7 @@ public:
         upstream_ready_cb_(new NiceMock<Event::MockSchedulableCallback>(&dispatcher_)),
         pool_(std::make_unique<TestConnPoolImpl>(dispatcher_, random_, host_,
                                                  Upstream::ResourcePriority::Default, nullptr,
-                                                 nullptr, state_)) {
+                                                 nullptr, state_, overload_manager_)) {
     // Default connections to 1024 because the tests shouldn't be relying on the
     // connection resource limit for most tests.
     cluster_->resetResourceManager(1024, 1024, 1024, 1, 1);
@@ -115,8 +122,7 @@ public:
     }
   }
 
-  void expectConnectionSetupForClient(int num_clients,
-                                      absl::optional<uint32_t> buffer_limits = {}) {
+  void expectConnectionSetupForClient(int num_clients, std::optional<uint32_t> buffer_limits = {}) {
     // Set the createClientConnection mocks. The createCodecClient_ invoke
     // below takes care of making sure connection_index_ is updated.
     EXPECT_CALL(dispatcher_, createClientConnection_(_, _, _, _))
@@ -134,8 +140,7 @@ public:
       test_client.codec_client_ = new CodecClientForTest(
           CodecType::HTTP1, std::move(connection), test_client.codec_,
           [this](CodecClient*) -> void { onClientDestroy(); },
-          Upstream::makeTestHost(cluster, "tcp://127.0.0.1:9000", simTime()),
-          *test_client.client_dispatcher_);
+          Upstream::makeTestHost(cluster, "tcp://127.0.0.1:9000"), *test_client.client_dispatcher_);
       if (buffer_limits) {
         EXPECT_CALL(*cluster_, perConnectionBufferLimitBytes())
             .Times(num_clients)
@@ -154,13 +159,13 @@ public:
 
   // Creates a new test client, expecting a new connection to be created and associated
   // with the new client.
-  void expectClientCreate(absl::optional<uint32_t> buffer_limits = {}) {
+  void expectClientCreate(std::optional<uint32_t> buffer_limits = {}) {
     createTestClients(1);
     expectConnectionSetupForClient(1, buffer_limits);
   }
   void expectClientsCreate(int num_clients) {
     createTestClients(num_clients);
-    expectConnectionSetupForClient(num_clients, absl::nullopt);
+    expectConnectionSetupForClient(num_clients, std::nullopt);
   }
 
   // Connects a pending connection for client with the given index.
@@ -213,8 +218,9 @@ public:
   Api::ApiPtr api_;
   NiceMock<Event::MockDispatcher> dispatcher_;
   std::shared_ptr<Upstream::MockClusterInfo> cluster_{new NiceMock<Upstream::MockClusterInfo>()};
-  Upstream::HostSharedPtr host_{Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:80", simTime())};
+  Upstream::HostSharedPtr host_{Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:80")};
   NiceMock<Event::MockSchedulableCallback>* upstream_ready_cb_;
+  NiceMock<Server::MockOverloadManager> overload_manager_;
   std::unique_ptr<TestConnPoolImpl> pool_;
   std::vector<TestCodecClient> test_clients_;
   NiceMock<Runtime::MockLoader> runtime_;
@@ -228,9 +234,13 @@ public:
       EXPECT_CALL(*test.test_clients_[client_index].codec_, newStream(_))
           .WillOnce(DoAll(SaveArgAddress(&inner_decoder_), ReturnRef(inner_encoder_)));
       EXPECT_CALL(callbacks_.pool_ready_, ready());
-      EXPECT_EQ(nullptr, test.pool_->newStream(decoder_, callbacks_));
+      EXPECT_EQ(nullptr, test.pool_->newStream(decoder_, callbacks_,
+                                               {/*can_send_early_data_=*/false,
+                                                /*can_use_http3_=*/false}));
     } else {
-      handle_ = test.pool_->newStream(decoder_, callbacks_);
+      handle_ = test.pool_->newStream(decoder_, callbacks_,
+                                      {/*can_send_early_data_=*/false,
+                                       /*can_use_http3_=*/false});
       EXPECT_NE(nullptr, handle_);
     }
   }
@@ -289,10 +299,8 @@ void Http2ConnPoolImplTest::closeAllClients() {
 
 void Http2ConnPoolImplTest::completeRequest(ActiveTestRequest& r) {
   EXPECT_CALL(r.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r.decoder_, decodeHeaders_(_, true));
   r.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
@@ -337,31 +345,29 @@ TEST_F(Http2ConnPoolImplTest, VerifyAlpnFallback) {
 
   // Recreate the conn pool so that the host re-evaluates the transport socket match, arriving at
   // our test transport socket factory.
-  host_ = Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:80", simTime());
+  host_ = Upstream::makeTestHost(cluster_, "tcp://127.0.0.1:80");
   new NiceMock<Event::MockSchedulableCallback>(&dispatcher_);
-  pool_ = std::make_unique<TestConnPoolImpl>(
-      dispatcher_, random_, host_, Upstream::ResourcePriority::Default, nullptr, nullptr, state_);
+  pool_ = std::make_unique<TestConnPoolImpl>(dispatcher_, random_, host_,
+                                             Upstream::ResourcePriority::Default, nullptr, nullptr,
+                                             state_, overload_manager_);
 
   // This requires some careful set up of expectations ordering: the call to createTransportSocket
   // happens before all the connection set up but after the test client is created (due to some)
   // of the mocks that are constructed as part of the test client.
   createTestClients(1);
-  EXPECT_CALL(*factory_ptr, createTransportSocket(_))
-      .WillOnce(Invoke(
-          [](Network::TransportSocketOptionsConstSharedPtr options) -> Network::TransportSocketPtr {
-            EXPECT_TRUE(options != nullptr);
-            EXPECT_EQ(options->applicationProtocolFallback()[0],
-                      Http::Utility::AlpnNames::get().Http2);
-            return std::make_unique<Network::RawBufferSocket>();
-          }));
+  EXPECT_CALL(*factory_ptr, createTransportSocket(_, _))
+      .WillOnce(Invoke([](Network::TransportSocketOptionsConstSharedPtr options,
+                          Upstream::HostDescriptionConstSharedPtr) -> Network::TransportSocketPtr {
+        EXPECT_TRUE(options != nullptr);
+        EXPECT_EQ(options->applicationProtocolFallback()[0], Http::Utility::AlpnNames::get().Http2);
+        return std::make_unique<Network::RawBufferSocket>();
+      }));
   expectConnectionSetupForClient(1);
   ActiveTestRequest r(*this, 0, false);
   expectClientConnect(0, r);
   EXPECT_CALL(r.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   EXPECT_CALL(r.decoder_, decodeHeaders_(_, true));
   EXPECT_CALL(*this, onClientDestroy());
@@ -384,10 +390,8 @@ TEST_F(Http2ConnPoolImplTest, DrainConnectionReadyWithRequest) {
   ActiveTestRequest r(*this, 0, false);
   expectClientConnect(0, r);
   EXPECT_CALL(r.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
 
@@ -409,10 +413,8 @@ TEST_F(Http2ConnPoolImplTest, DrainConnectionBusy) {
   ActiveTestRequest r(*this, 0, false);
   expectClientConnect(0, r);
   EXPECT_CALL(r.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
 
@@ -539,16 +541,19 @@ TEST_F(Http2ConnPoolImplTest, CloseExcessMixedMultiplexing) {
   // Connection capacity is min(max requests per connection, max concurrent streams).
   // Use maxRequestsPerConnection here since max requests is tested above.
   EXPECT_CALL(*cluster_, maxRequestsPerConnection).WillOnce(Return(3));
+  EXPECT_CALL(*cluster_, maxRequestsPerConnection).WillOnce(Return(3));
   expectClientCreate();
   ActiveTestRequest r1(*this, 0, false);
   ActiveTestRequest r2(*this, 0, false);
   ActiveTestRequest r3(*this, 0, false);
 
   EXPECT_CALL(*cluster_, maxRequestsPerConnection).WillOnce(Return(2));
+  EXPECT_CALL(*cluster_, maxRequestsPerConnection).WillOnce(Return(2));
   expectClientCreate();
   ActiveTestRequest r4(*this, 0, false);
   ActiveTestRequest r5(*this, 0, false);
 
+  EXPECT_CALL(*cluster_, maxRequestsPerConnection).WillOnce(Return(6));
   EXPECT_CALL(*cluster_, maxRequestsPerConnection).WillOnce(Return(6));
   expectClientCreate();
   ActiveTestRequest r6(*this, 0, false);
@@ -599,10 +604,8 @@ TEST_F(Http2ConnPoolImplTest, DrainConnections) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   // With max_streams == 1, the second request moves the first connection
   // to draining.
@@ -610,10 +613,8 @@ TEST_F(Http2ConnPoolImplTest, DrainConnections) {
   ActiveTestRequest r2(*this, 1, false);
   expectClientConnect(1, r2);
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   // This will move the second connection to draining.
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
@@ -624,8 +625,8 @@ TEST_F(Http2ConnPoolImplTest, DrainConnections) {
   EXPECT_CALL(*this, onClientDestroy()).Times(2);
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 // Test that cluster.http2_protocol_options.max_concurrent_streams limits
@@ -678,7 +679,7 @@ TEST_F(Http2ConnPoolImplTest, MaxConcurrentRequestsPerStream) {
   EXPECT_CALL(*this, onClientDestroy()).Times(2);
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_total_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_total_.value());
 }
 
 // Verifies that requests are queued up in the conn pool until the connection becomes ready.
@@ -698,21 +699,15 @@ TEST_F(Http2ConnPoolImplTest, PendingStreams) {
 
   // Send a request through each stream.
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   EXPECT_CALL(r3.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r3.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r3.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   // Since we now have an active connection, subsequent requests should connect immediately.
   ActiveTestRequest r4(*this, 0, true);
@@ -722,8 +717,8 @@ TEST_F(Http2ConnPoolImplTest, PendingStreams) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 // Verifies that the correct number of CONNECTING connections are created for
@@ -747,21 +742,15 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsNumberConnectingTotalRequestsPerConn
 
   // Send a request through each stream.
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   EXPECT_CALL(r3.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r3.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r3.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   // Clean up everything.
   test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
@@ -791,21 +780,15 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsNumberConnectingConcurrentRequestsPe
 
   // Send a request through each stream.
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   EXPECT_CALL(r3.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r3.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r3.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   // Clean up everything.
   test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
@@ -826,11 +809,10 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsFailure) {
   ActiveTestRequest r2(*this, 0, false);
   ActiveTestRequest r3(*this, 0, false);
 
-  // The connection now becomes ready. This should cause all the queued requests to be sent.
-  // Note that these occur in reverse order due to the order we purge pending requests in.
-  expectStreamReset(r3);
+  // The connection fails, causing all queued requests to be failed in FIFO order.
+  expectStreamReset(r1);
   expectStreamReset(r2);
-  expectClientReset(0, r1, false);
+  expectClientReset(0, r3, false);
 
   expectClientCreate();
   // Since we have no active connection, subsequence requests will queue until
@@ -843,8 +825,8 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsFailure) {
   EXPECT_CALL(*this, onClientDestroy()).Times(2);
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 // Verifies resets due to local connection closes are tracked correctly.
@@ -858,11 +840,10 @@ TEST_F(Http2ConnPoolImplTest, LocalFailure) {
   ActiveTestRequest r2(*this, 0, false);
   ActiveTestRequest r3(*this, 0, false);
 
-  // The connection now becomes ready. This should cause all the queued requests to be sent.
-  // Note that these occur in reverse order due to the order we purge pending requests in.
-  expectStreamReset(r3);
+  // The connection fails, causing all queued requests to be failed in FIFO order.
+  expectStreamReset(r1);
   expectStreamReset(r2);
-  expectClientReset(0, r1, true);
+  expectClientReset(0, r3, true);
 
   EXPECT_CALL(*this, onClientDestroy());
 }
@@ -899,8 +880,8 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsRequestOverflow) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 // Verifies that we honor the max pending requests circuit breaker.
@@ -922,7 +903,9 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsMaxPendingCircuitBreaker) {
   MockResponseDecoder decoder;
   ConnPoolCallbacks callbacks;
   EXPECT_CALL(callbacks.pool_failure_, ready());
-  EXPECT_EQ(nullptr, pool_->newStream(decoder, callbacks));
+  EXPECT_EQ(nullptr, pool_->newStream(decoder, callbacks,
+                                      {/*can_send_early_data_=*/false,
+                                       /*can_use_http3_=*/false}));
 
   expectStreamConnect(0, r1);
   expectClientConnect(0);
@@ -935,8 +918,8 @@ TEST_F(Http2ConnPoolImplTest, PendingStreamsMaxPendingCircuitBreaker) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, VerifyConnectionTimingStats) {
@@ -947,22 +930,22 @@ TEST_F(Http2ConnPoolImplTest, VerifyConnectionTimingStats) {
               deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_connect_ms"), _));
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r1.decoder_, decodeHeaders_(_, true));
   r1.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
 
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_rq_per_cx"), _));
   EXPECT_CALL(cluster_->stats_store_,
               deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_length_ms"), _));
   test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 /**
@@ -972,17 +955,15 @@ TEST_F(Http2ConnPoolImplTest, VerifyBufferLimits) {
   InSequence s;
   expectClientCreate(8192);
   ActiveTestRequest r1(*this, 0, false);
-  // 1 stream. HTTP/2 defaults to 536870912 streams/connection.
-  CHECK_STATE(0 /*active*/, 1 /*pending*/, 536870912 /*capacity*/);
+  // 1 stream. HTTP/2 defaults to 1024 streams/connection.
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 1024 /*capacity*/);
 
   expectClientConnect(0, r1);
   // capacity goes down by one as one stream is used.
-  CHECK_STATE(1 /*active*/, 0 /*pending*/, 536870911 /*capacity*/);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 1023 /*capacity*/);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r1.decoder_, decodeHeaders_(_, true));
   r1.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
@@ -992,8 +973,8 @@ TEST_F(Http2ConnPoolImplTest, VerifyBufferLimits) {
   dispatcher_.clearDeferredDeleteList();
   CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, RequestAndResponse) {
@@ -1003,21 +984,17 @@ TEST_F(Http2ConnPoolImplTest, RequestAndResponse) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_active_.value());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_active_.value());
   EXPECT_CALL(r1.decoder_, decodeHeaders_(_, true));
   r1.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
 
   ActiveTestRequest r2(*this, 0, true);
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r2.decoder_, decodeHeaders_(_, true));
   r2.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
@@ -1026,9 +1003,9 @@ TEST_F(Http2ConnPoolImplTest, RequestAndResponse) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(0U, cluster_->stats_.upstream_cx_active_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_active_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, LocalReset) {
@@ -1038,20 +1015,18 @@ TEST_F(Http2ConnPoolImplTest, LocalReset) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, false));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, false)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, false));
   r1.callbacks_.outer_encoder_->getStream().resetStream(Http::StreamResetReason::LocalReset);
 
   test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_rq_tx_reset_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_rq_tx_reset_.value());
   EXPECT_EQ(0U, cluster_->circuit_breakers_stats_.rq_open_.value());
-  EXPECT_EQ(0U, cluster_->stats_.upstream_cx_active_.value());
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_active_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, RemoteReset) {
@@ -1061,20 +1036,40 @@ TEST_F(Http2ConnPoolImplTest, RemoteReset) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, false));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, false)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, false));
   r1.inner_encoder_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
 
   test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_rq_rx_reset_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_rq_rx_reset_.value());
   EXPECT_EQ(0U, cluster_->circuit_breakers_stats_.rq_open_.value());
-  EXPECT_EQ(0U, cluster_->stats_.upstream_cx_active_.value());
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_active_.value());
+}
+
+TEST_F(Http2ConnPoolImplTest, RemoteResetNoError) {
+  InSequence s;
+
+  expectClientCreate();
+  ActiveTestRequest r1(*this, 0, false);
+  expectClientConnect(0, r1);
+  EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, false));
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, false));
+  r1.inner_encoder_.stream_.resetStream(Http::StreamResetReason::RemoteResetNoError);
+
+  test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
+  EXPECT_CALL(*this, onClientDestroy());
+  dispatcher_.clearDeferredDeleteList();
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_rq_rx_reset_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_rq_rx_reset_no_error_.value());
+  EXPECT_EQ(0U, cluster_->circuit_breakers_stats_.rq_open_.value());
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_active_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, DrainDisconnectWithActiveRequest) {
@@ -1085,10 +1080,8 @@ TEST_F(Http2ConnPoolImplTest, DrainDisconnectWithActiveRequest) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   ReadyWatcher drained;
   pool_->addIdleCallback([&]() -> void { drained.ready(); });
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainAndDelete);
@@ -1099,8 +1092,8 @@ TEST_F(Http2ConnPoolImplTest, DrainDisconnectWithActiveRequest) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, DrainDisconnectDrainingWithActiveRequest) {
@@ -1113,18 +1106,14 @@ TEST_F(Http2ConnPoolImplTest, DrainDisconnectDrainingWithActiveRequest) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   expectClientCreate();
   ActiveTestRequest r2(*this, 1, false);
   expectClientConnect(1, r2);
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   ReadyWatcher drained;
   pool_->addIdleCallback([&]() -> void { drained.ready(); });
@@ -1143,8 +1132,8 @@ TEST_F(Http2ConnPoolImplTest, DrainDisconnectDrainingWithActiveRequest) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, DrainPrimary) {
@@ -1157,18 +1146,14 @@ TEST_F(Http2ConnPoolImplTest, DrainPrimary) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   expectClientCreate();
   ActiveTestRequest r2(*this, 1, false);
   expectClientConnect(1, r2);
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
 
   ReadyWatcher drained;
   pool_->addIdleCallback([&]() -> void { drained.ready(); });
@@ -1201,10 +1186,8 @@ TEST_F(Http2ConnPoolImplTest, DrainPrimaryNoActiveRequest) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(dispatcher_, deferredDelete_(_));
   EXPECT_CALL(r1.decoder_, decodeHeaders_(_, true));
   r1.inner_decoder_->decodeHeaders(
@@ -1216,10 +1199,8 @@ TEST_F(Http2ConnPoolImplTest, DrainPrimaryNoActiveRequest) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(dispatcher_, deferredDelete_(_));
   EXPECT_CALL(r2.decoder_, decodeHeaders_(_, true));
   r2.inner_decoder_->decodeHeaders(
@@ -1254,10 +1235,8 @@ TEST_F(Http2ConnPoolImplTest, ConnectTimeout) {
   ActiveTestRequest r2(*this, 1, false);
   expectClientConnect(1, r2);
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r2.decoder_, decodeHeaders_(_, true));
   r2.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
@@ -1266,13 +1245,13 @@ TEST_F(Http2ConnPoolImplTest, ConnectTimeout) {
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_rq_total_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_connect_fail_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_connect_timeout_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_rq_pending_failure_eject_.value());
-  EXPECT_EQ(2U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_local_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_rq_total_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_connect_fail_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_connect_timeout_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_rq_pending_failure_eject_.value());
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_local_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, MaxGlobalRequests) {
@@ -1283,21 +1262,21 @@ TEST_F(Http2ConnPoolImplTest, MaxGlobalRequests) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   ConnPoolCallbacks callbacks;
   MockResponseDecoder decoder;
   EXPECT_CALL(callbacks.pool_failure_, ready());
-  EXPECT_EQ(nullptr, pool_->newStream(decoder, callbacks));
+  EXPECT_EQ(nullptr, pool_->newStream(decoder, callbacks,
+                                      {/*can_send_early_data_=*/false,
+                                       /*can_use_http3_=*/false}));
 
   test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
   EXPECT_CALL(*this, onClientDestroy());
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_.value());
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_destroy_remote_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, GoAway) {
@@ -1307,10 +1286,8 @@ TEST_F(Http2ConnPoolImplTest, GoAway) {
   ActiveTestRequest r1(*this, 0, false);
   expectClientConnect(0, r1);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r1.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r1.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r1.decoder_, decodeHeaders_(_, true));
   r1.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
@@ -1321,10 +1298,8 @@ TEST_F(Http2ConnPoolImplTest, GoAway) {
   ActiveTestRequest r2(*this, 1, false);
   expectClientConnect(1, r2);
   EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
-  EXPECT_TRUE(
-      r2.callbacks_.outer_encoder_
-          ->encodeHeaders(TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true)
-          .ok());
+  EXPECT_OK(r2.callbacks_.outer_encoder_->encodeHeaders(
+      TestRequestHeaderMapImpl{{":path", "/"}, {":method", "GET"}}, true));
   EXPECT_CALL(r2.decoder_, decodeHeaders_(_, true));
   r2.inner_decoder_->decodeHeaders(
       ResponseHeaderMapPtr{new TestResponseHeaderMapImpl{{":status", "200"}}}, true);
@@ -1334,7 +1309,7 @@ TEST_F(Http2ConnPoolImplTest, GoAway) {
   EXPECT_CALL(*this, onClientDestroy()).Times(2);
   dispatcher_.clearDeferredDeleteList();
 
-  EXPECT_EQ(1U, cluster_->stats_.upstream_cx_close_notify_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_close_notify_.value());
 }
 
 TEST_F(Http2ConnPoolImplTest, NoActiveConnectionsByDefault) {
@@ -1434,34 +1409,167 @@ TEST_F(Http2ConnPoolImplTest, PreconnectWithoutMultiplexing) {
   closeAllClients();
 }
 
-TEST_F(Http2ConnPoolImplTest, DisconnectWithNegativeCapacity) {
-  TestScopedRuntime scoped_runtime;
-  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(2);
+TEST_F(Http2ConnPoolImplTest, IncreaseCapacityWithSettingsFrame) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(100);
   ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1));
 
-  // One stream results in one connection. Two streams result in two connections.
+  // The initial capacity is determined by configured max_concurrent_streams.
   expectClientsCreate(1);
   ActiveTestRequest r1(*this, 0, false);
-  CHECK_STATE(0 /*active*/, 1 /*pending*/, 2 /*capacity*/);
-  ActiveTestRequest r2(*this, 0, false);
-  CHECK_STATE(0 /*active*/, 2 /*pending*/, 2 /*capacity*/);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 100 /*capacity*/);
 
-  // When the connection connects, there is zero spare capacity in this pool.
+  // When the connection connects, there is 99 spare capacity in this pool.
   EXPECT_CALL(*test_clients_[0].codec_, newStream(_))
-      .WillOnce(DoAll(SaveArgAddress(&r1.inner_decoder_), ReturnRef(r1.inner_encoder_)))
-      .WillOnce(DoAll(SaveArgAddress(&r2.inner_decoder_), ReturnRef(r2.inner_encoder_)));
+      .WillOnce(DoAll(SaveArgAddress(&r1.inner_decoder_), ReturnRef(r1.inner_encoder_)));
   EXPECT_CALL(r1.callbacks_.pool_ready_, ready());
-  EXPECT_CALL(r2.callbacks_.pool_ready_, ready());
   expectClientConnect(0);
-  CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 99 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 1);
 
-  // Settings frame reducing capacity to one stream per connection results in -1 capacity.
+  // Settings frame results in 0 capacity, the state of client changes from Ready to BUSY.
   NiceMock<MockReceivedSettings> settings;
   settings.max_concurrent_streams_ = 1;
   test_clients_[0].codec_client_->onSettings(settings);
-  CHECK_STATE(2 /*active*/, 0 /*pending*/, -1 /*capacity*/);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 0);
 
+  // Settings frame results in 9 capacity, the state of client changes from BUSY to Ready.
+  settings.max_concurrent_streams_ = 10;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 9 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 1);
+
+  // Settings frame with capacity of 150 which will be restricted by configured
+  // max_concurrent_streams, then results in 99 capacity.
+  settings.max_concurrent_streams_ = 150;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 99 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 1);
+
+  // Close connection.
   closeAllClients();
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+}
+
+TEST_F(Http2ConnPoolImplTest, DisconnectWithNegativeCapacity) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(6);
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1));
+
+  expectClientsCreate(1);
+  ActiveTestRequest r1(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 6 /*capacity*/);
+  ActiveTestRequest r2(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 2 /*pending*/, 6 /*capacity*/);
+  ActiveTestRequest r3(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 3 /*pending*/, 6 /*capacity*/);
+  ActiveTestRequest r4(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 4 /*pending*/, 6 /*capacity*/);
+  ActiveTestRequest r5(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 5 /*pending*/, 6 /*capacity*/);
+
+  // When the connection connects, there is 1 spare capacity in this pool.
+  EXPECT_CALL(*test_clients_[0].codec_, newStream(_))
+      .WillOnce(DoAll(SaveArgAddress(&r1.inner_decoder_), ReturnRef(r1.inner_encoder_)))
+      .WillOnce(DoAll(SaveArgAddress(&r2.inner_decoder_), ReturnRef(r2.inner_encoder_)))
+      .WillOnce(DoAll(SaveArgAddress(&r3.inner_decoder_), ReturnRef(r3.inner_encoder_)))
+      .WillOnce(DoAll(SaveArgAddress(&r4.inner_decoder_), ReturnRef(r4.inner_encoder_)))
+      .WillOnce(DoAll(SaveArgAddress(&r5.inner_decoder_), ReturnRef(r5.inner_encoder_)));
+  EXPECT_CALL(r1.callbacks_.pool_ready_, ready());
+  EXPECT_CALL(r2.callbacks_.pool_ready_, ready());
+  EXPECT_CALL(r3.callbacks_.pool_ready_, ready());
+  EXPECT_CALL(r4.callbacks_.pool_ready_, ready());
+  EXPECT_CALL(r5.callbacks_.pool_ready_, ready());
+  expectClientConnect(0);
+  CHECK_STATE(5 /*active*/, 0 /*pending*/, 1 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 1);
+
+  // Settings frame results in negative per-client capacity, but pool capacity is clamped to 0
+  // because the negative portion is tracked as debt on the client.
+  NiceMock<MockReceivedSettings> settings;
+  settings.max_concurrent_streams_ = 3;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(5 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 0);
+
+  // Close 1 stream, concurrency capacity goes to -1, still no ready client available.
+  completeRequest(r1);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 0);
+
+  // Close 2 streams, concurrency capacity goes to 1, there should be one ready client.
+  completeRequest(r2);
+  completeRequest(r3);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 1);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 1 /*capacity*/);
+
+  // Another settings frame results in negative per-client capacity, pool clamped to 0.
+  settings.max_concurrent_streams_ = 1;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 0);
+
+  // Close connection with negative capacity.
+  closeAllClients();
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+}
+
+// Regression test for https://github.com/envoyproxy/envoy/issues/46234
+// When a SETTINGS frame reduces max_concurrent_streams below the active stream count on a busy
+// client, the pool capacity should not go negative — a ready client on a different connection
+// should still reflect positive capacity.
+TEST_F(Http2ConnPoolImplTest, NegativeCapacityDoesNotAffectReadyClient) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(4);
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1.5));
+
+  // 3 pending requests with preconnect 1.5 triggers creation of 2 connections (each cap=4).
+  expectClientsCreate(2);
+  ActiveTestRequest r1(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 4 /*capacity*/);
+  ActiveTestRequest r2(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 2 /*pending*/, 4 /*capacity*/);
+  ActiveTestRequest r3(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 3 /*pending*/, 8 /*capacity*/);
+
+  // Connect connection 0, dispatches all 3 pending streams.
+  EXPECT_CALL(*test_clients_[0].codec_, newStream(_))
+      .WillOnce(DoAll(SaveArgAddress(&r1.inner_decoder_), ReturnRef(r1.inner_encoder_)))
+      .WillOnce(DoAll(SaveArgAddress(&r2.inner_decoder_), ReturnRef(r2.inner_encoder_)))
+      .WillOnce(DoAll(SaveArgAddress(&r3.inner_decoder_), ReturnRef(r3.inner_encoder_)));
+  EXPECT_CALL(r1.callbacks_.pool_ready_, ready());
+  EXPECT_CALL(r2.callbacks_.pool_ready_, ready());
+  EXPECT_CALL(r3.callbacks_.pool_ready_, ready());
+  expectClientConnect(0);
+  // Connection 0: 3 active, capacity=1. Connection 1: still connecting, capacity=4. Total=5.
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 5 /*capacity*/);
+
+  // Connect connection 1 (idle, ready with capacity 4).
+  expectClientConnect(1);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 5 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 2);
+
+  // SETTINGS frame on connection 0 reduces max_concurrent_streams to 1 (below 3 active).
+  // Connection 0 transitions to Busy with per-client capacity of -2 (tracked as debt).
+  // Pool capacity only reflects real available capacity: connection 1's 4 + connection 0's 0 = 4.
+  NiceMock<MockReceivedSettings> settings;
+  settings.max_concurrent_streams_ = 1;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 4 /*capacity*/);
+  EXPECT_EQ(pool_->owningList(Envoy::ConnectionPool::ActiveClient::State::Ready).size(), 1);
+
+  // As streams close on connection 0, capacity stays at 4 until debt is repaid.
+  completeRequest(r1);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 4 /*capacity*/);
+  completeRequest(r2);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 4 /*capacity*/);
+
+  // Final stream closes on connection 0 — debt fully repaid, capacity restored to 1.
+  // Pool increments: connection 0's 1 + connection 1's 4 = 5.
+  completeRequest(r3);
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 5 /*capacity*/);
+
+  // Clean up.
+  pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
+  closeAllClients();
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
 }
 
 TEST_F(Http2ConnPoolImplTest, PreconnectWithMultiplexing) {
@@ -1520,7 +1628,7 @@ TEST_F(Http2ConnPoolImplTest, PreconnectWithSettings) {
   settings.max_concurrent_streams_ = 1;
   test_clients_[0].codec_client_->onSettings(settings);
   test_clients_[1].codec_client_->onSettings(settings);
-  CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 1 /*capacity*/);
 
   // Clean up.
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
@@ -1575,6 +1683,46 @@ TEST_F(Http2ConnPoolImplTest, PreconnectEvenWhenReady) {
   // Clean up.
   completeRequest(r1);
   completeRequest(r2);
+  pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
+  closeAllClients();
+}
+
+// Test that with many concurrent requests that the correct total number of connections are
+// established.
+TEST_F(Http2ConnPoolImplTest, PreconnectConcurrentRequests) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(2);
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1.5));
+
+  expectClientsCreate(1);
+  ActiveTestRequest r1(*this, 0, false);
+
+  expectClientConnect(0, r1);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 1 /*capacity*/); // Preconnect required capacity: 2
+
+  expectClientsCreate(1);
+  ActiveTestRequest r2(*this, 0, true);
+  expectClientConnect(1);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 2 /*capacity*/); // Preconnect required capacity: 3
+
+  expectClientsCreate(1);
+  ActiveTestRequest r3(*this, 1, true);
+  expectClientConnect(2);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 3 /*capacity*/); // Preconnect required capacity: 5
+
+  ActiveTestRequest r4(*this, 2, true);
+  CHECK_STATE(4 /*active*/, 0 /*pending*/, 2 /*capacity*/); // Preconnect required capacity: 6
+
+  expectClientsCreate(1);
+  ActiveTestRequest r5(*this, 2, true);
+  expectClientConnect(3);
+  CHECK_STATE(5 /*active*/, 0 /*pending*/, 3 /*capacity*/); // Preconnect required capacity: 8
+
+  // Clean up.
+  completeRequest(r1);
+  completeRequest(r2);
+  completeRequest(r3);
+  completeRequest(r4);
+  completeRequest(r5);
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
   closeAllClients();
 }
@@ -1638,6 +1786,138 @@ TEST_F(Http2ConnPoolImplTest, MaybePreconnect) {
   closeAllClients();
 }
 
+TEST_F(Http2ConnPoolImplTest, TestUnusedCapacity) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(8);
+  cluster_->max_requests_per_connection_ = 6;
+
+  expectClientsCreate(1);
+  ActiveTestRequest r1(*this, 0, false);
+  // Initially, capacity is based on remaining streams and capped at 6.
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 6 /*capacity*/);
+  expectClientConnect(0, r1);
+  // Now the stream is active, remaining concurrency capacity is 5.
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 5 /*capacity*/);
+
+  // With two more streams, remaining unused capacity is 3.
+  ActiveTestRequest r2(*this, 0, true);
+  ActiveTestRequest r3(*this, 0, true);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  // Settings frame results in 1 unused capacity.
+  NiceMock<MockReceivedSettings> settings;
+  settings.max_concurrent_streams_ = 4;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 1 /*capacity*/);
+
+  // Closing a stream, unused capacity returns to 2.
+  completeRequest(r1);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 2 /*capacity*/);
+
+  // Closing another, unused capacity returns to 3 (3 remaining stream).
+  completeRequest(r2);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  // Closing the last stream, unused capacity remains at 3, as there is only 3 remaining streams.
+  completeRequest(r3);
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  // Clean up with an outstanding stream.
+  pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
+  closeAllClients();
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+}
+
+TEST_F(Http2ConnPoolImplTest, TestNegativeUnusedCapacity) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(4);
+
+  expectClientsCreate(2);
+  ActiveTestRequest r1(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 4 /*capacity*/);
+  expectClientConnect(0, r1);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  ActiveTestRequest r2(*this, 0, true);
+  ActiveTestRequest r3(*this, 0, true);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 1 /*capacity*/);
+
+  // Settings frame results in negative per-client capacity, pool clamped to 0.
+  NiceMock<MockReceivedSettings> settings;
+  settings.max_concurrent_streams_ = 1;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+
+  completeRequest(r1);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+
+  // With zero capacity, verify that a new request creates a new connection.
+  ActiveTestRequest r4(*this, 1, false);
+  CHECK_STATE(2 /*active*/, 1 /*pending*/, 4 /*capacity*/);
+  expectClientConnect(1, r4);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  completeRequest(r2);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  completeRequest(r3);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 4 /*capacity*/);
+
+  completeRequest(r4);
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 5 /*capacity*/);
+
+  // Clean up with an outstanding stream.
+  pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
+  closeAllClients();
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+}
+
+TEST_F(Http2ConnPoolImplTest, TestDrainingNegativeUnusedCapacity) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(4);
+
+  expectClientsCreate(2);
+  ActiveTestRequest r1(*this, 0, false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 4 /*capacity*/);
+  expectClientConnect(0, r1);
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  ActiveTestRequest r2(*this, 0, true);
+  ActiveTestRequest r3(*this, 0, true);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 1 /*capacity*/);
+
+  // Settings frame results in negative per-client capacity, pool clamped to 0.
+  NiceMock<MockReceivedSettings> settings;
+  settings.max_concurrent_streams_ = 2;
+  test_clients_[0].codec_client_->onSettings(settings);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+
+  // Clean up with an outstanding stream.
+  pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
+
+  completeRequest(r1);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+
+  // With negative capacity, verify that a new request creates a new connection.
+  ActiveTestRequest r4(*this, 1, false);
+  CHECK_STATE(2 /*active*/, 1 /*pending*/, 4 /*capacity*/);
+  expectClientConnect(1, r4);
+  CHECK_STATE(3 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  // Completing this request does NOT add more capacity because the connection is
+  // draining, and that connection's capacity is no longer negative.
+  completeRequest(r2);
+  CHECK_STATE(2 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  // After r3 completes, the draining connection should close.
+  EXPECT_CALL(*this, onClientDestroy());
+  completeRequest(r3);
+  dispatcher_.clearDeferredDeleteList();
+  CHECK_STATE(1 /*active*/, 0 /*pending*/, 3 /*capacity*/);
+
+  completeRequest(r4);
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 4 /*capacity*/);
+
+  closeClient(1);
+}
+
 TEST_F(Http2ConnPoolImplTest, TestStateWithMultiplexing) {
   cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(2);
   cluster_->max_requests_per_connection_ = 4;
@@ -1647,22 +1927,22 @@ TEST_F(Http2ConnPoolImplTest, TestStateWithMultiplexing) {
   // Initially, capacity is based on concurrency and capped at 2.
   CHECK_STATE(0 /*active*/, 1 /*pending*/, 2 /*capacity*/);
   expectClientConnect(0, r1);
-  // Now the stream is active, remaining concurrency capacity is 1
+  // Now the stream is active, remaining concurrency capacity is 1.
   CHECK_STATE(1 /*active*/, 0 /*pending*/, 1 /*capacity*/);
 
   // With one more stream, remaining concurrency capacity is 0.
   ActiveTestRequest r2(*this, 0, true);
   CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
 
-  // If one stream closes, concurrency capacity goes to 1 (2 remaining streams)
+  // If one stream closes, concurrency capacity goes to 1 (2 remaining streams).
   completeRequest(r1);
   CHECK_STATE(1 /*active*/, 0 /*pending*/, 1 /*capacity*/);
 
-  // Assigning a new stream, concurrency capacity returns to 0 (1 remaining stream);
+  // Assigning a new stream, concurrency capacity returns to 0 (1 remaining stream).
   ActiveTestRequest r3(*this, 0, true);
   CHECK_STATE(2 /*active*/, 0 /*pending*/, 0 /*capacity*/);
 
-  // Closing a stream, capacity returns to 1 (both concurrency and remaining streams)
+  // Closing a stream, capacity returns to 1 (both concurrency and remaining streams).
   completeRequest(r2);
   CHECK_STATE(1 /*active*/, 0 /*pending*/, 1 /*capacity*/);
 
@@ -1674,6 +1954,196 @@ TEST_F(Http2ConnPoolImplTest, TestStateWithMultiplexing) {
   pool_->drainConnections(Envoy::ConnectionPool::DrainBehavior::DrainExistingConnections);
   closeAllClients();
   CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*capacity*/);
+}
+
+class InitialStreamsLimitTest : public Http2ConnPoolImplTest {
+protected:
+  void SetUp() override {
+    mock_host_->cluster_.http2_options_.mutable_max_concurrent_streams()->set_value(2000);
+    EXPECT_CALL(mock_host_->cluster_, maxRequestsPerConnection)
+        .Times(AnyNumber())
+        .WillRepeatedly(Return(4000));
+    EXPECT_CALL(mock_host_->cluster_, maxRequestsPerConnection()).WillRepeatedly(Return(8000));
+  }
+
+  TestScopedRuntime scoped_runtime_;
+  std::optional<HttpServerPropertiesCache::Origin> origin_{{"https", "hostname.com", 443}};
+  std::shared_ptr<Upstream::MockHost> mock_host_{std::make_shared<NiceMock<Upstream::MockHost>>()};
+  std::shared_ptr<MockHttpServerPropertiesCache> cache_{
+      std::make_shared<NiceMock<MockHttpServerPropertiesCache>>()};
+};
+
+TEST_F(InitialStreamsLimitTest, InitialStreamsLimitDefaultsNoCache) {
+  // By default, return max concurrent streams from SetUp.
+  cache_ = nullptr;
+  EXPECT_EQ(2000, ActiveClient::calculateInitialStreamsLimit(nullptr, origin_, mock_host_));
+}
+
+TEST_F(InitialStreamsLimitTest, InitialStreamsLimitDefaultsWithCache) {
+  // Adding a cache is a no-op if there's no cached settings.
+  EXPECT_EQ(2000, ActiveClient::calculateInitialStreamsLimit(cache_, origin_, mock_host_));
+}
+
+TEST_F(InitialStreamsLimitTest, InitialStreamsLimitZeroCached) {
+  // Zero is ignored.
+  EXPECT_CALL(*cache_, getConcurrentStreams(_)).WillOnce(Return(0));
+  EXPECT_EQ(2000, ActiveClient::calculateInitialStreamsLimit(cache_, origin_, mock_host_));
+}
+
+TEST_F(InitialStreamsLimitTest, InitialStreamsLimitRespectCache) {
+  // Cached settings are respected if lower than configured streams.
+  EXPECT_CALL(*cache_, getConcurrentStreams(_)).WillOnce(Return(500));
+  EXPECT_EQ(500, ActiveClient::calculateInitialStreamsLimit(cache_, origin_, mock_host_));
+}
+
+TEST_F(InitialStreamsLimitTest, InitialStreamsLimitRespectMaxRequests) {
+  // Max requests per connection is an upper bound.
+  EXPECT_CALL(*cache_, getConcurrentStreams(_)).WillOnce(Return(500));
+  EXPECT_CALL(mock_host_->cluster_, maxRequestsPerConnection)
+      .Times(AnyNumber())
+      .WillRepeatedly(Return(100));
+  EXPECT_EQ(100, ActiveClient::calculateInitialStreamsLimit(cache_, origin_, mock_host_));
+}
+
+// Verifies the upstream_rq_per_cx histogram correctly tracks multiple concurrent HTTP/2 streams on
+// the same connection.
+TEST_F(Http2ConnPoolImplTest, RequestTrackingMultipleStreams) {
+  // Allow multiple concurrent streams on a single connection
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(5);
+
+  // Set up expectations for all histograms that will be emitted on connection close
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_connect_ms"), _));
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_length_ms"), _));
+  // Use _ to capture any value and let the test show us what it actually is
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_rq_per_cx"), _));
+
+  InSequence s;
+
+  // Create first request - this will create a new connection
+  expectClientCreate();
+  ActiveTestRequest r1(*this, 0, false);
+  expectClientConnect(0, r1);
+
+  // Create second and third requests - these should reuse the same connection due to multiplexing
+  ActiveTestRequest r2(*this, 0, true); // expect_connected=true means reuse connection
+  ActiveTestRequest r3(*this, 0, true); // expect_connected=true means reuse connection
+
+  // Complete all requests
+  completeRequest(r1);
+  completeRequest(r2);
+  completeRequest(r3);
+
+  // Close the connection to trigger metrics emission
+  // Set expectation first, then raise the event
+  EXPECT_CALL(*this, onClientDestroy());
+  test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
+  dispatcher_.clearDeferredDeleteList();
+}
+
+// Verify request tracking for HTTP/2 with 5 concurrent streams.
+TEST_F(Http2ConnPoolImplTest, RequestTrackingFiveStreams) {
+  // Allow multiple concurrent streams on a single connection
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(10);
+
+  // Set up expectations for all histograms that will be emitted on connection close
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_connect_ms"), _));
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_length_ms"), _));
+  // Test with 5 requests to see if it correctly tracks all of them
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_rq_per_cx"), 5));
+
+  InSequence s;
+
+  // Create first request - this will create a new connection
+  expectClientCreate();
+  ActiveTestRequest r1(*this, 0, false);
+  expectClientConnect(0, r1);
+
+  // Create 4 more requests - these should reuse the same connection due to HTTP/2 multiplexing
+  ActiveTestRequest r2(*this, 0, true);
+  ActiveTestRequest r3(*this, 0, true);
+  ActiveTestRequest r4(*this, 0, true);
+  ActiveTestRequest r5(*this, 0, true);
+
+  // Complete all requests
+  completeRequest(r1);
+  completeRequest(r2);
+  completeRequest(r3);
+  completeRequest(r4);
+  completeRequest(r5);
+
+  // Close the connection to trigger metrics emission
+  EXPECT_CALL(*this, onClientDestroy());
+  test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
+  dispatcher_.clearDeferredDeleteList();
+}
+
+// Test that failed connections don't record upstream_rq_per_cx metric
+TEST_F(Http2ConnPoolImplTest, RequestTrackingConnectionFailureNoMetric) {
+  // Create a request that will trigger connection creation
+  expectClientCreate();
+  ActiveTestRequest r(*this, 0, false);
+
+  // DO NOT call expectClientConnect - let the connection fail before handshake completion
+  // This should not record any upstream_rq_per_cx metric due to hasHandshakeCompleted() check
+
+  EXPECT_CALL(r.callbacks_.pool_failure_, ready());
+
+  // Close/fail the connection BEFORE it becomes ready (before handshake completion)
+  EXPECT_CALL(*this, onClientDestroy());
+  test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
+  dispatcher_.clearDeferredDeleteList();
+
+  // Verify the connection failure was recorded
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_.value());
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_destroy_remote_.value());
+}
+
+/**
+ * Verify that if a request is synchronously reset during onPoolReady(),
+ * it does not trigger recursive reentrant crashes in ConnPoolImplBase in the H2 pool.
+ */
+TEST_F(Http2ConnPoolImplTest, ReentrancySynchronousResetInPoolReady) {
+  cluster_->http2_options_.mutable_max_concurrent_streams()->set_value(1);
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.conn_pool_fix_reentrancy", "true"}});
+
+  InSequence s;
+
+  // 1. Create a client and a pending request.
+  expectClientCreate();
+  ActiveTestRequest r(*this, 0, false);
+
+  // 2. Expect the H2 client connection to be created, and expect onPoolReady.
+  // We override the onPoolReady callback to synchronously reset the stream!
+  EXPECT_CALL(*test_clients_[0].codec_, newStream(_))
+      .WillOnce(DoAll(SaveArgAddress(&r.inner_decoder_), ReturnRef(r.inner_encoder_)));
+
+  bool already_called = false;
+  EXPECT_CALL(r.callbacks_.pool_ready_, ready()).WillRepeatedly(Invoke([&]() {
+    if (already_called) {
+      ADD_FAILURE() << "Recursive onPoolReady call detected! Core pool reentrant bug is active!";
+      return;
+    }
+    already_called = true;
+    ASSERT_NE(r.callbacks_.outer_encoder_, nullptr);
+    r.callbacks_.outer_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
+  }));
+
+  // 3. Connect the client. This will trigger onPoolReady -> resetStream -> onStreamClosed ->
+  // onUpstreamReady recursively.
+  expectClientConnect(0);
+
+  // 4. Verify that the connection is successfully closed.
+  EXPECT_CALL(*this, onClientDestroy());
+  test_clients_[0].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
+  dispatcher_.clearDeferredDeleteList();
 }
 
 } // namespace Http2

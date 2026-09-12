@@ -11,7 +11,7 @@ namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
 
-static constexpr int kFakeSocketFd = 42;
+static constexpr int kFakeSocketFd = 65534;
 
 class FakeConnectionSocket : public Network::MockConnectionSocket {
 public:
@@ -26,7 +26,7 @@ public:
 
   Network::Address::Type addressType() const override;
 
-  absl::optional<Network::Address::IpVersion> ipVersion() const override;
+  std::optional<Network::Address::IpVersion> ipVersion() const override;
 
   void setRequestedApplicationProtocols(const std::vector<absl::string_view>& protocols) override;
 
@@ -40,15 +40,25 @@ public:
 
   absl::string_view requestedServerName() const override;
 
+  void setJA3Hash(absl::string_view ja3_hash) override;
+
+  absl::string_view ja3Hash() const override;
+
+  void setJA4Hash(absl::string_view ja4_hash) override;
+
+  absl::string_view ja4Hash() const override;
+
   Api::SysCallIntResult getSocketOption(int level, int, void* optval, socklen_t*) const override;
 
-  absl::optional<std::chrono::milliseconds> lastRoundTripTime() override;
+  std::optional<std::chrono::milliseconds> lastRoundTripTime() override;
 
 private:
   const Network::IoHandlePtr io_handle_;
   std::vector<std::string> application_protocols_;
   std::string transport_protocol_;
   std::string server_name_;
+  std::string ja3_hash_;
+  std::string ja4_hash_;
 };
 
 // TODO: Move over to Fake (name is confusing)

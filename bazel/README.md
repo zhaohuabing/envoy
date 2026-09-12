@@ -16,13 +16,6 @@ On macOS, run the following command:
 brew install bazelisk
 ```
 
-On Windows, run the following commands:
-```cmd
-mkdir %USERPROFILE%\bazel
-powershell Invoke-WebRequest https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-windows-amd64.exe -OutFile %USERPROFILE%\bazel\bazel.exe
-set PATH=%USERPROFILE%\bazel;%PATH%
-```
-
 ## Production environments
 
 To build Envoy with Bazel in a production environment, where the [Envoy
@@ -32,15 +25,38 @@ independently sourced, the following steps should be followed:
 1. Configure, build and/or install the [Envoy dependencies](https://www.envoyproxy.io/docs/envoy/latest/start/building#requirements).
 1. `bazel build -c opt envoy` from the repository root.
 
+### Building from a release tarball
+
+To build Envoy from a release tarball, you can download a release tarball from Assets section in each release in project [Releases page](https://github.com/envoyproxy/envoy/releases).
+Given all required [Envoy dependencies](https://www.envoyproxy.io/docs/envoy/latest/start/building#requirements) are installed, the following steps should be followed:
+
+1. Download and extract source code of a release tarball from the Releases page. For example: https://github.com/envoyproxy/envoy/releases/tag/v1.39.0.
+1. `python3 tools/github/write_current_source_version.py` from the repository root.
+1. `bazel build -c opt envoy` from the repository root.
+
+> **Note**: If the the `write_current_source_version.py` script is missing from the extracted source code directory, you can download it from [here](https://raw.githubusercontent.com/envoyproxy/envoy/main/tools/github/write_current_source_version.py).
+> This script is used to generate SOURCE_VERSION that is required by [`bazel/get_workspace_status`](./get_workspace_status) to "stamp" the binary in a non-git directory.
+
+> **Note**: To avoid rate-limiting by GitHub API, you can provide [a valid GitHub token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats) to `GITHUB_TOKEN` environment variable.
+> The environment variable name that holds the token can also be customized by setting `--github_api_token_env_name`.
+> In a GitHub Actions workflow file, you can set this token from [`secrets.GITHUB_TOKEN`](https://docs.github.com/en/actions/security-guides/automatic-token-authentication#about-the-github_token-secret).
+
+Examples:
+
+```console
+GITHUB_TOKEN=<GITHUB_TOKEN> python3 tools/github/write_current_source_version.py
+MY_TOKEN=<GITHUB_TOKEN> python3 tools/github/write_current_source_version.py --github_api_token_env_name=MY_TOKEN
+```
+
 ## Quick start Bazel build for developers
 
 This section describes how to and what dependencies to install to get started building Envoy with Bazel.
 If you would rather use a pre-build Docker image with required tools installed, skip to [this section](#building-envoy-with-the-ci-docker-image).
 
-As a developer convenience, a [WORKSPACE](https://github.com/envoyproxy/envoy/blob/main/WORKSPACE) and
-[rules for building a recent
-version](https://github.com/envoyproxy/envoy/blob/main/bazel/repositories.bzl) of the various Envoy
-dependencies are provided. These are provided as is, they are only suitable for development and
+As a developer convenience, a [MODULE.bazel](https://github.com/envoyproxy/envoy/blob/main/MODULE.bazel)
+pinning a recent version of the various Envoy dependencies is provided, resolved via the
+[Envoy Bazel registry](https://github.com/envoyproxy/bazel-registry). These are provided as is, they
+are only suitable for development and
 testing purposes. The specific versions of the Envoy dependencies used in this build may not be
 up-to-date with the latest security patches. See
 [this doc](https://github.com/envoyproxy/envoy/blob/main/bazel/EXTERNAL_DEPS.md#updating-an-external-dependency-version)
@@ -52,12 +68,9 @@ for how to update or override dependencies.
     ```console
     sudo apt-get install \
        autoconf \
-       automake \
-       cmake \
        curl \
+       libxml2-dev \
        libtool \
-       make \
-       ninja-build \
        patch \
        python3-pip \
        unzip \
@@ -69,175 +82,101 @@ for how to update or override dependencies.
     ```console
     dnf install \
         aspell-en \
-        cmake \
         libatomic \
         libstdc++ \
         libstdc++-static \
         libtool \
+        libxml2-devel \
         lld \
-        ninja-build \
         patch \
         python3-pip
     ```
 
     ### Linux
-    On Linux, we recommend using the prebuilt Clang+LLVM package from [LLVM official site](http://releases.llvm.org/download.html).
-    Extract the tar.xz and run the following:
+    Envoy uses a hermetic Clang toolchain that is automatically downloaded by Bazel, so you do not
+    need to install Clang manually. Note that despite the toolchain being hermetic, `libxml2` must
+    be installed on the host (included in the package lists above). To use the hermetic toolchain,
+    add `--config=clang` to your build command:
     ```console
-    bazel/setup_clang.sh <PATH_TO_EXTRACTED_CLANG_LLVM>
+    bazel build --config=clang envoy
     ```
 
-    This will setup a `clang.bazelrc` file in Envoy source root. If you want to make clang as default, run the following:
+    If you want to make clang the default, add it to your `user.bazelrc`:
     ```console
     echo "build --config=clang" >> user.bazelrc
     ```
 
-    Note: Either `libc++` or `libstdc++-7-dev` (or higher) must be installed.
+    Note: `libc++` is the recommended standard library for Envoy development and is automatically used with `--config=clang`.
 
-    #### Config Flag Choices
-    Different [config](https://docs.bazel.build/versions/master/guide.html#--config) flags specify the compiler libraries:
+    #### Compiler and Standard Library Configuration
+    Envoy supports the following compiler toolchains:
 
-    - `--config=libc++` means using `clang` + `libc++`
-    - `--config=clang` means using `clang` + `libstdc++`
-    - no config flag means using `gcc` + `libstdc++`
+    - `--config=clang` (recommended): Uses `clang` compiler with `libc++` (LLVM standard library)
+    - `--config=gcc`: Uses `gcc` compiler with `libstdc++` (GNU standard library)
+    - No config flag: Uses system default compiler settings
+
+    Note: While it's possible to use `clang` with `libstdc++` by setting CC/CXX environment variables without a config flag, this combination is not tested or supported.
+
+    For more granular control:
+    - `--config=clang-common`: Provides base clang configuration without standard library settings
+    - `--config=libc++`: Provides just the libc++ standard library flags
+    - `--config=libstdc++`: Provides just the libstdc++ standard library flags
 
 
     ### macOS
     On macOS, you'll need to install several dependencies. This can be accomplished via [Homebrew](https://brew.sh/):
     ```console
-    brew install coreutils wget cmake libtool go bazel automake ninja clang-format autoconf aspell
+    brew install coreutils wget libtool go bazelisk clang-format autoconf aspell
     ```
     _notes_: `coreutils` is used for `realpath`, `gmd5sum` and `gsha256sum`
 
+    _notes_: See Homebrew python setup notes: https://docs.brew.sh/Homebrew-and-Python.
+
     The full version of Xcode (not just Command Line Tools) is also required to build Envoy on macOS.
-    Envoy compiles and passes tests with the version of clang installed by Xcode 11.1:
-    Apple clang version 11.0.0 (clang-1100.0.33.8).
+    Envoy compiles and passes tests with a recent version of Xcode and its bundled Apple clang.
+
+    #### Troubleshooting
+    If you see some error messages like the following:
+    ```console
+    xcrun: error: SDK "macosx12.1" cannot be located
+    xcrun: error: SDK "macosx12.1" cannot be located
+    xcrun: error: unable to lookup item 'Path' in SDK 'macosx12.1'
+    ```
+    please check the installed sdk version.
+    ```console
+    xcrun --show-sdk-version
+    ```
+
+    If the sdk version is lower than the one in the error message, upgrade your Command Line Tools using the following commands:
+    ```console
+    sudo rm -rf /Library/Developer/CommandLineTools
+    softwareupdate --all --install --force
+    sudo xcode-select --install
+    ```
+
+    If the following error occurs during the compilation process:
+    ```console
+    xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer directory '/Library/Developer/CommandLineTools' is a command line tools instance
+    ```
+    please execute the following command and retry:
+    ```console
+    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    ```
 
     Having the binutils keg installed in Brew is known to cause issues due to putting an incompatible
     version of `ar` on the PATH, so if you run into issues building third party code like luajit
     consider uninstalling binutils.
 
-    ### Windows
-
-    > Note: These instructions apply to **Windows 10 SDK, version 1803 (10.0.17134.12)**. Earlier versions will not compile because the `afunix.h` header is not available. **The recommended Windows version is equal or later than Windows 10 SDK, version 1903 (10.0.18362.1)**
-
-    Install bazelisk in the PATH using the `bazel.exe` executable name as described above in the first section.
-
-    When building Envoy, Bazel creates very long path names. One way to work around these excessive path
-    lengths is to change the output base directory for bazel to a very short root path. An example Bazel configuration
-    to help with this is to use `C:\_eb` as the bazel base path. This and other preferences should be set up by placing
-    the following bazelrc configuration line in a system `%ProgramData%\bazel.bazelrc` file or the individual
-    user's `%USERPROFILE%\.bazelrc` file (rather than including it on every bazel command line):
-
-    ```
-    startup --output_base=C:/_eb
-    ```
-
-    Another option to shorten the output root for Bazel is to set the `USERNAME` environment variable in your shell
-    session to a short value. Bazel uses this value when constructing its output root path if no explicit `--output_base`
-    is set.
-
-    Bazel also creates file symlinks when building Envoy. It's strongly recommended to enable file symlink support
-    using [Bazel's instructions](https://docs.bazel.build/versions/master/windows.html#enable-symlink-support).
-    For other common issues, see the
-    [Using Bazel on Windows](https://docs.bazel.build/versions/master/windows.html) page.
-
-    > The paths in this document are given as
-    examples, make sure to verify you are using the correct paths for your environment. Also note
-    that these examples assume using a `cmd.exe` shell to set environment variables etc., be sure
-    to do the equivalent if using a different shell.
-
-    [python3](https://www.python.org/downloads/): Specifically, the Windows-native flavor distributed
-    by python.org. The POSIX flavor available via MSYS2, the Windows Store flavor and other distributions
-    will not work. Add a symlink for `python3.exe` pointing to the installed `python.exe` for Envoy scripts
-    and Bazel rules which follow POSIX python conventions. Add `pip.exe` to the PATH and install the `wheel`
-    package.
-    ```cmd
-    mklink %USERPROFILE%\Python39\python3.exe %USERPROFILE%\Python39\python.exe
-    set PATH=%USERPROFILE%\Python39;%PATH%
-    set PATH=%USERPROFILE%\Python39\Scripts;%PATH%
-    pip install wheel
-    ```
-
-    [Build Tools for Visual Studio 2019](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2019):
-    For building with MSVC, you must install at least the VC++ workload.
-    You may alternately install the entire Visual Studio 2019 and use the Build Tools installed in that
-    package. Earlier versions of VC++ Build Tools/Visual Studio are not recommended or supported.
-    If installed in a non-standard filesystem location, be sure to set the `BAZEL_VC` environment variable
-    to the path of the VC++ package to allow Bazel to find your installation of VC++. NOTE: ensure that
-    the `link.exe` that resolves on your PATH is from VC++ Build Tools and not `/usr/bin/link.exe` from MSYS2,
-    which is determined by their relative ordering in your PATH.
-    ```cmd
-    set BAZEL_VC=%USERPROFILE%\VSBT2019\VC
-    set PATH=%USERPROFILE%\VSBT2019\VC\Tools\MSVC\14.26.28801\bin\Hostx64\x64;%PATH%
-    ```
-
-    The Windows SDK contains header files and libraries you need when building Windows applications. Bazel always uses the latest, but you can specify a different version by setting the environment variable `BAZEL_WINSDK_FULL_VERSION`. See [bazel/windows](https://docs.bazel.build/versions/master/windows.html)
-
-    Ensure `CMake` and `ninja` binaries are on the PATH. The versions packaged with VC++ Build
-    Tools are sufficient in most cases, but are 32 bit binaries. These flavors will not run in
-    the project's GCP CI remote build environment, so 64 bit builds from the CMake and ninja
-    projects are used instead.
-    ```cmd
-    set PATH=%USERPROFILE%\VSBT2019\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%PATH%
-    set PATH=%USERPROFILE%\VSBT2019\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%
-    ```
-
-    [MSYS2 shell](https://msys2.github.io/): Install to a path with no spaces, e.g. C:\msys64.
-
-    Set the `BAZEL_SH` environment variable to the path of the installed MSYS2 `bash.exe`
-    executable. Additionally, setting the `MSYS2_ARG_CONV_EXCL` environment variable to a value
-    of `*` is often advisable to ensure argument parsing in the MSYS2 shell behaves as expected.
-    ```cmd
-    set PATH=%USERPROFILE%\msys64\usr\bin;%PATH%
-    set BAZEL_SH=%USERPROFILE%\msys64\usr\bin\bash.exe
-    set MSYS2_ARG_CONV_EXCL=*
-    set MSYS2_PATH_TYPE=inherit
-    ```
-
-    Set the `TMPDIR` environment variable to a path usable as a temporary directory (e.g.
-    `C:\Windows\TEMP`), and create a directory symlink `C:\c` to `C:\`, so that the MSYS2
-    path `/c/Windows/TEMP` is equivalent to the Windows path `C:\Windows\TEMP`:
-    ```cmd
-    set TMPDIR=C:\Windows\TEMP
-    mklink /d C:\c C:\
-    ```
-
-    The TMPDIR path and MSYS2 `mktemp` command are used frequently by the `rules_foreign_cc`
-    component of Bazel as well as Envoy's test scripts, causing problems if not set to a path
-    accessible to both Windows and msys commands. [Note the `ci/windows_ci_steps.sh` script
-    which builds envoy and run tests in CI creates this symlink automatically.]
-
-    In the MSYS2 shell, install additional packages via pacman:
-    ```
-    pacman -S diffutils patch unzip zip
-    ```
-
-    [Git](https://git-scm.com/downloads): This version from the Git project, or the version
-    distributed using pacman under MSYS2 will both work, ensure one is on the PATH:.
-    ```cmd
-    set PATH=%USERPROFILE%\Git\bin;%PATH%
-    ```
-
-    Lastly, persist environment variable changes.
-    ``` cmd
-    setx PATH "%PATH%"
-    setx BAZEL_SH "%BAZEL_SH%"
-    setx MSYS2_ARG_CONV_EXCL "%MSYS2_ARG_CONV_EXCL%"
-    setx BAZEL_VC "%BAZEL_VC%"
-    setx TMPDIR "%TMPDIR%"
-    setx MSYS2_PATH_TYPE "%MSYS2_PATH_TYPE%"
-    ```
-    > On Windows the supported/recommended shell to interact with bazel is MSYS2. This means that all the bazel commands (i.e. build, test) should be executed from MSYS2.
-
 1. Install Golang on your machine. This is required as part of building [BoringSSL](https://boringssl.googlesource.com/boringssl/+/HEAD/BUILDING.md)
    and also for [Buildifer](https://github.com/bazelbuild/buildtools) which is used for formatting bazel BUILD files.
-1. `go get -u github.com/bazelbuild/buildtools/buildifier` to install buildifier. You may need to set `BUILDIFIER_BIN` to `$GOPATH/bin/buildifier`
-   in your shell for buildifier to work.
-1. `go get -u github.com/bazelbuild/buildtools/buildozer` to install buildozer. You may need to set `BUILDOZER_BIN` to `$GOPATH/bin/buildozer`
-   in your shell for buildozer to work.
+   Make sure you have go version 1.24 or later.
+1. `go install github.com/bazelbuild/buildtools/buildifier@latest` to install buildifier. You may need to set `BUILDIFIER_BIN` to `$GOPATH/bin/buildifier`
+   in your shell for buildifier to work. If GOPATH is not set, it is $HOME/go by default.
+1. `go install github.com/bazelbuild/buildtools/buildozer@latest` to install buildozer. You may need to set `BUILDOZER_BIN` to `$GOPATH/bin/buildozer`
+   in your shell for buildozer to work. If GOPATH is not set, it is $HOME/go by default.
 1. `bazel build envoy` from the Envoy source directory. Add `-c opt` for an optimized release build or
    `-c dbg` for an unoptimized, fully instrumented debugging build.
+1. For debug builds on macOS, pass additionally: `--spawn_strategy=local --features=oso_prefix_is_pwd`
 
 ## Building Envoy with the CI Docker image
 
@@ -246,16 +185,7 @@ Envoy can also be built with the Docker image used for CI, by installing Docker 
 On Linux, run:
 
 ```
-./ci/run_envoy_docker.sh './ci/do_ci.sh bazel.dev'
-```
-
-From a Windows host with Docker installed, the Windows containers feature enabled, and bash (installed via
-MSYS2 or Git bash), run:
-
-**Note: the command below executes the whole Windows CI and unlike Linux you are not able to set specific build targets. You can modify `./ci/windows_ci_steps.sh` to modify `bazel` arguments, tests to run, etc. as well as set environment variables to adjust your container build environment.**
-
-```
-./ci/run_envoy_docker.sh './ci/windows_ci_steps.sh'
+./ci/run_envoy_docker.sh './ci/do_ci.sh dev'
 ```
 
 See also the [documentation](https://github.com/envoyproxy/envoy/tree/main/ci) for developer use of the
@@ -280,7 +210,7 @@ Change the value of `--remote_cache`, `--remote_executor` and `--remote_instance
 be run in remote execution too.
 
 Note: Currently the test run configuration in `.bazelrc` doesn't download test binaries and test logs,
-to override the behavior set [`--experimental_remote_download_outputs`](https://docs.bazel.build/versions/master/command-line-reference.html#flag--experimental_remote_download_outputs)
+to override the behavior set [`--remote_download_outputs`](https://docs.bazel.build/versions/master/command-line-reference.html#flag--remote_download_outputs)
 accordingly.
 
 ## Building Envoy with Docker sandbox
@@ -295,17 +225,38 @@ bazel build envoy --config=docker-clang
 Tests can be run in docker sandbox too. Note that the network environment, such as IPv6, may be different in the docker sandbox so you may want
 set different options. See below to configure test IP versions.
 
+## Building with host-provided toolchains
+
+By default, Envoy's Bazel build downloads hermetic versions of several toolchains (Go, CMake/Make/Ninja,
+and Python). Downstream projects that embed Envoy may prefer to use the versions already installed on
+the build host instead. Under bzlmod this is done from the embedding project's own `MODULE.bazel`,
+by registering host toolchains so that they take precedence over Envoy's hermetic ones.
+
+To use a host-installed Clang/LLVM toolchain instead of the hermetic one downloaded
+by Bazel, add the following to your `user.bazelrc`:
+
+```
+build --repo_env=BAZEL_USE_HOST_SYSROOT=True
+build --repo_env=BAZEL_LLVM_PATH=/usr
+build --config=clang-local
+```
+
+`BAZEL_LLVM_PATH` should point to the root of your LLVM installation.
+
+**Note:** Building with host-provided toolchains is **not supported** by the Envoy project. The
+hermetic toolchain versions are the only configuration tested in CI. Using host tools may result
+in build failures or unexpected behavior depending on the versions installed. This option is
+provided as a convenience for downstream repositories that build inside controlled environments
+(e.g. container-based CI) where tools are pre-installed at known versions. Upstream Envoy builds
+are unaffected when no host toolchains are registered.
+
 ## Linking against libc++ on Linux
 
-To link Envoy against libc++, follow the [quick start](#quick-start-bazel-build-for-developers) to setup Clang+LLVM and run:
-```
-bazel build --config=libc++ envoy
-```
+When using `--config=clang`, Envoy is automatically linked against libc++. No additional configuration is needed.
 
-Or use our configuration with Remote Execution or Docker sandbox, pass `--config=remote-clang-libc++` or
-`--config=docker-clang-libc++` respectively.
+For remote execution or Docker sandbox builds, use `--config=remote-clang` or `--config=docker-clang` respectively.
 
-If you want to make libc++ as default, add a line `build --config=libc++` to the `user.bazelrc` file in Envoy source root.
+If you want to ensure clang with libc++ is always used by default, add `build --config=clang` to the `user.bazelrc` file in Envoy source root.
 
 ## Using a compiler toolchain in a non-standard location
 
@@ -320,8 +271,8 @@ for more details.
 
 ## Supported compiler versions
 
-We now require Clang >= 5.0 due to known issues with std::string thread safety and C++14 support. GCC >= 7 is also
-known to work. Currently the CI is running with Clang 10.
+We require Clang >= 18 due to C++20 and tcmalloc requirements. GCC >= 13 is also known to work.
+Currently the CI is running with Clang 22.
 
 ## Clang STL debug symbols
 
@@ -339,6 +290,16 @@ target from [`cc_binary`](https://docs.bazel.build/versions/master/be/c-cpp.html
 or pass [`--strip=always`](https://docs.bazel.build/versions/master/command-line-reference.html#flag--strip)
 instead.
 
+# Running the built Envoy binary on the host system
+
+After Envoy is built, it can be executed via CLI.
+
+For example, if Envoy was built using the `bazel build -c opt //source/exe:envoy-static` command, then it can be executed from the project's root directory by running:
+
+```console
+$(bazel info bazel-genfiles)/source/exe/envoy-static --config-path /path/to/your/envoy/config.yaml
+```
+
 # Testing Envoy with Bazel
 
 All the Envoy tests can be built and run with:
@@ -348,7 +309,7 @@ bazel test //test/...
 ```
 
 An individual test target can be run with a more specific Bazel
-[label](https://bazel.build/versions/master/docs/build-ref.html#Labels), e.g. to build and run only
+[label](https://bazel.build/concepts/labels), e.g. to build and run only
 the units tests in
 [test/common/http/async_client_impl_test.cc](https://github.com/envoyproxy/envoy/blob/main/test/common/http/async_client_impl_test.cc):
 
@@ -362,11 +323,12 @@ To observe more verbose test output:
 bazel test --test_output=streamed //test/common/http:async_client_impl_test
 ```
 
-It's also possible to pass into an Envoy test additional command-line args via `--test_arg`. For
+It's also possible to pass into an Envoy test additional command-line args via `--test_arg`. Note
+that `--test_arg="--"` should be added to pass Envoy command-line arguments. For
 example, for extremely verbose test debugging:
 
 ```
-bazel test --test_output=streamed //test/common/http:async_client_impl_test --test_arg="-l trace"
+bazel test --test_output=streamed //test/common/http:async_client_impl_test --test_arg="--" --test_arg="-l trace"
 ```
 
 By default, testing exercises both IPv4 and IPv6 address connections. In IPv4 or IPv6 only
@@ -391,7 +353,7 @@ bazel test //test/... --test_env=HEAPCHECK=minimal
 ```
 
 If you see a leak detected, by default the reported offsets will require `addr2line` interpretation.
-You can run under `--config=clang-asan` to have this automatically applied.
+You can run under `--config=asan` to have this automatically applied.
 
 Bazel will by default cache successful test results. To force it to rerun tests:
 
@@ -401,7 +363,7 @@ bazel test //test/common/http:async_client_impl_test --cache_test_results=no
 
 Bazel will by default run all tests inside a sandbox, which disallows access to the
 local filesystem. If you need to break out of the sandbox (for example to run under a
-local script or tool with [`--run_under`](https://docs.bazel.build/versions/master/user-manual.html#flag--run_under)),
+local script or tool with [`--run_under`](https://docs.bazel.build/versions/master/user-manual.html#test-run-under)),
 you can run the test with `--strategy=TestRunner=local`, e.g.:
 
 ```
@@ -431,7 +393,7 @@ be disabled by specifying local execution. Example command line with
 
 ```
 bazel test -c dbg //test/server:backtrace_test
---run_under=`pwd`/tools/stack_decode.py --strategy=TestRunner=local
+--run_under=//tools:stack_decode --strategy=TestRunner=local
 --cache_test_results=no --test_output=all
 ```
 
@@ -461,7 +423,7 @@ gdb bazel-bin/test/common/http/async_client_impl_test
 
 We need to use `-c dbg` Bazel option to generate debugging symbols and without
 that GDB will not be very useful. The debugging symbols are stored as separate
-debugging information files (`.dwo` files) and we can build a DWARF package file
+debugging information files (`.dwp` files) and we can build a DWARF package file
 with `.dwp ` target. The `.dwp` file need to be presented in the same folder with the
 binary for a full debugging experience.
 
@@ -472,7 +434,7 @@ them with elevated privileges, e.g. `sudo test`. However, that may not always be
 particularly if the test needs to run in a CI pipeline. `tools/bazel-test-docker.sh` may be used in
 such situations to run the tests in a privileged docker container.
 
-The script works by wrapping the test execution in the current repository's circle ci build
+The script works by wrapping the test execution in the current repository's CI build
 container, then executing it either locally or on a remote docker container. In both cases, the
 container runs with the `--privileged` flag, allowing it to execute operations which would otherwise
 be restricted.
@@ -512,12 +474,12 @@ RUN_REMOTE=yes MOUNT_LOCAL=yes tools/bazel-test-docker.sh  //test/integration:in
 # Additional Envoy build and test options
 
 In general, there are 3 [compilation
-modes](https://docs.bazel.build/versions/master/user-manual.html#flag--compilation_mode)
+modes](https://docs.bazel.build/versions/master/user-manual.html#compilation-mode)
 that Bazel supports:
 
 * `fastbuild`: `-O0`, aimed at developer speed (default).
 * `opt`: `-O2 -DNDEBUG -ggdb3 -gsplit-dwarf`, for production builds and performance benchmarking.
-* `dbg`: `-O0 -ggdb3 -gsplit-dwarf`, no optimization and debug symbols.
+* `dbg`: `-O0 -ggdb3 -gsplit-dwarf`, only debug symbols, no optimization.
 
 You can use the `-c <compilation_mode>` flag to control this, e.g.
 
@@ -534,10 +496,9 @@ bazel build envoy --config=sizeopt
 
 ## Sanitizers
 
-To build and run tests with the gcc compiler's [address sanitizer
-(ASAN)](https://github.com/google/sanitizers/wiki/AddressSanitizer) and
-[undefined behavior
-(UBSAN)](https://developers.redhat.com/blog/2014/10/16/gcc-undefined-behavior-sanitizer-ubsan) sanitizer enabled:
+**Note: Sanitizer testing requires the Clang toolchain.**
+
+To build and run tests with [address sanitizer (ASAN)](https://github.com/google/sanitizers/wiki/AddressSanitizer) and [undefined behavior (UBSAN)](https://developers.redhat.com/blog/2014/10/16/gcc-undefined-behavior-sanitizer-ubsan) sanitizer enabled:
 
 ```
 bazel test -c dbg --config=asan //test/...
@@ -547,12 +508,6 @@ The ASAN failure stack traces include line numbers as a result of running ASAN w
 stack trace is not symbolized, try setting the ASAN_SYMBOLIZER_PATH environment variable to point to the
 llvm-symbolizer binary (or make sure the llvm-symbolizer is in your $PATH).
 
-If you have clang-5.0 or newer, additional checks are provided with:
-
-```
-bazel test -c dbg --config=clang-asan //test/...
-```
-
 [Thread sanitizer (TSAN)](https://github.com/google/sanitizers/wiki/ThreadSanitizerCppManual) tests rely on
 a TSAN-instrumented version of libc++ and can be run under the docker sandbox:
 
@@ -560,10 +515,10 @@ a TSAN-instrumented version of libc++ and can be run under the docker sandbox:
 bazel test -c dbg --config=docker-tsan //test/...
 ```
 
-Alternatively, you can build a local copy of TSAN-instrumented libc++. Follow the [quick start](#quick-start-bazel-build-for-developers) instruction to setup Clang+LLVM environment. Download LLVM sources from the [LLVM official site](https://github.com/llvm/llvm-project)
+Alternatively, you can build a local copy of TSAN-instrumented libc++. Follow the [quick start](#quick-start-bazel-build-for-developers) instruction to setup Clang+LLVM environment. Download LLVM sources from the [LLVM official site](https://github.com/llvm/llvm-project). The LLVM version used should match the hermetic toolchain version (currently 22.1.x).
 
 ```
-curl -sSfL "https://github.com/llvm/llvm-project/archive/llvmorg-11.0.1.tar.gz" | tar zx
+curl -sSfL "https://github.com/llvm/llvm-project/archive/llvmorg-22.1.8.tar.gz" | tar zx
 
 ```
 
@@ -574,7 +529,7 @@ mkdir tsan
 pushd tsan
 
 cmake -GNinja -DLLVM_ENABLE_PROJECTS="libcxxabi;libcxx" -DLLVM_USE_LINKER=lld -DLLVM_USE_SANITIZER=Thread -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_INSTALL_PREFIX="/opt/libcxx_tsan" "../llvm-project-llvmorg-11.0.1/llvm"
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_INSTALL_PREFIX="/opt/libcxx_tsan" "../llvm-project-llvmorg-22.1.8/llvm"
 ninja install-cxx install-cxxabi
 
 rm -rf /opt/libcxx_tsan/include
@@ -615,7 +570,7 @@ logging at `-l trace`. For example, in tests:
 
 ```
 bazel test //test/integration:protocol_integration_test --test_output=streamed \
-  --test_arg="-l trace" --test_env="ENVOY_NGHTTP2_TRACE="
+  --test_arg="--" --test_arg="-l trace" --test_env="ENVOY_NGHTTP2_TRACE="
 ```
 
 Similarly, `QUICHE` verbose logs can be enabled by setting `ENVOY_QUICHE_VERBOSITY=n` in the
@@ -633,24 +588,31 @@ The following optional features can be disabled on the Bazel build command-line:
 * tcmalloc with `--define tcmalloc=disabled`. Also you can choose Gperftools' implementation of
   tcmalloc with `--define tcmalloc=gperftools` which is the default for builds other than x86_64 and aarch64.
 * deprecated features with `--define deprecated_features=disabled`
-* http3/quic with --//bazel:http3=False
+* http3/quic with `--//bazel:http3=False`
+* autolinking libraries with `--define=library_autolink=disabled`
+* admin HTML home page with `--define=admin_html=disabled`
+* admin functionality with `--define=admin_functionality=disabled`
+* static extension registration with `--define=static_extension_registration=disabled`
+* spdlogging functionality with `--define=enable_logging=disabled`
 
 ## Enabling optional features
 
 The following optional features can be enabled on the Bazel build command-line:
 
 * Exported symbols during linking with `--define exported_symbols=enabled`.
-  This is useful in cases where you have a lua script that loads shared object libraries, such as
-  those installed via luarocks.
+  This config will exports all symbols and results in larger binary size. If partial symbols export
+  is required and target platform is Linux, then `bazel/exported_symbols.txt` can be used to land it.
 * Perf annotation with `--define perf_annotation=enabled` (see
   source/common/common/perf_annotation.h for details).
-* BoringSSL can be built in a FIPS-compliant mode with `--define boringssl=fips`
-  (see [FIPS 140-2](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/security/ssl#fips-140-2) for details).
+* BoringSSL can be built in a FIPS-compliant mode with `--config=boringssl-fips`
+  (see [FIPS 140-2](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/security/ssl#fips-140-2) for details,
+  and [SSL.md](SSL.md) more information about SSL BUILDS).
+* OpenSSL can be used with `--config=openssl`. (see [SSL.md](SSL.md) for more information about SSL BUILDS).
 * ASSERT() can be configured to log failures and increment a stat counter in a release build with
   `--define log_fast_debug_assert_in_release=enabled`. SLOW_ASSERT()s can be included with `--define log_debug_assert_in_release=enabled`. The default behavior is to compile all debug assertions out of
   release builds so that the condition is not evaluated. This option has no effect in debug builds.
 * memory-debugging (scribbling over memory after allocation and before freeing) with
-  `--define tcmalloc=debug`. Note this option cannot be used with FIPS-compliant mode BoringSSL and
+  `--define tcmalloc=debug`. Note this option cannot be used with FIPS mode and
   tcmalloc is built from the sources of Gperftools.
 * Default [path normalization](https://github.com/envoyproxy/envoy/issues/6435) with
   `--define path_normalization_by_default=true`. Note this still could be disable by explicit xDS config.
@@ -661,8 +623,8 @@ The following optional features can be enabled on the Bazel build command-line:
 * Process logging for Android applications can be enabled with `--define logger=android`.
 * Excluding assertions for known issues with `--define disable_known_issue_asserts=true`.
   A KNOWN_ISSUE_ASSERT is an assertion that should pass (like all assertions), but sometimes fails for some as-yet unidentified or unresolved reason. Because it is known to potentially fail, it can be compiled out even when DEBUG is true, when this flag is set. This allows Envoy to be run in production with assertions generally enabled, without crashing for known issues. KNOWN_ISSUE_ASSERT should only be used for newly-discovered issues that represent benign violations of expectations.
-* Envoy can be linked to [`zlib-ng`](https://github.com/zlib-ng/zlib-ng) instead of
-  [`zlib`](https://zlib.net) with `--define zlib=ng`.
+* Envoy is built using [`zlib-ng`](https://github.com/zlib-ng/zlib-ng), you can link an alternative implementation
+  using e.g. `--@envoy//bazel:zlib=@zlib`. This would require registering the zlib repository with Bazel.
 
 ## Enabling and disabling extensions
 
@@ -679,17 +641,30 @@ The extensions enabled by default can be disabled by adding the following parame
 `envoy.wasm.runtime.v8` extension, add `--//source/extensions/wasm_runtime/v8:enabled=false`.
 Note not all extensions can be disabled.
 
-If you're building from a custom build repository, the parameters need to prefixed with `@envoy`, for example
-`--@envoy//source/extensions/filters/http/kill_request:enabled`.
+To select a specific WebAssembly (Wasm) runtime, pass `--@proxy-wasm-cpp-host//bazel:engine=[runtime]`, e.g.
+`--@proxy-wasm-cpp-host//bazel:engine=wasmtime` to enable the [wasmtime](https://wasmtime.dev/) engine.
+Accepted values are:
+
+* `v8` (default)
+* `wamr` (interpreter mode; alias for `wamr-interp`)
+* `wamr-interp`
+* `wamr-jit`
+* `wasmtime`
+* `null`
+* `disabled` (disable Wasm entirely)
+
+Invalid values are rejected at parse time. Note: the former `--define wasm=<engine>` and
+`--define engine=<engine>` mechanisms are no longer supported; passing them is now a **build
+error**. Use `--@proxy-wasm-cpp-host//bazel:engine=<engine>` instead.
 
 You may persist those options in `user.bazelrc` in Envoy repo or your `.bazelrc`.
 
 Contrib extensions can be enabled and disabled similarly to above when building the contrib
 executable. For example:
 
-`bazel build //contrib/exe:envoy-static --//contrib/squash/filters/http/source:enabled=false`
+`bazel build //contrib/exe:envoy-static --//contrib/dynamo/filters/http/source:enabled=false`
 
-Will disable the squash extension when building the contrib executable.
+Will disable the dynamo extension when building the contrib executable.
 
 ## Customize extension build config
 
@@ -697,41 +672,36 @@ You can also use the following procedure to customize the extensions for your bu
 
 * The Envoy build assumes that a Bazel repository named `@envoy_build_config` exists which
   contains the file `@envoy_build_config//:extensions_build_config.bzl`. In the default build,
-  a synthetic repository is created containing [extensions_build_config.bzl](../source/extensions/extensions_build_config.bzl).
-* Start by creating a new Bazel workspace somewhere in the filesystem that your build can access.
-  This workspace should contain:
-  * Empty WORKSPACE file.
+  this repository is generated by the `envoy_build_config_ext` module extension
+  (see [`bazel/extensions.bzl`](extensions.bzl), wired up in [`MODULE.bazel`](../MODULE.bazel))
+  and contains [extensions_build_config.bzl](../source/extensions/extensions_build_config.bzl).
+* Start by creating a directory somewhere in the filesystem that your build can access.
+  This directory should contain:
+  * Empty `MODULE.bazel` file.
   * Empty BUILD file.
   * A copy of [extensions_build_config.bzl](../source/extensions/extensions_build_config.bzl).
   * Comment out any extensions that you don't want to build in your file copy.
 
 To have your local build use your overridden configuration repository there are two options:
 
-1. Use the [`--override_repository`](https://docs.bazel.build/versions/master/command-line-reference.html)
-   CLI option to override the `@envoy_build_config` repo.
-2. Use the following snippet in your WORKSPACE before you load the Envoy repository. E.g.,
+1. Use the [`--override_repository`](https://bazel.build/reference/command-line-reference)
+   CLI option to override the `envoy_build_config` repo. Because it is generated by a module
+   extension it must be named by its *canonical* name, e.g.
+
+   ```
+   --override_repository=+envoy_build_config_ext+envoy_build_config=/somewhere/on/filesystem/envoy_build_config
+   ```
+
+   See [`ci/mac_ci_steps.sh`](../ci/mac_ci_steps.sh) for this usage in practice.
+2. Add the equivalent override to your `user.bazelrc` so it applies to every invocation:
 
 ```
-workspace(name = "envoy_filter_example")
-
-local_repository(
-    name = "envoy_build_config",
-    # Relative paths are also supported.
-    path = "/somewhere/on/filesystem/envoy_build_config",
-)
-
-local_repository(
-    name = "envoy",
-    # Relative paths are also supported.
-    path = "/somewhere/on/filesystem/envoy",
-)
-
-...
+build --override_repository=+envoy_build_config_ext+envoy_build_config=/somewhere/on/filesystem/envoy_build_config
 ```
 
 When performing custom builds, it is acceptable to include contrib extensions as well. This can
 be done by including the desired Bazel paths from [contrib_build_config.bzl](../contrib/contrib_build_config.bzl)
-into the overriden `extensions_build_config.bzl`. (There is no need to specifically perform
+into the overridden `extensions_build_config.bzl`. (There is no need to specifically perform
 a contrib build to include a contrib extension.)
 
 ## Extra extensions
@@ -781,13 +751,8 @@ FUZZ_COVERAGE=true VALIDATE_COVERAGE=false test/run_envoy_bazel_coverage.sh
 ```
 This generates a coverage report for fuzz targets after running the target for one minute against fuzzing engine libfuzzer using its coprus as initial seed inputs. The full coverage report will be available in `generated/fuzz_coverage/coverage.html`.
 
-Coverage for every PR is available in Circle in the "artifacts" tab of the coverage job. You will
-need to navigate down and open "coverage.html" but then you can navigate per normal. NOTE: We
-have seen some issues with seeing the artifacts tab. If you can't see it, log out of Circle, and
-then log back in and it should start working.
-
 The latest coverage report for main is available
-[here](https://storage.googleapis.com/envoy-postsubmit/main/coverage/index.html). The latest fuzz coverage report for main is available [here](https://storage.googleapis.com/envoy-postsubmit/main/fuzz_coverage/index.html).
+[here](https://storage.googleapis.com/envoy-cncf-postsubmit/main/coverage/index.html). The latest fuzz coverage report for main is available [here](https://storage.googleapis.com/envoy-cncf-postsubmit/main/fuzz_coverage/index.html).
 
 It's also possible to specialize the coverage build to a specified test or test dir. This is useful
 when doing things like exploring the coverage of a fuzzer over its corpus. This can be done by
@@ -858,44 +823,34 @@ The compilation database could also be used to setup editors with cross referenc
 For example, you can use [You Complete Me](https://valloric.github.io/YouCompleteMe/) or
 [clangd](https://clangd.llvm.org/) with supported editors.
 
-This requires Python 3.8.0+, download from [here](https://www.python.org/downloads/) if you do not have it installed already.
+This requires Python 3.10+, download from [here](https://www.python.org/downloads/) if you do not have it installed already.
 
 Use the following command to prepare a compilation database:
 
-```
+```console
 TEST_TMPDIR=/tmp tools/gen_compilation_database.py
 ```
 
+On macOS:
+
+```console
+tools/gen_compilation_database.py --exclude_contrib
+```
 
 # Running format linting without docker
 
-The easiest way to run the clang-format check/fix commands is to run them via
-docker, which helps ensure the right toolchain is set up. However you may prefer
-to run clang-format scripts on your workstation directly:
- * It's possible there is a speed advantage
- * Docker itself can sometimes go awry and you then have to deal with that
- * Type-ahead doesn't always work when waiting running a command through docker
-
-To run the tools directly, you must install the correct version of clang. This
-may change over time, check the version of clang in the docker image. You must
-also have 'buildifier' installed from the bazel distribution.
-
 Note that if you run the `check_spelling.py` script you will need to have `aspell` installed.
+Prefer to run it via bazel as the environment will contain the dictionary used.
 
-Edit the paths shown here to reflect the installation locations on your system:
-
-```shell
-export CLANG_FORMAT="$HOME/ext/clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04/bin/clang-format"
-export BUILDIFIER_BIN="/usr/bin/buildifier"
-```
-
-Once this is set up, you can run clang-format without docker:
+You can run clang-format directly, without docker:
 
 ```shell
-./tools/code_format/check_format.py check
-./tools/spelling/check_spelling_pedantic.py check
-./tools/code_format/check_format.py fix
-./tools/spelling/check_spelling_pedantic.py fix
+bazel run //tools/code_format:check_format -- check
+# Target root needs to be an absolute path to your envoy repository to run on
+# the entire codebase by default.
+bazel run //tools/spelling:check_spelling_pedantic -- check --target_root=$(pwd)
+bazel run //tools/code_format:check_format -- fix
+bazel run //tools/spelling:check_spelling_pedantic -- fix --target_root=$(pwd)
 ```
 
 # Advanced caching setup
@@ -908,7 +863,7 @@ using multiple compilation modes or multiple trees.
 You may use any [Remote Caching](https://docs.bazel.build/versions/master/remote-caching.html) backend
 as an alternative to this.
 
-This requires Go 1.11+, follow the [instructions](https://golang.org/doc/install#install) to install
+This requires Go 1.17+, follow the [instructions](https://golang.org/doc/install#install) to install
 if you don't have one. To start the cache, run the following from the root of the Envoy repository (or anywhere else
 that the Go toolchain can find the necessary dependencies):
 
@@ -926,5 +881,5 @@ slower cache performance on macOS due to slow disk performance on Docker for Mac
 Adding the following parameter to Bazel everytime or persist them in `.bazelrc`.
 
 ```
---remote_http_cache=http://127.0.0.1:28080/
+--remote_cache=http://127.0.0.1:28080/
 ```

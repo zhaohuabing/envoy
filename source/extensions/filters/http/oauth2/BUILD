@@ -11,11 +11,15 @@ licenses(["notice"])  # Apache 2
 envoy_extension_package()
 
 # HTTP L7 filter that performs oauth.
-# Public docs: docs/root/configuration/http_filters/oauth_filter.rst
+# Public docs: https://envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/oauth2_filter
 
 envoy_cc_library(
     name = "oauth_callback_interface",
     hdrs = ["oauth.h"],
+    deps = [
+        "//envoy/http:filter_interface",
+        "//envoy/stream_info:stream_info_interface",
+    ],
 )
 
 envoy_proto_library(
@@ -31,6 +35,7 @@ envoy_cc_library(
         ":oauth_response_cc_proto",
         "//envoy/http:async_client_interface",
         "//envoy/upstream:cluster_manager_interface",
+        "//source/common/common:base64_lib",
         "//source/common/http:message_lib",
         "//source/common/http:utility_lib",
         "//source/common/protobuf:message_validator_lib",
@@ -40,19 +45,37 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "client_assertion_lib",
+    srcs = ["client_assertion.cc"],
+    hdrs = ["client_assertion.h"],
+    external_deps = ["ssl"],
+    deps = [
+        "//source/common/common:base64_lib",
+        "//source/common/crypto:utility_lib",
+        "//source/common/json:json_sanitizer_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "oauth_lib",
     srcs = ["filter.cc"],
     hdrs = ["filter.h"],
     deps = [
+        ":client_assertion_lib",
         ":oauth_client",
         "//envoy/server:filter_config_interface",
         "//source/common/common:assert_lib",
+        "//source/common/common:base64_lib",
         "//source/common/common:empty_string",
-        "//source/common/config:datasource_lib",
+        "//source/common/common:matchers_lib",
         "//source/common/crypto:utility_lib",
         "//source/common/formatter:substitution_formatter_lib",
-        "//source/common/http:rest_api_fetcher_lib",
+        "//source/common/http:header_utility_lib",
+        "//source/common/jwt:jwt_lib",
+        "//source/common/protobuf:message_validator_lib",
         "//source/common/protobuf:utility_lib",
+        "//source/common/router:retry_policy_lib",
+        "//source/common/secret:secret_provider_impl_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/http/oauth2/v3:pkg_cc_proto",

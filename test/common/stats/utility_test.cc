@@ -1,6 +1,8 @@
 #include <string>
+#include <vector>
 
 #include "envoy/stats/stats_macros.h"
+#include "envoy/stats/tag.h"
 
 #include "source/common/stats/isolated_store_impl.h"
 #include "source/common/stats/null_counter.h"
@@ -36,7 +38,7 @@ protected:
             {{pool_.add("tag1"), pool_.add("value1")}, {pool_.add("tag2"), pool_.add("value2")}}) {
     switch (GetParam()) {
     case StoreType::ThreadLocal:
-      alloc_ = std::make_unique<AllocatorImpl>(*symbol_table_),
+      alloc_ = std::make_unique<Allocator>(*symbol_table_),
       store_ = std::make_unique<ThreadLocalStoreImpl>(*alloc_);
       break;
     case StoreType::Isolated:
@@ -54,10 +56,11 @@ protected:
   }
 
   void init(MakeStatFn make_stat) {
-    make_stat(*store_, {pool_.add("symbolic1")});
-    make_stat(*store_, {Stats::DynamicName("dynamic1")});
+    make_stat(*store_->rootScope(), {pool_.add("symbolic1")});
+    make_stat(*store_->rootScope(), {Stats::DynamicName("dynamic1")});
     make_stat(*scope_, {pool_.add("symbolic2")});
     make_stat(*scope_, {Stats::DynamicName("dynamic2")});
+    make_stat(*scope_, {Stats::DynamicSavedName("dynamicsaved3")});
   }
 
   template <class StatType> IterateFn<StatType> iterOnce() {
@@ -111,8 +114,8 @@ protected:
   }
 
   template <class StatType> void storeOnce(const MakeStatFn make_stat) {
-    CachedReference<StatType> symbolic1_ref(*store_, "symbolic1");
-    CachedReference<StatType> dynamic1_ref(*store_, "dynamic1");
+    CachedReference<StatType> symbolic1_ref(*store_->rootScope(), "symbolic1");
+    CachedReference<StatType> dynamic1_ref(*store_->rootScope(), "dynamic1");
     EXPECT_FALSE(symbolic1_ref.get());
     EXPECT_FALSE(dynamic1_ref.get());
 
@@ -129,13 +132,13 @@ protected:
   template <class StatType> void storeAll(const MakeStatFn make_stat) {
     init(make_stat);
     EXPECT_TRUE(store_->iterate(iterAll<StatType>()));
-    EXPECT_THAT(results_,
-                UnorderedElementsAre("symbolic1", "dynamic1", "scope.symbolic2", "scope.dynamic2"));
+    EXPECT_THAT(results_, UnorderedElementsAre("symbolic1", "dynamic1", "scope.symbolic2",
+                                               "scope.dynamicsaved3", "scope.dynamic2"));
   }
 
   template <class StatType> void scopeOnce(const MakeStatFn make_stat) {
-    CachedReference<StatType> symbolic2_ref(*store_, "scope.symbolic2");
-    CachedReference<StatType> dynamic2_ref(*store_, "scope.dynamic2");
+    CachedReference<StatType> symbolic2_ref(*scope_, "scope.symbolic2");
+    CachedReference<StatType> dynamic2_ref(*scope_, "scope.dynamic2");
     EXPECT_FALSE(symbolic2_ref.get());
     EXPECT_FALSE(dynamic2_ref.get());
 
@@ -152,14 +155,15 @@ protected:
   template <class StatType> void scopeAll(const MakeStatFn make_stat) {
     init(make_stat);
     EXPECT_TRUE(scope_->iterate(iterAll<StatType>()));
-    EXPECT_THAT(results_, UnorderedElementsAre("scope.symbolic2", "scope.dynamic2"));
+    EXPECT_THAT(results_,
+                UnorderedElementsAre("scope.symbolic2", "scope.dynamic2", "scope.dynamicsaved3"));
   }
 
   SymbolTablePtr symbol_table_;
   StatNamePool pool_;
-  std::unique_ptr<AllocatorImpl> alloc_;
+  std::unique_ptr<Allocator> alloc_;
   std::unique_ptr<Store> store_;
-  ScopePtr scope_;
+  ScopeSharedPtr scope_;
   absl::flat_hash_set<std::string> results_;
   StatNameTagVector tags_;
 };
@@ -168,7 +172,7 @@ INSTANTIATE_TEST_SUITE_P(StatsUtilityTest, StatsUtilityTest,
                          testing::ValuesIn({StoreType::ThreadLocal, StoreType::Isolated}));
 
 TEST_P(StatsUtilityTest, Counters) {
-  ScopePtr scope = store_->createScope("scope.");
+  ScopeSharedPtr scope = store_->createScope("scope.");
   Counter& c1 = Utility::counterFromElements(*scope, {DynamicName("a"), DynamicName("b")});
   EXPECT_EQ("scope.a.b", c1.name());
   StatName token = pool_.add("token");
@@ -186,8 +190,118 @@ TEST_P(StatsUtilityTest, Counters) {
   EXPECT_EQ("scope.x.token.y.tag1.value1.tag2.value2", ctags.name());
 }
 
+// Verifies the `*FromTaggedPrefix` helpers with a string_view leaf name. Unlike counterFromElements
+// (which appends tags to the flat name), the tagged prefix keeps the tag value at its original
+// position in the flat name (join of `tagged_prefix` and the leaf). The tag-extracted `base_prefix`
+// only surfaces through a store configured with tag extractors, so it is exercised at the store
+// level in thread_local_store_test / isolated_store_impl_test; here we pin the flat name the
+// utility helper builds.
+TEST_P(StatsUtilityTest, TaggedStatNames) {
+  ScopeSharedPtr scope = store_->createScope("scope.");
+  const StatName tag_extracted_prefix = pool_.add("prefix");
+  const StatName tagged_prefix = pool_.add("prefix.value");
+
+  Counter& c = Utility::counterFromTaggedPrefix(*scope, tag_extracted_prefix, tags_, tagged_prefix,
+                                                "requests");
+  EXPECT_EQ("scope.prefix.value.requests", c.name());
+
+  Gauge& g = Utility::gaugeFromTaggedPrefix(*scope, tag_extracted_prefix, tags_, tagged_prefix,
+                                            "active", Gauge::ImportMode::Accumulate);
+  EXPECT_EQ("scope.prefix.value.active", g.name());
+  EXPECT_EQ(Gauge::ImportMode::Accumulate, g.importMode());
+
+  Histogram& h = Utility::histogramFromTaggedPrefix(
+      *scope, tag_extracted_prefix, tags_, tagged_prefix, "latency", Histogram::Unit::Unspecified);
+  EXPECT_EQ("scope.prefix.value.latency", h.name());
+  EXPECT_EQ(Histogram::Unit::Unspecified, h.unit());
+
+  TextReadout& t = Utility::textReadoutFromTaggedPrefix(*scope, tag_extracted_prefix, tags_,
+                                                        tagged_prefix, "info");
+  EXPECT_EQ("scope.prefix.value.info", t.name());
+}
+
+// Verifies the `*FromTaggedPrefix` overloads that take a symbolic StatName leaf (rather than a
+// string_view), which are used when the leaf name is already interned.
+TEST_P(StatsUtilityTest, TaggedStatNamesWithStatNameLeaf) {
+  ScopeSharedPtr scope = store_->createScope("scope.");
+  const StatName tag_extracted_prefix = pool_.add("prefix");
+  const StatName tagged_prefix = pool_.add("prefix.value");
+  const StatName requests = pool_.add("requests");
+  const StatName active = pool_.add("active");
+  const StatName latency = pool_.add("latency");
+  const StatName info = pool_.add("info");
+
+  Counter& c = Utility::counterFromTaggedPrefix(*scope, tag_extracted_prefix, tags_, tagged_prefix,
+                                                requests);
+  EXPECT_EQ("scope.prefix.value.requests", c.name());
+
+  Gauge& g = Utility::gaugeFromTaggedPrefix(*scope, tag_extracted_prefix, tags_, tagged_prefix,
+                                            active, Gauge::ImportMode::NeverImport);
+  EXPECT_EQ("scope.prefix.value.active", g.name());
+  EXPECT_EQ(Gauge::ImportMode::NeverImport, g.importMode());
+
+  Histogram& h = Utility::histogramFromTaggedPrefix(*scope, tag_extracted_prefix, tags_,
+                                                    tagged_prefix, latency, Histogram::Unit::Bytes);
+  EXPECT_EQ("scope.prefix.value.latency", h.name());
+  EXPECT_EQ(Histogram::Unit::Bytes, h.unit());
+
+  TextReadout& t = Utility::textReadoutFromTaggedPrefix(*scope, tag_extracted_prefix, tags_,
+                                                        tagged_prefix, info);
+  EXPECT_EQ("scope.prefix.value.info", t.name());
+}
+
+// A tagged prefix with no tags: base and tagged forms coincide, so the flat name is just the prefix
+// joined with the leaf.
+TEST_P(StatsUtilityTest, TaggedStatNamesNoTags) {
+  ScopeSharedPtr scope = store_->createScope("scope.");
+  const StatName prefix = pool_.add("prefix");
+  Counter& c = Utility::counterFromTaggedPrefix(*scope, prefix, {}, prefix, "requests");
+  EXPECT_EQ("scope.prefix.requests", c.name());
+
+  Counter& c2 = Utility::counterFromTaggedPrefix(*scope, prefix, {}, StatName(), "requests");
+  EXPECT_EQ("scope.prefix.requests", c2.name());
+
+  Gauge& g = Utility::gaugeFromTaggedPrefix(*scope, prefix, {}, StatName(), "gauge",
+                                            Gauge::ImportMode::NeverImport);
+  EXPECT_EQ("scope.prefix.gauge", g.name());
+
+  Histogram& h = Utility::histogramFromTaggedPrefix(*scope, prefix, {}, StatName(), "histogram",
+                                                    Histogram::Unit::Milliseconds);
+  EXPECT_EQ("scope.prefix.histogram", h.name());
+
+  TextReadout& t = Utility::textReadoutFromTaggedPrefix(*scope, prefix, {}, StatName(), "text");
+  EXPECT_EQ("scope.prefix.text", t.name());
+}
+
+// Exercises TaggedStatName directly: it pre-encodes the base name, tagged name, and tags
+// into its own pool, copying the string_view inputs so callers need not keep them alive.
+TEST_P(StatsUtilityTest, TaggedStatNameAccessors) {
+  const std::vector<TagStringView> tag_views{{"tagA", "valA"}, {"tagB", "valB"}};
+  TaggedStatName tagged(*symbol_table_, "base.name", tag_views, "base.valA.name");
+  EXPECT_EQ("base.name", symbol_table_->toString(tagged.baseName()));
+  EXPECT_EQ("base.valA.name", symbol_table_->toString(tagged.name()));
+  const StatNameTagSpan name_tags = tagged.tags();
+  ASSERT_EQ(2, name_tags.size());
+  EXPECT_EQ("tagA", symbol_table_->toString(name_tags[0].first));
+  EXPECT_EQ("valA", symbol_table_->toString(name_tags[0].second));
+  EXPECT_EQ("tagB", symbol_table_->toString(name_tags[1].first));
+  EXPECT_EQ("valB", symbol_table_->toString(name_tags[1].second));
+
+  // Empty tags: base and tagged forms coincide and there are no tags.
+  TaggedStatName empty(*symbol_table_, "base", {}, "base");
+  EXPECT_EQ("base", symbol_table_->toString(empty.baseName()));
+  EXPECT_EQ("base", symbol_table_->toString(empty.name()));
+  EXPECT_TRUE(empty.tags().empty());
+
+  // Empty tags with an empty tagged name: the name falls back to the base name.
+  TaggedStatName fallback(*symbol_table_, "base", {}, "");
+  EXPECT_EQ("base", symbol_table_->toString(fallback.baseName()));
+  EXPECT_EQ("base", symbol_table_->toString(fallback.name()));
+  EXPECT_TRUE(fallback.tags().empty());
+}
+
 TEST_P(StatsUtilityTest, Gauges) {
-  ScopePtr scope = store_->createScope("scope.");
+  ScopeSharedPtr scope = store_->createScope("scope.");
   Gauge& g1 = Utility::gaugeFromElements(*scope, {DynamicName("a"), DynamicName("b")},
                                          Gauge::ImportMode::NeverImport);
   EXPECT_EQ("scope.a.b", g1.name());
@@ -206,7 +320,7 @@ TEST_P(StatsUtilityTest, Gauges) {
 }
 
 TEST_P(StatsUtilityTest, Histograms) {
-  ScopePtr scope = store_->createScope("scope.");
+  ScopeSharedPtr scope = store_->createScope("scope.");
   Histogram& h1 = Utility::histogramFromElements(*scope, {DynamicName("a"), DynamicName("b")},
                                                  Histogram::Unit::Milliseconds);
   EXPECT_EQ("scope.a.b", h1.name());
@@ -225,7 +339,7 @@ TEST_P(StatsUtilityTest, Histograms) {
 }
 
 TEST_P(StatsUtilityTest, TextReadouts) {
-  ScopePtr scope = store_->createScope("scope.");
+  ScopeSharedPtr scope = store_->createScope("scope.");
   TextReadout& t1 = Utility::textReadoutFromElements(*scope, {DynamicName("a"), DynamicName("b")});
   EXPECT_EQ("scope.a.b", t1.name());
   StatName token = pool_.add("token");
@@ -270,6 +384,15 @@ TEST_P(StatsUtilityTest, StoreTextReadoutAll) { storeAll<TextReadout>(makeTextRe
 TEST_P(StatsUtilityTest, ScopeTextReadoutOnce) { scopeOnce<TextReadout>(makeTextReadout()); }
 
 TEST_P(StatsUtilityTest, ScopeTextReadoutAll) { scopeAll<TextReadout>(makeTextReadout()); }
+
+TEST_P(StatsUtilityTest, SanitizeStatsName) {
+  EXPECT_EQ("a.b.c", Utility::sanitizeStatsName("a.b.c."));
+  EXPECT_EQ("a.b.c", Utility::sanitizeStatsName(".a.b.c"));
+  EXPECT_EQ("a__b", Utility::sanitizeStatsName("a::b"));
+  EXPECT_EQ("a._", Utility::sanitizeStatsName(absl::string_view("a.\0", 3)));
+  EXPECT_EQ("a_b", Utility::sanitizeStatsName("a://b"));
+  EXPECT_EQ("a_b", Utility::sanitizeStatsName("a:/b"));
+}
 
 } // namespace
 } // namespace Stats

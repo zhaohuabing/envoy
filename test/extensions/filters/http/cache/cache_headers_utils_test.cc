@@ -10,11 +10,15 @@
 #include "source/common/http/header_utility.h"
 #include "source/extensions/filters/http/cache/cache_headers_utils.h"
 
-#include "test/extensions/filters/http/cache/common.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/utility.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+
+using testing::Contains;
+using testing::UnorderedElementsAre;
 
 namespace Envoy {
 namespace Extensions {
@@ -61,77 +65,77 @@ public:
         {
           "",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, absl::nullopt, absl::nullopt, absl::nullopt}
+          {false, false, false, false, std::nullopt, std::nullopt, std::nullopt}
         },
         // Valid cache-control headers
         {
           "max-age=3600, min-fresh=10, no-transform, only-if-cached, no-store",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, true, true, true, Seconds(3600), Seconds(10), absl::nullopt}
+          {false, true, true, true, Seconds(3600), Seconds(10), std::nullopt}
         },
         {
           "min-fresh=100, max-stale, no-cache",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {true, false, false, false, absl::nullopt, Seconds(100), SystemTime::duration::max()}
+          {true, false, false, false, std::nullopt, Seconds(100), SystemTime::duration::max()}
         },
         {
           "max-age=10, max-stale=50",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, Seconds(10), absl::nullopt, Seconds(50)}
+          {false, false, false, false, Seconds(10), std::nullopt, Seconds(50)}
         },
         // Quoted arguments are interpreted correctly
         {
           "max-age=\"3600\", min-fresh=\"10\", no-transform, only-if-cached, no-store",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, true, true, true, Seconds(3600), Seconds(10), absl::nullopt}
+          {false, true, true, true, Seconds(3600), Seconds(10), std::nullopt}
         },
         {
           "max-age=\"10\", max-stale=\"50\", only-if-cached",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, true, Seconds(10), absl::nullopt, Seconds(50)}
+          {false, false, false, true, Seconds(10), std::nullopt, Seconds(50)}
         },
         // Unknown directives are ignored
         {
           "max-age=10, max-stale=50, unknown-directive",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, Seconds(10), absl::nullopt, Seconds(50)}
+          {false, false, false, false, Seconds(10), std::nullopt, Seconds(50)}
         },
         {
           "max-age=10, max-stale=50, unknown-directive-with-arg=arg1",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, Seconds(10), absl::nullopt, Seconds(50)}
+          {false, false, false, false, Seconds(10), std::nullopt, Seconds(50)}
         },
         {
           "max-age=10, max-stale=50, unknown-directive-with-quoted-arg=\"arg1\"",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, Seconds(10), absl::nullopt, Seconds(50)}
+          {false, false, false, false, Seconds(10), std::nullopt, Seconds(50)}
         },
         {
           "max-age=10, max-stale=50, unknown-directive, unknown-directive-with-quoted-arg=\"arg1\"",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, Seconds(10), absl::nullopt, Seconds(50)}
+          {false, false, false, false, Seconds(10), std::nullopt, Seconds(50)}
         },
         // Invalid durations are ignored
         {
           "max-age=five, min-fresh=30, no-store",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, true, false, false, absl::nullopt, Seconds(30), absl::nullopt}
+          {false, true, false, false, std::nullopt, Seconds(30), std::nullopt}
         },
         {
           "max-age=five, min-fresh=30s, max-stale=-2",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, absl::nullopt, absl::nullopt, absl::nullopt}
+          {false, false, false, false, std::nullopt, std::nullopt, std::nullopt}
         },
         {
           "max-age=\"",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {false, false, false, false, absl::nullopt, absl::nullopt, absl::nullopt}
+          {false, false, false, false, std::nullopt, std::nullopt, std::nullopt}
         },
         // Invalid parts of the header are ignored
         {
           "no-cache, ,,,fjfwioen3298, max-age=20, min-fresh=30=40",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {true, false, false, false, Seconds(20), absl::nullopt, absl::nullopt}
+          {true, false, false, false, Seconds(20), std::nullopt, std::nullopt}
         },
         // If a directive argument contains a comma by mistake
         // the part before the comma will be interpreted as the argument
@@ -139,7 +143,7 @@ public:
         {
           "no-cache, max-age=10,0, no-store",
           // {must_validate_, no_store_, no_transform_, only_if_cached_, max_age_, min_fresh_, max_stale_}
-          {true, true, false, false, Seconds(10), absl::nullopt, absl::nullopt}
+          {true, true, false, false, Seconds(10), std::nullopt, std::nullopt}
         },
     );
     // clang-format on
@@ -153,6 +157,27 @@ TEST_P(RequestCacheControlTest, RequestCacheControlTest) {
   const absl::string_view cache_control_header = GetParam().cache_control_header;
   const RequestCacheControl expected_request_cache_control = GetParam().request_cache_control;
   EXPECT_EQ(expected_request_cache_control, RequestCacheControl(cache_control_header));
+}
+
+// operator<<(ostream&, const RequestCacheControl&) is only used in tests, but lives in //source,
+// and so needs test coverage. This test provides that coverage, to keep the coverage test happy.
+TEST(RequestCacheControl, StreamingTest) {
+  std::ostringstream os;
+  RequestCacheControl request_cache_control(
+      "no-cache, no-store, no-transform, only-if-cached, max-age=0, min-fresh=0, max-stale=0");
+  os << request_cache_control;
+  EXPECT_EQ(os.str(), "{must_validate, no_store, no_transform, only_if_cached, max-age=0, "
+                      "min-fresh=0, max-stale=0}");
+}
+
+// operator<<(ostream&, const ResponseCacheControl&) is only used in tests, but lives in //source,
+// and so needs test coverage. This test provides that coverage, to keep the coverage test happy.
+TEST(ResponseCacheControl, StreamingTest) {
+  std::ostringstream os;
+  ResponseCacheControl response_cache_control(
+      "no-cache, must-revalidate, no-store, no-transform, max-age=0");
+  os << response_cache_control;
+  EXPECT_EQ(os.str(), "{must_validate, no_store, no_transform, no_stale, max-age=0}");
 }
 
 struct TestResponseCacheControl : public ResponseCacheControl {
@@ -181,7 +206,7 @@ public:
         {
           "",
           // {must_validate_, no_store_, no_transform_, no_stale_, is_public_, max_age_}
-          {false, false, false, false, false, absl::nullopt}
+          {false, false, false, false, false, std::nullopt}
         },
         // Valid cache-control headers
         {
@@ -202,7 +227,7 @@ public:
         {
           "private",
           // {must_validate_, no_store_, no_transform_, no_stale_, is_public_, max_age_}
-          {false, true, false, false, false, absl::nullopt}
+          {false, true, false, false, false, std::nullopt}
         },
         {
           "public, max-age=0",
@@ -250,17 +275,17 @@ public:
         {
           "max-age=five",
           // {must_validate_, no_store_, no_transform_, no_stale_, is_public_, max_age_}
-          {false, false, false, false, false, absl::nullopt}
+          {false, false, false, false, false, std::nullopt}
         },
         {
           "max-age=10s, private",
           // {must_validate_, no_store_, no_transform_, no_stale_, is_public_, max_age_}
-          {false, true, false, false, false, absl::nullopt}
+          {false, true, false, false, false, std::nullopt}
         },
         {
           "s-maxage=\"50s\", max-age=\"zero\", no-cache",
           // {must_validate_, no_store_, no_transform_, no_stale_, is_public_, max_age_}
-          {true, false, false, false, false, absl::nullopt}
+          {true, false, false, false, false, std::nullopt}
         },
         {
           "s-maxage=five, max-age=10, no-transform",
@@ -270,7 +295,7 @@ public:
         {
           "max-age=\"",
           // {must_validate_, no_store_, no_transform_, no_stale_, is_public_, max_age_}
-          {false, false, false, false, false, absl::nullopt}
+          {false, false, false, false, false, std::nullopt}
         },
         // Invalid parts of the header are ignored
         {
@@ -468,15 +493,14 @@ TEST(GetAllMatchingHeaderNames, EmptyRuleset) {
 }
 
 TEST(GetAllMatchingHeaderNames, EmptyHeaderMap) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
   Http::TestRequestHeaderMapImpl headers;
   std::vector<Matchers::StringMatcherPtr> ruleset;
   absl::flat_hash_set<absl::string_view> result;
 
   envoy::type::matcher::v3::StringMatcher matcher;
   matcher.set_exact("accept");
-  ruleset.emplace_back(
-      std::make_unique<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>>(
-          matcher));
+  ruleset.emplace_back(std::make_unique<Matchers::StringMatcherImpl>(matcher, context));
 
   CacheHeadersUtils::getAllMatchingHeaderNames(headers, ruleset, result);
 
@@ -484,59 +508,50 @@ TEST(GetAllMatchingHeaderNames, EmptyHeaderMap) {
 }
 
 TEST(GetAllMatchingHeaderNames, SingleMatchSingleValue) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
   Http::TestRequestHeaderMapImpl headers{{"accept", "image/*"}, {"accept-language", "en-US"}};
   std::vector<Matchers::StringMatcherPtr> ruleset;
   absl::flat_hash_set<absl::string_view> result;
 
   envoy::type::matcher::v3::StringMatcher matcher;
   matcher.set_exact("accept");
-  ruleset.emplace_back(
-      std::make_unique<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>>(
-          matcher));
+  ruleset.emplace_back(std::make_unique<Matchers::StringMatcherImpl>(matcher, context));
 
   CacheHeadersUtils::getAllMatchingHeaderNames(headers, ruleset, result);
 
-  ASSERT_EQ(result.size(), 1);
-  EXPECT_TRUE(result.contains("accept"));
+  EXPECT_THAT(result, UnorderedElementsAre("accept"));
 }
 
 TEST(GetAllMatchingHeaderNames, SingleMatchMultiValue) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
   Http::TestRequestHeaderMapImpl headers{{"accept", "image/*"}, {"accept", "text/html"}};
   std::vector<Matchers::StringMatcherPtr> ruleset;
   absl::flat_hash_set<absl::string_view> result;
 
   envoy::type::matcher::v3::StringMatcher matcher;
   matcher.set_exact("accept");
-  ruleset.emplace_back(
-      std::make_unique<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>>(
-          matcher));
+  ruleset.emplace_back(std::make_unique<Matchers::StringMatcherImpl>(matcher, context));
 
   CacheHeadersUtils::getAllMatchingHeaderNames(headers, ruleset, result);
 
-  ASSERT_EQ(result.size(), 1);
-  EXPECT_TRUE(result.contains("accept"));
+  EXPECT_THAT(result, UnorderedElementsAre("accept"));
 }
 
 TEST(GetAllMatchingHeaderNames, MultipleMatches) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
   Http::TestRequestHeaderMapImpl headers{{"accept", "image/*"}, {"accept-language", "en-US"}};
   std::vector<Matchers::StringMatcherPtr> ruleset;
   absl::flat_hash_set<absl::string_view> result;
 
   envoy::type::matcher::v3::StringMatcher matcher;
   matcher.set_exact("accept");
-  ruleset.emplace_back(
-      std::make_unique<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>>(
-          matcher));
+  ruleset.emplace_back(std::make_unique<Matchers::StringMatcherImpl>(matcher, context));
   matcher.set_exact("accept-language");
-  ruleset.emplace_back(
-      std::make_unique<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>>(
-          matcher));
+  ruleset.emplace_back(std::make_unique<Matchers::StringMatcherImpl>(matcher, context));
 
   CacheHeadersUtils::getAllMatchingHeaderNames(headers, ruleset, result);
 
-  ASSERT_EQ(result.size(), 2);
-  EXPECT_TRUE(result.contains("accept"));
-  EXPECT_TRUE(result.contains("accept-language"));
+  EXPECT_THAT(result, UnorderedElementsAre("accept", "accept-language"));
 }
 
 struct ParseCommaDelimitedHeaderTestCase {
@@ -632,15 +647,18 @@ TEST_P(ParseCommaDelimitedHeaderTest, ParseCommaDelimitedHeader) {
 }
 
 TEST(CreateVaryIdentifier, IsStableForAllowListOrder) {
-  VaryAllowList vary_allow_list1(toStringMatchers({"width", "accept", "accept-language"}));
-  VaryAllowList vary_allow_list2(toStringMatchers({"accept", "width", "accept-language"}));
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  VaryAllowList vary_allow_list1(toStringMatchers({"width", "accept", "accept-language"}),
+                                 factory_context);
+  VaryAllowList vary_allow_list2(toStringMatchers({"accept", "width", "accept-language"}),
+                                 factory_context);
 
   Http::TestRequestHeaderMapImpl request_headers{
       {"accept", "image/*"}, {"accept-language", "en-us"}, {"width", "640"}};
 
-  absl::optional<std::string> vary_identifier1 = VaryHeaderUtils::createVaryIdentifier(
-      vary_allow_list1, {"accept", "accept-language", "width"}, request_headers);
-  absl::optional<std::string> vary_identifier2 = VaryHeaderUtils::createVaryIdentifier(
+  std::optional<std::string> vary_identifier1 = VaryHeaderUtils::createVaryIdentifier(
+      vary_allow_list1, {"accept", "accept-language", "", "width"}, request_headers);
+  std::optional<std::string> vary_identifier2 = VaryHeaderUtils::createVaryIdentifier(
       vary_allow_list2, {"accept", "accept-language", "width"}, request_headers);
 
   ASSERT_TRUE(vary_identifier1.has_value());
@@ -690,16 +708,20 @@ TEST(HasVary, NotEmpty) {
 }
 
 TEST(CreateVaryIdentifier, EmptyVaryEntry) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{{"accept", "image/*"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {}, request_headers),
             "vary-id\n");
 }
 
 TEST(CreateVaryIdentifier, SingleHeaderExists) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{{"accept", "image/*"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {"accept"}, request_headers),
             "vary-id\naccept\r"
@@ -707,17 +729,21 @@ TEST(CreateVaryIdentifier, SingleHeaderExists) {
 }
 
 TEST(CreateVaryIdentifier, SingleHeaderMissing) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers;
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {"accept"}, request_headers),
             "vary-id\naccept\r\n");
 }
 
 TEST(CreateVaryIdentifier, MultipleHeadersAllExist) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{
       {"accept", "image/*"}, {"accept-language", "en-us"}, {"width", "640"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(
                 vary_allow_list, {"accept", "accept-language", "width"}, request_headers),
@@ -727,9 +753,11 @@ TEST(CreateVaryIdentifier, MultipleHeadersAllExist) {
 }
 
 TEST(CreateVaryIdentifier, MultipleHeadersSomeExist) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestResponseHeaderMapImpl response_headers{{"vary", "accept, accept-language, width"}};
   Http::TestRequestHeaderMapImpl request_headers{{"accept", "image/*"}, {"width", "640"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(
                 vary_allow_list, {"accept", "accept-language", "width"}, request_headers),
@@ -738,9 +766,11 @@ TEST(CreateVaryIdentifier, MultipleHeadersSomeExist) {
 }
 
 TEST(CreateVaryIdentifier, ExtraRequestHeaders) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{
       {"accept", "image/*"}, {"heigth", "1280"}, {"width", "640"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(
       VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {"accept", "width"}, request_headers),
@@ -749,8 +779,10 @@ TEST(CreateVaryIdentifier, ExtraRequestHeaders) {
 }
 
 TEST(CreateVaryIdentifier, MultipleHeadersNoneExist) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers;
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(
                 vary_allow_list, {"accept", "accept-language", "width"}, request_headers),
@@ -758,16 +790,19 @@ TEST(CreateVaryIdentifier, MultipleHeadersNoneExist) {
 }
 
 TEST(CreateVaryIdentifier, DifferentHeadersSameValue) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+
   // Two requests with the same value for different headers must have different
   // vary-ids.
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   Http::TestRequestHeaderMapImpl request_headers1{{"accept", "foo"}};
-  absl::optional<std::string> vary_identifier1 = VaryHeaderUtils::createVaryIdentifier(
+  std::optional<std::string> vary_identifier1 = VaryHeaderUtils::createVaryIdentifier(
       vary_allow_list, {"accept", "accept-language"}, request_headers1);
 
   Http::TestRequestHeaderMapImpl request_headers2{{"accept-language", "foo"}};
-  absl::optional<std::string> vary_identifier2 = VaryHeaderUtils::createVaryIdentifier(
+  std::optional<std::string> vary_identifier2 = VaryHeaderUtils::createVaryIdentifier(
       vary_allow_list, {"accept", "accept-language", "width"}, request_headers2);
 
   ASSERT_TRUE(vary_identifier1.has_value());
@@ -776,8 +811,10 @@ TEST(CreateVaryIdentifier, DifferentHeadersSameValue) {
 }
 
 TEST(CreateVaryIdentifier, MultiValueSameHeader) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{{"width", "foo"}, {"width", "bar"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {"width"}, request_headers),
             "vary-id\nwidth\r"
@@ -786,20 +823,24 @@ TEST(CreateVaryIdentifier, MultiValueSameHeader) {
 }
 
 TEST(CreateVaryIdentifier, DisallowedHeader) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{{"width", "foo"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {"disallowed"}, request_headers),
-            absl::nullopt);
+            std::nullopt);
 }
 
 TEST(CreateVaryIdentifier, DisallowedHeaderWithAllowedHeader) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
   Http::TestRequestHeaderMapImpl request_headers{{"width", "foo"}};
-  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}));
+  VaryAllowList vary_allow_list(toStringMatchers({"accept", "accept-language", "width"}),
+                                factory_context);
 
   EXPECT_EQ(
       VaryHeaderUtils::createVaryIdentifier(vary_allow_list, {"disallowed,width"}, request_headers),
-      absl::nullopt);
+      std::nullopt);
 }
 
 envoy::extensions::filters::http::cache::v3::CacheConfig getConfig() {
@@ -820,8 +861,9 @@ envoy::extensions::filters::http::cache::v3::CacheConfig getConfig() {
 
 class VaryAllowListTest : public testing::Test {
 protected:
-  VaryAllowListTest() : vary_allow_list_(getConfig().allowed_vary_headers()) {}
+  VaryAllowListTest() : vary_allow_list_(getConfig().allowed_vary_headers(), factory_context_) {}
 
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context_;
   VaryAllowList vary_allow_list_;
   Http::TestRequestHeaderMapImpl request_headers_;
   Http::TestResponseHeaderMapImpl response_headers_;

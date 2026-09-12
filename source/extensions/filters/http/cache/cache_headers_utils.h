@@ -1,5 +1,7 @@
 #pragma once
 
+#include <iosfwd>
+
 #include "envoy/common/time.h"
 #include "envoy/extensions/filters/http/cache/v3/cache.pb.h"
 #include "envoy/http/header_map.h"
@@ -20,7 +22,7 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Cache {
 
-using OptionalDuration = absl::optional<SystemTime::duration>;
+using OptionalDuration = std::optional<SystemTime::duration>;
 
 // According to: https://httpwg.org/specs/rfc7234.html#cache-request-directive
 struct RequestCacheControl {
@@ -93,6 +95,8 @@ struct ResponseCacheControl {
 
 bool operator==(const RequestCacheControl& lhs, const RequestCacheControl& rhs);
 bool operator==(const ResponseCacheControl& lhs, const ResponseCacheControl& rhs);
+std::ostream& operator<<(std::ostream& os, const RequestCacheControl& request_cache_control);
+std::ostream& operator<<(std::ostream& os, const ResponseCacheControl& response_cache_control);
 
 namespace CacheHeadersUtils {
 // Parses header_entry as an HTTP time. Returns SystemTime() if
@@ -106,9 +110,9 @@ Seconds calculateAge(const Http::ResponseHeaderMap& response_headers, SystemTime
 /**
  * Read a leading positive decimal integer value and advance "*str" past the
  * digits read. If overflow occurs, or no digits exist, return
- * absl::nullopt without advancing "*str".
+ * std::nullopt without advancing "*str".
  */
-absl::optional<uint64_t> readAndRemoveLeadingDigits(absl::string_view& str);
+std::optional<uint64_t> readAndRemoveLeadingDigits(absl::string_view& str);
 
 // Add to out all header names from the given map that match any of the given rules.
 void getAllMatchingHeaderNames(const Http::HeaderMap& headers,
@@ -124,7 +128,8 @@ class VaryAllowList {
 public:
   // Parses the allow list from the Cache Config into the object's private allow_list_.
   VaryAllowList(
-      const Protobuf::RepeatedPtrField<envoy::type::matcher::v3::StringMatcher>& allow_list);
+      const Protobuf::RepeatedPtrField<envoy::type::matcher::v3::StringMatcher>& allow_list,
+      Server::Configuration::CommonFactoryContext& context);
 
   // Checks if the headers contain an allowed value in the Vary header.
   bool allowsHeaders(const Http::ResponseHeaderMap& headers) const;
@@ -146,10 +151,10 @@ bool hasVary(const Http::ResponseHeaderMap& headers);
 absl::btree_set<absl::string_view> getVaryValues(const Envoy::Http::ResponseHeaderMap& headers);
 
 // Creates a single string combining the values of the varied headers from
-// entry_headers. Returns an absl::nullopt if no valid vary key can be created
+// entry_headers. Returns an std::nullopt if no valid vary key can be created
 // and the response should not be cached (eg. when disallowed vary headers are
 // present in the response).
-absl::optional<std::string>
+std::optional<std::string>
 createVaryIdentifier(const VaryAllowList& allow_list,
                      const absl::btree_set<absl::string_view>& vary_header_values,
                      const Envoy::Http::RequestHeaderMap& request_headers);

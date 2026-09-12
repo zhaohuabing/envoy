@@ -10,6 +10,7 @@
 #include "envoy/network/listener.h"
 
 #include "source/common/network/utility.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/server/active_listener_base.h"
 
 namespace Envoy {
@@ -55,6 +56,7 @@ protected:
   Network::Socket& listen_socket_;
   Network::UdpListenerPtr udp_listener_;
   UdpListenerStats udp_stats_;
+  Network::UdpListenerWorkerRouter& udp_listener_worker_router_;
 };
 
 /**
@@ -65,9 +67,6 @@ class ActiveRawUdpListener : public ActiveUdpListenerBase,
                              public Network::UdpReadFilterCallbacks,
                              Logger::Loggable<Logger::Id::conn_handler> {
 public:
-  ActiveRawUdpListener(uint32_t worker_index, uint32_t concurrency,
-                       Network::UdpConnectionHandler& parent, Event::Dispatcher& dispatcher,
-                       Network::ListenerConfig& config);
   ActiveRawUdpListener(uint32_t worker_index, uint32_t concurrency,
                        Network::UdpConnectionHandler& parent,
                        Network::SocketSharedPtr listen_socket_ptr, Event::Dispatcher& dispatcher,
@@ -89,6 +88,10 @@ public:
     // TODO(mattklein123) change this to a reasonable number if needed.
     return Network::MAX_NUM_PACKETS_PER_EVENT_LOOP;
   }
+  const Network::IoHandle::UdpSaveCmsgConfig& udpSaveCmsgConfig() const override {
+    static const Network::IoHandle::UdpSaveCmsgConfig empty_config{};
+    return empty_config;
+  }
 
   // Network::UdpWorker
   void onDataWorker(Network::UdpRecvData&& data) override;
@@ -96,7 +99,17 @@ public:
   // ActiveListenerImplBase
   void pauseListening() override { udp_listener_->disable(); }
   void resumeListening() override { udp_listener_->enable(); }
-  void shutdownListener() override {
+  void shutdownListener(const Network::ExtraShutdownListenerOptions& options) override {
+    if (options.non_dispatched_udp_packet_handler_) {
+      // Keep the listener alive during hot restart drain. Forward datagrams of unknown sessions to
+      // the child only when the guard is enabled, otherwise keep serving them locally on the
+      // draining parent rather than forwarding each over the hot restart RPC.
+      if (Runtime::runtimeFeatureEnabled(
+              "envoy.reloadable_features.udp_hot_restart_session_handoff")) {
+        non_dispatched_udp_packet_handler_ = options.non_dispatched_udp_packet_handler_;
+      }
+      return;
+    }
     // The read filter should be deleted before the UDP listener is deleted.
     // The read filter refers to the UDP listener to send packets to downstream.
     // If the UDP listener is deleted before the read filter, the read filter may try to use it
@@ -106,20 +119,38 @@ public:
   }
   // These two are unreachable because a config will be rejected if it configures both this listener
   // and any L4 filter chain.
-  void updateListenerConfig(Network::ListenerConfig&) override { NOT_REACHED_GCOVR_EXCL_LINE; }
-  void onFilterChainDraining(const std::list<const Network::FilterChain*>&) override {
-    NOT_REACHED_GCOVR_EXCL_LINE;
+  void updateListenerConfig(Network::ListenerConfig&) override {
+    IS_ENVOY_BUG("unexpected call to updateListenerConfig");
   }
+  void onFilterChainDraining(const std::list<const Network::FilterChain*>&) override {
+    IS_ENVOY_BUG("unexpected call to onFilterChainDraining");
+  }
+  // Drain notifications are broadcast to every listener owned by the connection handler, UDP
+  // listeners included, so these are reachable and must not be flagged as bugs. There is no
+  // connection-level state to notify for a raw UDP listener, so they are no-ops. Note that this
+  // differs from onFilterChainDraining() above, which is only invoked for listener types that
+  // support filter chain removal.
+  void onFilterChainDrainStart(const std::list<const Network::FilterChain*>&,
+                               Network::ConnectionDrainEvent) override {}
+  void onListenerDrainStart(Network::ConnectionDrainEvent) override {}
 
   // Network::UdpListenerFilterManager
   void addReadFilter(Network::UdpListenerReadFilterPtr&& filter) override;
 
   // Network::UdpReadFilterCallbacks
   Network::UdpListener& udpListener() override;
+  Network::UdpHotRestartSessionHandlePtr
+  registerHotRestartSession(const Network::Address::InstanceConstSharedPtr& local_address,
+                            const Network::Address::InstanceConstSharedPtr& peer_address) override;
 
 private:
+  // Sessions a filter has registered on this worker. During a hot restart the parent keeps serving
+  // these and forwards datagrams of any other 4-tuple to the child instance.
+  absl::flat_hash_set<Network::UdpRecvData::LocalPeerAddresses> active_sessions_;
+  // Destroying the filters unregisters their sessions, which touches active_sessions_ above.
   std::list<Network::UdpListenerReadFilterPtr> read_filters_;
   Network::UdpPacketWriterPtr udp_packet_writer_;
+  OptRef<Network::NonDispatchedUdpPacketHandler> non_dispatched_udp_packet_handler_;
 };
 
 } // namespace Server

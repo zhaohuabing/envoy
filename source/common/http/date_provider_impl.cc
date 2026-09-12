@@ -5,23 +5,32 @@
 
 namespace Envoy {
 namespace Http {
+namespace {
 
-DateFormatter DateProviderImplBase::date_formatter_("%a, %d %b %Y %H:%M:%S GMT");
+class DateProviderDateFormatter : public DateFormatter {
+public:
+  DateProviderDateFormatter() : DateFormatter("%a, %d %b %Y %H:%M:%S GMT") {}
+};
+using DateProviderDateFormatterSingleton = ConstSingleton<DateProviderDateFormatter>;
+} // namespace
 
 TlsCachingDateProviderImpl::TlsCachingDateProviderImpl(Event::Dispatcher& dispatcher,
                                                        ThreadLocal::SlotAllocator& tls)
-    : DateProviderImplBase(dispatcher.timeSource()), tls_(tls.allocateSlot()),
-      refresh_timer_(dispatcher.createTimer([this]() -> void { onRefreshDate(); })) {
+    : DateProviderImplBase(dispatcher.timeSource()), tls_(tls.allocateSlot()) {
+  tls_->set([](Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    return std::make_shared<ThreadLocalCachedDate>(dispatcher);
+  });
+}
 
+TlsCachingDateProviderImpl::ThreadLocalCachedDate::ThreadLocalCachedDate(
+    Event::Dispatcher& dispatcher)
+    : time_source_(dispatcher.timeSource()),
+      refresh_timer_(dispatcher.createTimer([this]() -> void { onRefreshDate(); })) {
   onRefreshDate();
 }
 
-void TlsCachingDateProviderImpl::onRefreshDate() {
-  std::string new_date_string = date_formatter_.now(time_source_);
-  tls_->set([new_date_string](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-    return std::make_shared<ThreadLocalCachedDate>(new_date_string);
-  });
-
+void TlsCachingDateProviderImpl::ThreadLocalCachedDate::onRefreshDate() {
+  date_string_ = DateProviderDateFormatterSingleton::get().now(time_source_);
   refresh_timer_->enableTimer(std::chrono::milliseconds(500));
 }
 
@@ -30,7 +39,7 @@ void TlsCachingDateProviderImpl::setDateHeader(ResponseHeaderMap& headers) {
 }
 
 void SlowDateProviderImpl::setDateHeader(ResponseHeaderMap& headers) {
-  headers.setDate(date_formatter_.now(time_source_));
+  headers.setDate(DateProviderDateFormatterSingleton::get().now(time_source_));
 }
 
 } // namespace Http

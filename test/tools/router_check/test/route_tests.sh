@@ -1,14 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
+ENVOY_SRCDIR="${TEST_SRCDIR}/${TEST_WORKSPACE}"
+
 # Router_check_tool binary path
-PATH_BIN="${TEST_SRCDIR}/envoy"/test/tools/router_check/router_check_tool
+PATH_BIN="${ENVOY_SRCDIR}"/test/tools/router_check/router_check_tool
 
 # Config json path
-PATH_CONFIG="${TEST_SRCDIR}/envoy"/test/tools/router_check/test/config
+PATH_CONFIG="${ENVOY_SRCDIR}"/test/tools/router_check/test/config
 
-TESTS=("ContentType" "ClusterHeader" "DirectResponse" "HeaderMatchedRouting" "Redirect" "Redirect2" "Redirect3" "Runtime" "TestRoutes" "Weighted")
+TESTS=("ContentType" "ClusterHeader" "DirectResponse" "HeaderMatchedRouting" "Redirect" "Redirect2" "Redirect3" "Redirect4" "Runtime" "TestRoutes" "Timeout" "Weighted")
 
 # Testing expected matches
 for t in "${TESTS[@]}"
@@ -57,7 +59,7 @@ fi
 echo "testing bad config output"
 BAD_CONFIG_OUTPUT=$("${PATH_BIN}" "-c" "${PATH_CONFIG}/Redirect.golden.proto.json" "-t" "${PATH_CONFIG}/TestRoutes.yaml" 2>&1) ||
   echo "${BAD_CONFIG_OUTPUT:-no-output}"
-if [[ "${BAD_CONFIG_OUTPUT}" != *"Protobuf message (type envoy.config.route.v3.RouteConfiguration reason INVALID_ARGUMENT:tests: Cannot find field.) has unknown fields"* ]]; then
+if ! [[ "${BAD_CONFIG_OUTPUT}" =~ .*INVALID_ARGUMENT.*envoy.config.route.v3.RouteConfiguration.*tests.* ]]; then
   exit 1
 fi
 
@@ -104,10 +106,47 @@ if ! echo "${FAILURE_OUTPUT}" | grep -Fxq "expected: [has(x-pong-response):true]
   exit 1
 fi
 
+# Failure test case for timeout mismatch strings.
+# The API regex matches only single-digit versions, so /api/v10/resource selects the fallback.
+echo "testing timeout mismatch failure output"
+TIMEOUT_FAILURE_OUTPUT=$("${PATH_BIN}" "-c" "${PATH_CONFIG}/Timeout.yaml" "-t" "${PATH_CONFIG}/TimeoutFailures.golden.proto.json" "--only-show-failures" 2>&1) ||
+  echo "${TIMEOUT_FAILURE_OUTPUT:-no-output}"
+if ! echo "${TIMEOUT_FAILURE_OUTPUT}" | grep -Fxq "expected: [120000], actual: [30000], test type: timeout"; then
+  exit 1
+fi
+
 # Missing test results
 echo "testing missing tests output test cases"
 MISSING_OUTPUT=$("${PATH_BIN}" "-c" "${PATH_CONFIG}/TestRoutes.yaml" "-t" "${PATH_CONFIG}/TestRoutes.golden.proto.json" "--details" "--covall" 2>&1) ||
   echo "${MISSING_OUTPUT:-no-output}"
 if [[ "${MISSING_OUTPUT}" != *"Missing test for host: www2_staging, route: prefix: \"/\""*"Missing test for host: default, route: prefix: \"/api/application_data\""* ]]; then
+  exit 1
+fi
+
+# Detaied coverage flag
+echo "test report should contain missing tests with detailed coverage flag"
+MISSING_OUTPUT=$("${PATH_BIN}" "-c" "${PATH_CONFIG}/DetailedCoverage.yaml" "-t" "${PATH_CONFIG}/DetailedCoverage.golden.proto.json" "--detailed-coverage" 2>&1) ||
+  echo "${MISSING_OUTPUT:-no-output}"
+if ! echo "${MISSING_OUTPUT}" | grep -qE "Missing test for host: localhost, route name: new_endpoint2-.+"; then
+  exit 1
+fi
+
+if ! echo "${MISSING_OUTPUT}" | grep -qE "Missing test for host: localhost, route name: -.+"; then
+  exit 1
+fi
+
+echo "test report shoud not contain missing tests without detailed coverage flag"
+MISSING_OUTPUT=$("${PATH_BIN}" "-c" "${PATH_CONFIG}/DetailedCoverage.yaml" "-t" "${PATH_CONFIG}/DetailedCoverage.golden.proto.json" 2>&1) ||
+  echo "${MISSING_OUTPUT:-no-output}"
+if echo "${MISSING_OUTPUT}" | grep -qE "Missing test for host:.+"; then
+  exit 1
+fi
+
+#  Correctness of route coverage for weighted clusters
+echo "route coverage should be calculated correctly for weighted clusters"
+MISSING_OUTPUT=$("${PATH_BIN}" "-c" "${PATH_CONFIG}/Weighted.yaml" "-t" "${PATH_CONFIG}/Weighted.golden.proto.json" "--details" 2>&1) ||
+  echo "${MISSING_OUTPUT:-no-output}"
+if ! echo "${MISSING_OUTPUT}" | grep -Fxq "Current route coverage: 100%"; then
+  echo "${MISSING_OUTPUT:-no-output}"
   exit 1
 fi

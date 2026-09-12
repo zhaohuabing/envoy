@@ -21,7 +21,7 @@
 #include "source/common/common/logger.h"
 #include "source/common/config/utility.h"
 #include "source/common/protobuf/utility.h"
-#include "source/common/stats/symbol_table_impl.h"
+#include "source/common/stats/symbol_table.h"
 #include "source/server/watchdog_impl.h"
 
 #include "absl/synchronization/mutex.h"
@@ -72,14 +72,16 @@ GuardDogImpl::GuardDogImpl(Stats::Scope& stats_scope, const Server::Configuratio
           envoy::watchdog::v3::AbortActionConfig abort_config;
           WatchDogAction* abort_action_config = actions.Add();
           abort_action_config->set_event(WatchDogAction::KILL);
-          abort_action_config->mutable_config()->mutable_typed_config()->PackFrom(abort_config);
+          std::ignore =
+              abort_action_config->mutable_config()->mutable_typed_config()->PackFrom(abort_config);
         }
 
         if (config.multiKillTimeout().count() > 0) {
           envoy::watchdog::v3::AbortActionConfig abort_config;
           WatchDogAction* abort_action_config = actions.Add();
           abort_action_config->set_event(WatchDogAction::MULTIKILL);
-          abort_action_config->mutable_config()->mutable_typed_config()->PackFrom(abort_config);
+          std::ignore =
+              abort_action_config->mutable_config()->mutable_typed_config()->PackFrom(abort_config);
         }
 
         for (const auto& action : actions) {
@@ -163,6 +165,8 @@ void GuardDogImpl::step() {
         multi_kill_threads.emplace_back(tid, last_checkin);
 
         if (multi_kill_threads.size() >= required_for_multi_kill) {
+          ENVOY_LOG_MISC(error, "Watchdog MULTIKILL as {} threads are stuck.",
+                         multi_kill_threads.size());
           invokeGuardDogActions(WatchDogAction::MULTIKILL, multi_kill_threads, now);
         }
       }

@@ -37,9 +37,11 @@ public:
   TcpStatsdSinkTest() {
     cluster_manager_.initializeClusters({"fake_cluster"}, {});
     cluster_manager_.initializeThreadLocalClusters({"fake_cluster"});
-    sink_ = std::make_unique<TcpStatsdSink>(
-        local_info_, "fake_cluster", tls_, cluster_manager_,
-        cluster_manager_.active_clusters_["fake_cluster"]->info_->stats_store_);
+    sink_ =
+        TcpStatsdSink::create(
+            local_info_, "fake_cluster", tls_, cluster_manager_,
+            *(cluster_manager_.active_clusters_["fake_cluster"]->info_->stats_store_.rootScope()))
+            .value();
   }
 
   void expectCreateConnection() {
@@ -47,7 +49,7 @@ public:
     Upstream::MockHost::MockCreateConnectionData conn_info;
     conn_info.connection_ = connection_;
     conn_info.host_description_ = Upstream::makeTestHost(
-        std::make_unique<NiceMock<Upstream::MockClusterInfo>>(), "tcp://127.0.0.1:80", simTime());
+        std::make_unique<NiceMock<Upstream::MockClusterInfo>>(), "tcp://127.0.0.1:80");
 
     EXPECT_CALL(cluster_manager_.thread_local_cluster_, tcpConn_(_)).WillOnce(Return(conn_info));
     EXPECT_CALL(*connection_, setConnectionStats(_));
@@ -65,7 +67,7 @@ public:
 TEST_F(TcpStatsdSinkTest, EmptyFlush) {
   InSequence s;
   expectCreateConnection();
-  EXPECT_CALL(*connection_, write(BufferStringEqual(""), _));
+  EXPECT_CALL(*connection_, write(BufferString(""), _));
   sink_->flush(snapshot_);
 }
 
@@ -83,9 +85,24 @@ TEST_F(TcpStatsdSinkTest, BasicFlow) {
   gauge.used_ = true;
   snapshot_.gauges_.push_back(gauge);
 
+  Stats::PrimitiveCounter host_counter;
+  host_counter.add(3);
+  Stats::PrimitiveCounterSnapshot host_counter_snap(host_counter);
+  host_counter_snap.setName("test_host_counter");
+  snapshot_.host_counters_.push_back(host_counter_snap);
+
+  Stats::PrimitiveGauge host_gauge;
+  host_gauge.add(4);
+  Stats::PrimitiveGaugeSnapshot host_gauge_snap(host_gauge);
+  host_gauge_snap.setName("test_host_gauge");
+  snapshot_.host_gauges_.push_back(host_gauge_snap);
+
   expectCreateConnection();
-  EXPECT_CALL(*connection_,
-              write(BufferStringEqual("envoy.test_counter:1|c\nenvoy.test_gauge:2|g\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.test_counter:1|c\n"
+                                               "envoy.test_host_counter:3|c\n"
+                                               "envoy.test_gauge:2|g\n"
+                                               "envoy.test_host_gauge:4|g\n"),
+                                  _));
   sink_->flush(snapshot_);
 
   connection_->runHighWatermarkCallbacks();
@@ -98,7 +115,7 @@ TEST_F(TcpStatsdSinkTest, BasicFlow) {
 
   NiceMock<Stats::MockHistogram> timer;
   timer.name_ = "test_timer";
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.test_timer:5|ms\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.test_timer:5|ms\n"), _));
   sink_->onHistogramComplete(timer, 5);
 
   EXPECT_CALL(*connection_, close(Network::ConnectionCloseType::NoFlush));
@@ -113,28 +130,28 @@ TEST_F(TcpStatsdSinkTest, SiSuffix) {
   items.name_ = "items";
   items.unit_ = Stats::Histogram::Unit::Unspecified;
 
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.items:1|ms\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.items:1|ms\n"), _));
   sink_->onHistogramComplete(items, 1);
 
   NiceMock<Stats::MockHistogram> information;
   information.name_ = "information";
   information.unit_ = Stats::Histogram::Unit::Bytes;
 
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.information:2|ms\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.information:2|ms\n"), _));
   sink_->onHistogramComplete(information, 2);
 
   NiceMock<Stats::MockHistogram> duration_micro;
   duration_micro.name_ = "duration";
   duration_micro.unit_ = Stats::Histogram::Unit::Microseconds;
 
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.duration:3|ms\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.duration:3|ms\n"), _));
   sink_->onHistogramComplete(duration_micro, 3);
 
   NiceMock<Stats::MockHistogram> duration_milli;
   duration_milli.name_ = "duration";
   duration_milli.unit_ = Stats::Histogram::Unit::Milliseconds;
 
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.duration:4|ms\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.duration:4|ms\n"), _));
   sink_->onHistogramComplete(duration_milli, 4);
 
   EXPECT_CALL(*connection_, close(Network::ConnectionCloseType::NoFlush));
@@ -148,7 +165,7 @@ TEST_F(TcpStatsdSinkTest, ScaledPercent) {
   items.name_ = "items";
   items.unit_ = Stats::Histogram::Unit::Percent;
 
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.items:0.5|h\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.items:0.5|h\n"), _));
   sink_->onHistogramComplete(items, Stats::Histogram::PercentScale / 2);
 
   EXPECT_CALL(*connection_, close(Network::ConnectionCloseType::NoFlush));
@@ -176,9 +193,10 @@ TEST_F(TcpStatsdSinkTest, NoHost) {
 }
 
 TEST_F(TcpStatsdSinkTest, WithCustomPrefix) {
-  sink_ = std::make_unique<TcpStatsdSink>(
+  sink_ = *TcpStatsdSink::create(
       local_info_, "fake_cluster", tls_, cluster_manager_,
-      cluster_manager_.active_clusters_["fake_cluster"]->info_->stats_store_, "test_prefix");
+      *(cluster_manager_.active_clusters_["fake_cluster"]->info_->stats_store_.rootScope()),
+      "test_prefix");
 
   NiceMock<Stats::MockCounter> counter;
   counter.name_ = "test_counter";
@@ -187,7 +205,7 @@ TEST_F(TcpStatsdSinkTest, WithCustomPrefix) {
   snapshot_.counters_.push_back({1, counter});
 
   expectCreateConnection();
-  EXPECT_CALL(*connection_, write(BufferStringEqual("test_prefix.test_counter:1|c\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("test_prefix.test_counter:1|c\n"), _));
   sink_->flush(snapshot_);
 }
 
@@ -225,22 +243,22 @@ TEST_F(TcpStatsdSinkTest, Overflow) {
 
   // Synthetically set buffer above high watermark. Make sure we don't write anything.
   cluster_manager_.active_clusters_["fake_cluster"]
-      ->info_->stats()
-      .upstream_cx_tx_bytes_buffered_.set(1024 * 1024 * 17);
+      ->info_->trafficStats()
+      ->upstream_cx_tx_bytes_buffered_.set(1024 * 1024 * 17);
   sink_->flush(snapshot_);
 
   // Lower and make sure we write.
   cluster_manager_.active_clusters_["fake_cluster"]
-      ->info_->stats()
-      .upstream_cx_tx_bytes_buffered_.set(1024 * 1024 * 15);
+      ->info_->trafficStats()
+      ->upstream_cx_tx_bytes_buffered_.set(1024 * 1024 * 15);
   expectCreateConnection();
-  EXPECT_CALL(*connection_, write(BufferStringEqual("envoy.test_counter:1|c\n"), _));
+  EXPECT_CALL(*connection_, write(BufferString("envoy.test_counter:1|c\n"), _));
   sink_->flush(snapshot_);
 
   // Raise and make sure we don't write and kill connection.
   cluster_manager_.active_clusters_["fake_cluster"]
-      ->info_->stats()
-      .upstream_cx_tx_bytes_buffered_.set(1024 * 1024 * 17);
+      ->info_->trafficStats()
+      ->upstream_cx_tx_bytes_buffered_.set(1024 * 1024 * 17);
   EXPECT_CALL(*connection_, close(Network::ConnectionCloseType::NoFlush));
   sink_->flush(snapshot_);
 
@@ -248,6 +266,26 @@ TEST_F(TcpStatsdSinkTest, Overflow) {
                      ->info_->stats_store_.counter("statsd.cx_overflow")
                      .value());
   tls_.shutdownThread();
+}
+
+TEST_F(TcpStatsdSinkTest, LargeStatNameNoOverflow) {
+  InSequence s;
+
+  NiceMock<Stats::MockCounter> counter;
+  std::string large_name(20000, 'a');
+  counter.name_ = large_name;
+  counter.latch_ = 1;
+  counter.used_ = true;
+  snapshot_.counters_.push_back({1, counter});
+
+  expectCreateConnection();
+  EXPECT_CALL(*connection_, write(_, _))
+      .WillOnce(Invoke([&large_name](Buffer::Instance& buffer, bool) -> void {
+        std::string compare = fmt::format("envoy.{}:1|c\n", large_name);
+        EXPECT_EQ(compare, buffer.toString());
+        buffer.drain(buffer.length());
+      }));
+  sink_->flush(snapshot_);
 }
 
 } // namespace
