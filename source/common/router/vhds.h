@@ -10,7 +10,6 @@
 #include "envoy/config/subscription.h"
 #include "envoy/http/codes.h"
 #include "envoy/local_info/local_info.h"
-#include "envoy/router/rds.h"
 #include "envoy/router/route_config_update_receiver.h"
 #include "envoy/server/filter_config.h"
 #include "envoy/service/discovery/v3/discovery.pb.h"
@@ -19,7 +18,7 @@
 #include "envoy/thread_local/thread_local.h"
 
 #include "source/common/common/logger.h"
-#include "source/common/config/subscription_base.h"
+#include "source/common/config/resource_type_helper.h"
 #include "source/common/init/target_impl.h"
 #include "source/common/protobuf/utility.h"
 
@@ -36,16 +35,17 @@ struct VhdsStats {
   ALL_VHDS_STATS(GENERATE_COUNTER_STRUCT)
 };
 
-class VhdsSubscription : Envoy::Config::SubscriptionBase<envoy::config::route::v3::VirtualHost>,
+class VhdsSubscription : public Envoy::Config::SubscriptionCallbacks,
                          Logger::Loggable<Logger::Id::router> {
 public:
-  VhdsSubscription(RouteConfigUpdatePtr& config_update_info,
-                   Server::Configuration::ServerFactoryContext& factory_context,
-                   const std::string& stat_prefix,
-                   absl::optional<RouteConfigProvider*>& route_config_providers);
+  static absl::StatusOr<std::unique_ptr<VhdsSubscription>>
+  createVhdsSubscription(const envoy::config::route::v3::RouteConfiguration& route_config,
+                         Server::Configuration::ServerFactoryContext& factory_context,
+                         const std::string& stat_prefix, bool from_rds,
+                         VhdsConfigUpdateReceiver& receiver, Init::Manager& init_manager);
+
   ~VhdsSubscription() override { init_target_.ready(); }
 
-  void registerInitTargetWithInitManager(Init::Manager& m) { m.add(init_target_); }
   void updateOnDemand(const std::string& with_route_config_name_prefix);
   static std::string domainNameToAlias(const std::string& route_config_name,
                                        const std::string& domain) {
@@ -57,22 +57,33 @@ public:
   }
 
 private:
+  VhdsSubscription(const envoy::config::route::v3::RouteConfiguration& route_config,
+                   Server::Configuration::ServerFactoryContext& factory_context,
+                   const std::string& stat_prefix, bool from_rds,
+                   VhdsConfigUpdateReceiver& receiver, Init::Manager& init_manager,
+                   absl::Status& creation_status);
+
   // Config::SubscriptionCallbacks
-  void onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>&,
-                      const std::string&) override {
-    NOT_IMPLEMENTED_GCOVR_EXCL_LINE;
+  absl::Status onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>&,
+                              const std::string&) override {
+    return absl::OkStatus();
   }
-  void onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>&,
-                      const Protobuf::RepeatedPtrField<std::string>&, const std::string&) override;
+  absl::Status onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>&,
+                              const Protobuf::RepeatedPtrField<std::string>&,
+                              const std::string&) override;
   void onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailureReason reason,
                             const EnvoyException* e) override;
 
-  RouteConfigUpdatePtr& config_update_info_;
-  Stats::ScopePtr scope_;
+  // The receiver that owns this subscription. It builds the new route configuration from every
+  // update and publishes it to its observer once it is warmed up.
+  VhdsConfigUpdateReceiver& receiver_;
+  const std::string route_config_name_;
+  Stats::ScopeSharedPtr scope_;
   VhdsStats stats_;
   Envoy::Config::SubscriptionPtr subscription_;
   Init::TargetImpl init_target_;
-  absl::optional<RouteConfigProvider*>& route_config_provider_opt_;
+  const Envoy::Config::ResourceTypeHelper<envoy::config::route::v3::VirtualHost>
+      resource_type_helper_;
 };
 
 using VhdsSubscriptionPtr = std::unique_ptr<VhdsSubscription>;

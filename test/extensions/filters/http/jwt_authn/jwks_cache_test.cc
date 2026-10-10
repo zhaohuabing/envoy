@@ -11,9 +11,11 @@
 #include "test/mocks/server/factory_context.h"
 #include "test/test_common/utility.h"
 
+#include "absl/time/time.h"
+
 using envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication;
 using envoy::extensions::filters::http::jwt_authn::v3::RemoteJwks;
-using ::google::jwt_verify::Status;
+using ::testing::ElementsAre;
 using ::testing::MockFunction;
 
 namespace Envoy {
@@ -21,6 +23,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace JwtAuthn {
 namespace {
+
+using JwtVerify::Status;
 
 JwtAuthnFilterStats generateMockStats(Stats::Scope& scope) {
   return {ALL_JWT_AUTHN_FILTER_STATS(POOL_COUNTER_PREFIX(scope, ""))};
@@ -32,21 +36,27 @@ protected:
 
   void SetUp() override {
     // fetcher is only called at async_fetch. In this test, it is never called.
-    EXPECT_CALL(mock_fetcher_, Call(_, _)).Times(0);
+    EXPECT_CALL(mock_fetcher_, Call(_, _, _)).Times(0);
     setupCache(ExampleConfig);
-    jwks_ = google::jwt_verify::Jwks::createFrom(PublicKey, google::jwt_verify::Jwks::JWKS);
+    jwks_ = Envoy::JwtVerify::Jwks::createFrom(PublicKey, Envoy::JwtVerify::Jwks::JWKS);
   }
 
   void setupCache(const std::string& config_str) {
     TestUtility::loadFromYaml(config_str, config_);
-    cache_ = JwksCache::create(config_, context_, mock_fetcher_.AsStdFunction(), stats_);
+    auto cache_or = JwksCache::create(config_, context_.server_factory_context_,
+                                      makeOptRef<Init::Manager>(context_.init_manager_),
+                                      mock_fetcher_.AsStdFunction(), stats_);
+    ASSERT_TRUE(cache_or.ok()) << cache_or.status();
+    cache_ = std::move(cache_or).value();
   }
 
   JwtAuthentication config_;
-  JwksCachePtr cache_;
-  google::jwt_verify::JwksPtr jwks_;
-  MockFunction<Common::JwksFetcherPtr(Upstream::ClusterManager&, const RemoteJwks&)> mock_fetcher_;
   NiceMock<Server::Configuration::MockFactoryContext> context_;
+  JwksCachePtr cache_;
+  Envoy::JwtVerify::JwksPtr jwks_;
+  MockFunction<Common::JwksFetcherPtr(Upstream::ClusterManager&, Router::RetryPolicyConstSharedPtr,
+                                      const RemoteJwks&)>
+      mock_fetcher_;
   JwtAuthnFilterStats stats_;
 };
 
@@ -59,6 +69,32 @@ TEST_F(JwksCacheTest, TestFindByProvider) {
 TEST_F(JwksCacheTest, TestFindByIssuer) {
   EXPECT_TRUE(cache_->findByIssuer("https://example.com") != nullptr);
   EXPECT_TRUE(cache_->findByIssuer("other-issuer") == nullptr);
+}
+
+// claim_to_headers is resolved to a path once here, and the segments are views into the config
+// proto rather than copies, so that resolving a claim per request allocates nothing.
+TEST_F(JwksCacheTest, TestClaimsToHeadersAliasTheConfigProto) {
+  setupCache(ClaimToHeadersConfig);
+  auto* jwks_data = cache_->findByProvider(ProviderName);
+  ASSERT_TRUE(jwks_data != nullptr);
+
+  const auto& claims_to_headers = jwks_data->claimsToHeaders();
+  ASSERT_EQ(2, claims_to_headers.size());
+
+  // A claim_name is still split on ".".
+  EXPECT_EQ("x-jwt-claim-nested", claims_to_headers[0].header_name_);
+  EXPECT_THAT(claims_to_headers[0].claim_path_, ElementsAre("nested", "key-1"));
+
+  // A claim_path key is taken whole, dots and all.
+  EXPECT_EQ("x-jwt-claim-url-name", claims_to_headers[1].header_name_);
+  EXPECT_THAT(claims_to_headers[1].claim_path_, ElementsAre("http://example.org/parent_token"));
+
+  // Both kinds of segment point into the provider proto, never at a temporary, so they stay valid
+  // for as long as the config that owns them.
+  const auto& proto_claims = config_.providers().at(ProviderName).claim_to_headers();
+  EXPECT_EQ(proto_claims[0].claim_name().data(), claims_to_headers[0].claim_path_[0].data());
+  EXPECT_EQ(proto_claims[1].claim_path()[0].key().data(),
+            claims_to_headers[1].claim_path_[0].data());
 }
 
 // Test findByIssuer with issuer not specified.
@@ -91,8 +127,11 @@ TEST_F(JwksCacheTest, TestSetRemoteJwks) {
   auto& provider0 = (*config_.mutable_providers())[std::string(ProviderName)];
   // Set cache_duration to 1 second to test expiration
   provider0.mutable_remote_jwks()->mutable_cache_duration()->set_seconds(1);
-  cache_ = JwksCache::create(config_, context_, mock_fetcher_.AsStdFunction(), stats_);
-
+  auto cache_or = JwksCache::create(config_, context_.server_factory_context_,
+                                    makeOptRef<Init::Manager>(context_.init_manager_),
+                                    mock_fetcher_.AsStdFunction(), stats_);
+  ASSERT_TRUE(cache_or.ok()) << cache_or.status();
+  cache_ = std::move(cache_or.value());
   auto jwks = cache_->findByIssuer("https://example.com");
   EXPECT_TRUE(jwks->getJwksObj() == nullptr);
 
@@ -101,7 +140,7 @@ TEST_F(JwksCacheTest, TestSetRemoteJwks) {
   EXPECT_FALSE(jwks->isExpired());
 
   // cache duration is 1 second, sleep two seconds to expire it
-  context_.time_system_.advanceTimeWait(std::chrono::seconds(2));
+  context_.server_factory_context_.time_system_.advanceTimeWait(std::chrono::seconds(2));
   EXPECT_TRUE(jwks->isExpired());
 }
 
@@ -110,8 +149,11 @@ TEST_F(JwksCacheTest, TestSetRemoteJwksWithDefaultCacheDuration) {
   auto& provider0 = (*config_.mutable_providers())[std::string(ProviderName)];
   // Clear cache_duration to use default one.
   provider0.mutable_remote_jwks()->clear_cache_duration();
-  cache_ = JwksCache::create(config_, context_, mock_fetcher_.AsStdFunction(), stats_);
-
+  auto cache_or = JwksCache::create(config_, context_.server_factory_context_,
+                                    makeOptRef<Init::Manager>(context_.init_manager_),
+                                    mock_fetcher_.AsStdFunction(), stats_);
+  ASSERT_TRUE(cache_or.ok()) << cache_or.status();
+  cache_ = std::move(cache_or.value());
   auto jwks = cache_->findByIssuer("https://example.com");
   EXPECT_TRUE(jwks->getJwksObj() == nullptr);
 
@@ -127,8 +169,11 @@ TEST_F(JwksCacheTest, TestGoodInlineJwks) {
   auto local_jwks = provider0.mutable_local_jwks();
   local_jwks->set_inline_string(PublicKey);
 
-  cache_ = JwksCache::create(config_, context_, mock_fetcher_.AsStdFunction(), stats_);
-
+  auto cache_or = JwksCache::create(config_, context_.server_factory_context_,
+                                    makeOptRef<Init::Manager>(context_.init_manager_),
+                                    mock_fetcher_.AsStdFunction(), stats_);
+  ASSERT_TRUE(cache_or.ok()) << cache_or.status();
+  cache_ = std::move(cache_or.value());
   auto jwks = cache_->findByIssuer("https://example.com");
   EXPECT_FALSE(jwks->getJwksObj() == nullptr);
   EXPECT_FALSE(jwks->isExpired());
@@ -141,8 +186,11 @@ TEST_F(JwksCacheTest, TestBadInlineJwks) {
   auto local_jwks = provider0.mutable_local_jwks();
   local_jwks->set_inline_string("BAD-JWKS");
 
-  cache_ = JwksCache::create(config_, context_, mock_fetcher_.AsStdFunction(), stats_);
-
+  auto cache_or = JwksCache::create(config_, context_.server_factory_context_,
+                                    makeOptRef<Init::Manager>(context_.init_manager_),
+                                    mock_fetcher_.AsStdFunction(), stats_);
+  ASSERT_TRUE(cache_or.ok()) << cache_or.status();
+  cache_ = std::move(cache_or.value());
   auto jwks = cache_->findByIssuer("https://example.com");
   EXPECT_TRUE(jwks->getJwksObj() == nullptr);
 }
@@ -179,6 +227,83 @@ TEST_F(JwksCacheTest, TestAudiences) {
 
   // Wrong multiple audiences
   EXPECT_FALSE(jwks->areAudiencesAllowed({"wrong-audience1", "wrong-audience2"}));
+}
+
+// Test subject constraints for JwtProvider
+TEST_F(JwksCacheTest, TestSubjects) {
+  setupCache(SubjectConfig);
+
+  {
+    auto jwks = cache_->findByIssuer("https://example.com");
+
+    // example.com has a suffix constraint of "@example.com"
+    EXPECT_TRUE(jwks->isSubjectAllowed("test@example.com"));
+    // Negative test for other subjects
+    EXPECT_FALSE(jwks->isSubjectAllowed("othersubject"));
+  }
+
+  {
+    auto jwks = cache_->findByIssuer("https://spiffe.example.com");
+
+    // Provider has a prefix constraint of spiffe://spiffe.example.com
+    EXPECT_TRUE(jwks->isSubjectAllowed("spiffe://spiffe.example.com/service"));
+    // Negative test for other subjects
+    EXPECT_FALSE(jwks->isSubjectAllowed("spiffe://spiffe.baz.com/service"));
+  }
+
+  {
+    auto jwks = cache_->findByIssuer("https://nosub.com");
+
+    // Provider no constraints, so test any subject should be allowed
+    EXPECT_TRUE(jwks->isSubjectAllowed("any_subject"));
+  }
+
+  {
+    auto jwks = cache_->findByIssuer("https://regexsub.com");
+
+    // Provider allows spiffe://*.example.com/
+    EXPECT_TRUE(jwks->isSubjectAllowed("spiffe://test1.example.com/service"));
+    EXPECT_TRUE(jwks->isSubjectAllowed("spiffe://test2.example.com/service"));
+    EXPECT_FALSE(jwks->isSubjectAllowed("spiffe://test1.baz.com/service"));
+  }
+}
+
+// Test lifetime constraints for JwtProvider
+TEST_F(JwksCacheTest, TestLifetime) {
+  setupCache(ExpirationConfig);
+
+  {
+    auto jwks = cache_->findByIssuer("https://example.com");
+
+    absl::Time created;
+    absl::Time good_exp = created + absl::Minutes(30);
+    absl::Time bad_exp = created + absl::Hours(25);
+    // Issuer has a lifetime constraint of 24 hours, so 30 minutes is good.
+    EXPECT_TRUE(jwks->isLifetimeAllowed(created, &good_exp));
+    // 25 hours should fail based on lifetime
+    EXPECT_FALSE(jwks->isLifetimeAllowed(created, &bad_exp));
+    // Tokens without expiration should also fail
+    EXPECT_FALSE(jwks->isLifetimeAllowed(created, nullptr));
+  }
+
+  {
+    auto jwks = cache_->findByIssuer("https://spiffe.example.com");
+
+    absl::Time created;
+    absl::Time long_exp = created + absl::Hours(2500);
+    // Spiffe provider has a infinite constraint, so any time should work.
+    EXPECT_TRUE(jwks->isLifetimeAllowed(created, &long_exp));
+    // Infinite constraints require an expiration, so null should fail.
+    EXPECT_FALSE(jwks->isLifetimeAllowed(created, nullptr));
+  }
+
+  {
+    auto jwks = cache_->findByIssuer("https://noexp.example.com");
+
+    absl::Time created;
+    // Require_expiration set to false, so this should pass.
+    EXPECT_TRUE(jwks->isLifetimeAllowed(created, nullptr));
+  }
 }
 
 } // namespace

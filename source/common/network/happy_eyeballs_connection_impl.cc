@@ -1,574 +1,164 @@
 #include "source/common/network/happy_eyeballs_connection_impl.h"
 
-#include <vector>
+#include <set>
+
+#include "envoy/network/address.h"
+
+#include "source/common/network/connection_impl.h"
 
 namespace Envoy {
 namespace Network {
 
-HappyEyeballsConnectionImpl::HappyEyeballsConnectionImpl(
-    Event::Dispatcher& dispatcher, const std::vector<Address::InstanceConstSharedPtr>& address_list,
-    Address::InstanceConstSharedPtr source_address, TransportSocketFactory& socket_factory,
+HappyEyeballsConnectionProvider::HappyEyeballsConnectionProvider(
+    Event::Dispatcher& dispatcher,
+    const Upstream::HostDescription::SharedConstAddressVector& sorted_address_list,
+    const std::shared_ptr<const Upstream::UpstreamLocalAddressSelector>&
+        upstream_local_address_selector,
+    UpstreamTransportSocketFactory& socket_factory,
     TransportSocketOptionsConstSharedPtr transport_socket_options,
+    const Upstream::HostDescriptionConstSharedPtr& host,
     const ConnectionSocket::OptionsSharedPtr options)
-    : id_(ConnectionImpl::next_global_id_++), dispatcher_(dispatcher), address_list_(address_list),
-      connection_construction_state_(
-          {source_address, socket_factory, transport_socket_options, options}),
-      next_attempt_timer_(dispatcher_.createTimer([this]() -> void { tryAnotherConnection(); })) {
-  ENVOY_LOG(trace, "New connection.");
-  connections_.push_back(createNextConnection());
+    : dispatcher_(dispatcher), address_list_(sorted_address_list),
+      upstream_local_address_selector_(upstream_local_address_selector),
+      socket_factory_(socket_factory), transport_socket_options_(transport_socket_options),
+      host_(host), options_(options) {
+  ASSERT(address_list_ != nullptr && !address_list_->empty());
 }
 
-HappyEyeballsConnectionImpl::~HappyEyeballsConnectionImpl() = default;
-
-void HappyEyeballsConnectionImpl::connect() {
-  ENVOY_BUG(!connect_finished_, "connection already connected");
-  connections_[0]->connect();
-  maybeScheduleNextAttempt();
+bool HappyEyeballsConnectionProvider::hasNextConnection() {
+  return next_address_ < address_list_->size();
 }
 
-void HappyEyeballsConnectionImpl::addWriteFilter(WriteFilterSharedPtr filter) {
-  if (connect_finished_) {
-    connections_[0]->addWriteFilter(filter);
-    return;
+ClientConnectionPtr HappyEyeballsConnectionProvider::createNextConnection(const uint64_t id) {
+  if (first_connection_created_) {
+    // The stats for the first connection are handled in ActiveClient::ActiveClient
+    host_->stats().cx_total_.inc();
+    host_->cluster().trafficStats()->upstream_cx_total_.inc();
   }
-  // Filters should only be notified of events on the final connection, so defer adding
-  // filters until the final connection has been determined.
-  post_connect_state_.write_filters_.push_back(filter);
+  first_connection_created_ = true;
+  ASSERT(hasNextConnection());
+  ENVOY_LOG_EVENT(debug, "happy_eyeballs_cx_attempt", "C[{}] address={}", id,
+                  (*address_list_)[next_address_]->asStringView());
+  auto& address = (*address_list_)[next_address_++];
+  auto upstream_local_address = upstream_local_address_selector_->getUpstreamLocalAddress(
+      address, options_, makeOptRefFromPtr(transport_socket_options_.get()));
+
+  return dispatcher_.createClientConnection(
+      address, upstream_local_address.address_,
+      socket_factory_.createTransportSocket(transport_socket_options_, host_),
+      upstream_local_address.socket_options_, transport_socket_options_);
 }
 
-void HappyEyeballsConnectionImpl::addFilter(FilterSharedPtr filter) {
-  if (connect_finished_) {
-    connections_[0]->addFilter(filter);
-    return;
-  }
-  // Filters should only be notified of events on the final connection, so defer adding
-  // filters until the final connection has been determined.
-  post_connect_state_.filters_.push_back(filter);
-}
+size_t HappyEyeballsConnectionProvider::nextConnection() { return next_address_; }
 
-void HappyEyeballsConnectionImpl::addReadFilter(ReadFilterSharedPtr filter) {
-  if (connect_finished_) {
-    connections_[0]->addReadFilter(filter);
-    return;
-  }
-  // Filters should only be notified of events on the final connection, so defer adding
-  // filters until the final connection has been determined.
-  post_connect_state_.read_filters_.push_back(filter);
-}
+size_t HappyEyeballsConnectionProvider::totalConnections() { return address_list_->size(); }
 
-void HappyEyeballsConnectionImpl::removeReadFilter(ReadFilterSharedPtr filter) {
-  if (connect_finished_) {
-    connections_[0]->removeReadFilter(filter);
-    return;
+namespace {
+
+struct AddressFamily {
+  Address::Type type;
+  std::optional<Address::IpVersion> version;
+
+  bool operator==(const AddressFamily& other) const {
+    return type == other.type && version == other.version;
   }
-  // Filters should only be notified of events on the final connection, so remove
-  // the filters from the list of deferred filters.
-  auto i = post_connect_state_.read_filters_.begin();
-  while (i != post_connect_state_.read_filters_.end()) {
-    if (*i == filter) {
-      post_connect_state_.read_filters_.erase(i);
-      return;
+
+  bool operator<(const AddressFamily& other) const {
+    if (type != other.type) {
+      return type < other.type;
     }
+    return version < other.version;
   }
-  NOT_REACHED_GCOVR_EXCL_LINE;
+};
+
+AddressFamily getFamily(const Address::InstanceConstSharedPtr& addr) {
+  if (addr->type() == Address::Type::Ip) {
+    return {Address::Type::Ip, addr->ip()->version()};
+  }
+  return {addr->type(), std::nullopt};
 }
 
-bool HappyEyeballsConnectionImpl::initializeReadFilters() {
-  if (connect_finished_) {
-    return connections_[0]->initializeReadFilters();
-  }
-  // Filters should only be notified of events on the final connection, so defer
-  // initialization of the filters until the final connection has been determined.
-  if (post_connect_state_.read_filters_.empty()) {
-    return false;
-  }
-  post_connect_state_.initialize_read_filters_ = true;
-  return true;
-}
+} // namespace
 
-void HappyEyeballsConnectionImpl::addBytesSentCallback(Connection::BytesSentCb cb) {
-  if (connect_finished_) {
-    connections_[0]->addBytesSentCallback(cb);
-    return;
-  }
-  // Callbacks should only be notified of events on the final connection, so defer adding
-  // callbacks until the final connection has been determined.
-  post_connect_state_.bytes_sent_callbacks_.push_back(cb);
-}
+std::vector<Address::InstanceConstSharedPtr> HappyEyeballsConnectionProvider::sortAddresses(
+    const std::vector<Address::InstanceConstSharedPtr>& in,
+    const envoy::config::cluster::v3::UpstreamConnectionOptions::HappyEyeballsConfig&
+        happy_eyeballs_config) {
+  // Sort the addresses according to https://datatracker.ietf.org/doc/html/rfc8305#section-4.
+  // Currently the first_address_family version and count options are supported. This allows
+  // specifying the address family version to prefer over others, and the number (count) of
+  // addresses in that family to attempt before moving to the next family.
+  //
+  // If no family version is specified, the version is taken from the first address in the list.
+  // The default count is 1. As an example, assume the first family version is v6, and the count
+  // is 3, then the output list will be:
+  //
+  //     [3*v6, 1*v4, 3*v6, 1*v4, ...]
+  //
+  // assuming sufficient addresses exist in the input.
+  //
+  // This implementation generalizes this to multiple address types (IPv4, IPv6, Pipe, Internal).
+  ENVOY_LOG_EVENT(trace, "happy_eyeballs_sort_address", "sort address with happy_eyeballs config.");
+  std::vector<Address::InstanceConstSharedPtr> address_list;
+  address_list.reserve(in.size());
 
-void HappyEyeballsConnectionImpl::enableHalfClose(bool enabled) {
-  if (!connect_finished_) {
-    per_connection_state_.enable_half_close_ = enabled;
-  }
-  for (auto& connection : connections_) {
-    connection->enableHalfClose(enabled);
-  }
-}
+  ASSERT(!in.empty());
 
-bool HappyEyeballsConnectionImpl::isHalfCloseEnabled() {
-  return connections_[0]->isHalfCloseEnabled();
-}
-
-std::string HappyEyeballsConnectionImpl::nextProtocol() const {
-  return connections_[0]->nextProtocol();
-}
-
-void HappyEyeballsConnectionImpl::noDelay(bool enable) {
-  if (!connect_finished_) {
-    per_connection_state_.no_delay_ = enable;
-  }
-  for (auto& connection : connections_) {
-    connection->noDelay(enable);
-  }
-}
-
-void HappyEyeballsConnectionImpl::readDisable(bool disable) {
-  if (connect_finished_) {
-    connections_[0]->readDisable(disable);
-    return;
-  }
-  if (!post_connect_state_.read_disable_count_.has_value()) {
-    post_connect_state_.read_disable_count_ = 0;
+  AddressFamily preferred_family = getFamily(in[0]);
+  switch (happy_eyeballs_config.first_address_family_version()) {
+  case envoy::config::cluster::v3::UpstreamConnectionOptions::DEFAULT:
+    break;
+  case envoy::config::cluster::v3::UpstreamConnectionOptions::V4:
+    preferred_family = {Address::Type::Ip, Address::IpVersion::v4};
+    break;
+  case envoy::config::cluster::v3::UpstreamConnectionOptions::V6:
+    preferred_family = {Address::Type::Ip, Address::IpVersion::v6};
+    break;
+  case envoy::config::cluster::v3::UpstreamConnectionOptions::PIPE:
+    preferred_family = {Address::Type::Pipe, std::nullopt};
+    break;
+  case envoy::config::cluster::v3::UpstreamConnectionOptions::INTERNAL:
+    preferred_family = {Address::Type::EnvoyInternal, std::nullopt};
+    break;
+  default:
+    break;
   }
 
-  if (disable) {
-    post_connect_state_.read_disable_count_.value()++;
-  } else {
-    ASSERT(post_connect_state_.read_disable_count_ != 0);
-    post_connect_state_.read_disable_count_.value()--;
-  }
-}
-
-void HappyEyeballsConnectionImpl::detectEarlyCloseWhenReadDisabled(bool value) {
-  if (!connect_finished_) {
-    per_connection_state_.detect_early_close_when_read_disabled_ = value;
-  }
-  for (auto& connection : connections_) {
-    connection->detectEarlyCloseWhenReadDisabled(value);
-  }
-}
-
-bool HappyEyeballsConnectionImpl::readEnabled() const {
-  if (!connect_finished_) {
-    return !post_connect_state_.read_disable_count_.has_value() ||
-           post_connect_state_.read_disable_count_ == 0;
-  }
-  return connections_[0]->readEnabled();
-}
-
-const ConnectionInfoProvider& HappyEyeballsConnectionImpl::connectionInfoProvider() const {
-  return connections_[0]->connectionInfoProvider();
-}
-
-ConnectionInfoProviderSharedPtr
-HappyEyeballsConnectionImpl::connectionInfoProviderSharedPtr() const {
-  return connections_[0]->connectionInfoProviderSharedPtr();
-}
-
-absl::optional<Connection::UnixDomainSocketPeerCredentials>
-HappyEyeballsConnectionImpl::unixSocketPeerCredentials() const {
-  return connections_[0]->unixSocketPeerCredentials();
-}
-
-Ssl::ConnectionInfoConstSharedPtr HappyEyeballsConnectionImpl::ssl() const {
-  return connections_[0]->ssl();
-}
-
-Connection::State HappyEyeballsConnectionImpl::state() const {
-  if (!connect_finished_) {
-    ASSERT(connections_[0]->state() == Connection::State::Open);
-  }
-  return connections_[0]->state();
-}
-
-bool HappyEyeballsConnectionImpl::connecting() const {
-  ASSERT(connect_finished_ || connections_[0]->connecting());
-  return connections_[0]->connecting();
-}
-
-void HappyEyeballsConnectionImpl::write(Buffer::Instance& data, bool end_stream) {
-  if (connect_finished_) {
-    connections_[0]->write(data, end_stream);
-    return;
-  }
-
-  // Data should only be written on the final connection, so defer actually writing
-  // until the final connection has been determined.
-  if (!post_connect_state_.write_buffer_.has_value()) {
-    post_connect_state_.end_stream_ = false;
-    post_connect_state_.write_buffer_ = dispatcher_.getWatermarkFactory().createBuffer(
-        [this]() -> void { this->onWriteBufferLowWatermark(); },
-        [this]() -> void { this->onWriteBufferHighWatermark(); },
-        // ConnectionCallbacks do not have a method to receive overflow watermark
-        // notification. So this class, like ConnectionImpl, has a no-op handler.
-        []() -> void { /* TODO(adisuissa): Handle overflow watermark */ });
-    if (per_connection_state_.buffer_limits_.has_value()) {
-      post_connect_state_.write_buffer_.value()->setWatermarks(
-          per_connection_state_.buffer_limits_.value());
-    }
-  }
-
-  post_connect_state_.write_buffer_.value()->move(data);
-  ASSERT(!post_connect_state_.end_stream_.value()); // Don't write after end_stream.
-  post_connect_state_.end_stream_ = end_stream;
-}
-
-void HappyEyeballsConnectionImpl::setBufferLimits(uint32_t limit) {
-  if (!connect_finished_) {
-    ASSERT(!per_connection_state_.buffer_limits_.has_value());
-    per_connection_state_.buffer_limits_ = limit;
-    if (post_connect_state_.write_buffer_.has_value()) {
-      post_connect_state_.write_buffer_.value()->setWatermarks(limit);
-    }
-  }
-  for (auto& connection : connections_) {
-    connection->setBufferLimits(limit);
-  }
-}
-
-uint32_t HappyEyeballsConnectionImpl::bufferLimit() const { return connections_[0]->bufferLimit(); }
-
-bool HappyEyeballsConnectionImpl::aboveHighWatermark() const {
-  if (!connect_finished_) {
-    // Writes are deferred, so return the watermark status from the deferred write buffer.
-    return post_connect_state_.write_buffer_.has_value() &&
-           post_connect_state_.write_buffer_.value()->highWatermarkTriggered();
-  }
-
-  return connections_[0]->aboveHighWatermark();
-}
-
-const ConnectionSocket::OptionsSharedPtr& HappyEyeballsConnectionImpl::socketOptions() const {
-  // Note, this might change before connect finishes.
-  return connections_[0]->socketOptions();
-}
-
-absl::string_view HappyEyeballsConnectionImpl::requestedServerName() const {
-  // Note, this might change before connect finishes.
-  return connections_[0]->requestedServerName();
-}
-
-StreamInfo::StreamInfo& HappyEyeballsConnectionImpl::streamInfo() {
-  // Note, this might change before connect finishes.
-  return connections_[0]->streamInfo();
-}
-
-const StreamInfo::StreamInfo& HappyEyeballsConnectionImpl::streamInfo() const {
-  // Note, this might change before connect finishes.
-  return connections_[0]->streamInfo();
-}
-
-absl::string_view HappyEyeballsConnectionImpl::transportFailureReason() const {
-  // Note, this might change before connect finishes.
-  return connections_[0]->transportFailureReason();
-}
-
-bool HappyEyeballsConnectionImpl::startSecureTransport() {
-  if (!connect_finished_) {
-    per_connection_state_.start_secure_transport_ = true;
-  }
-  bool ret = true;
-  for (auto& connection : connections_) {
-    if (!connection->startSecureTransport()) {
-      ret = false;
-    }
-  }
-  return ret;
-}
-
-absl::optional<std::chrono::milliseconds> HappyEyeballsConnectionImpl::lastRoundTripTime() const {
-  // Note, this might change before connect finishes.
-  return connections_[0]->lastRoundTripTime();
-}
-
-void HappyEyeballsConnectionImpl::addConnectionCallbacks(ConnectionCallbacks& cb) {
-  if (connect_finished_) {
-    connections_[0]->addConnectionCallbacks(cb);
-    return;
-  }
-  // Callbacks should only be notified of events on the final connection, so defer adding
-  // callbacks until the final connection has been determined.
-  post_connect_state_.connection_callbacks_.push_back(&cb);
-}
-
-void HappyEyeballsConnectionImpl::removeConnectionCallbacks(ConnectionCallbacks& cb) {
-  if (connect_finished_) {
-    connections_[0]->removeConnectionCallbacks(cb);
-    return;
-  }
-  // Callbacks should only be notified of events on the final connection, so remove
-  // the callback from the list of deferred callbacks.
-  auto i = post_connect_state_.connection_callbacks_.begin();
-  while (i != post_connect_state_.connection_callbacks_.end()) {
-    if (*i == &cb) {
-      post_connect_state_.connection_callbacks_.erase(i);
-      return;
-    }
-  }
-  NOT_REACHED_GCOVR_EXCL_LINE;
-}
-
-void HappyEyeballsConnectionImpl::close(ConnectionCloseType type) {
-  if (connect_finished_) {
-    connections_[0]->close(type);
-    return;
-  }
-
-  connect_finished_ = true;
-  ENVOY_LOG(trace, "Disabling next attempt timer.");
-  next_attempt_timer_->disableTimer();
-  for (size_t i = 0; i < connections_.size(); ++i) {
-    connections_[i]->removeConnectionCallbacks(*callbacks_wrappers_[i]);
-    if (i != 0) {
-      // Wait to close the final connection until the post-connection callbacks
-      // have been added.
-      connections_[i]->close(ConnectionCloseType::NoFlush);
-    }
-  }
-  connections_.resize(1);
-  callbacks_wrappers_.clear();
-
-  for (auto cb : post_connect_state_.connection_callbacks_) {
-    if (cb) {
-      connections_[0]->addConnectionCallbacks(*cb);
-    }
-  }
-  connections_[0]->close(type);
-}
-
-Event::Dispatcher& HappyEyeballsConnectionImpl::dispatcher() {
-  ASSERT(&dispatcher_ == &connections_[0]->dispatcher());
-  return connections_[0]->dispatcher();
-}
-
-uint64_t HappyEyeballsConnectionImpl::id() const { return id_; }
-
-void HappyEyeballsConnectionImpl::hashKey(std::vector<uint8_t>& hash_key) const {
-  // Pack the id into sizeof(id_) uint8_t entries in the hash_key vector.
-  hash_key.reserve(hash_key.size() + sizeof(id_));
-  for (unsigned i = 0; i < sizeof(id_); ++i) {
-    hash_key.push_back(0xFF & (id_ >> (8 * i)));
-  }
-}
-
-void HappyEyeballsConnectionImpl::setConnectionStats(const ConnectionStats& stats) {
-  if (!connect_finished_) {
-    per_connection_state_.connection_stats_ = std::make_unique<ConnectionStats>(stats);
-  }
-  for (auto& connection : connections_) {
-    connection->setConnectionStats(stats);
-  }
-}
-
-void HappyEyeballsConnectionImpl::setDelayedCloseTimeout(std::chrono::milliseconds timeout) {
-  if (!connect_finished_) {
-    per_connection_state_.delayed_close_timeout_ = timeout;
-  }
-  for (auto& connection : connections_) {
-    connection->setDelayedCloseTimeout(timeout);
-  }
-}
-
-void HappyEyeballsConnectionImpl::dumpState(std::ostream& os, int indent_level) const {
-  const char* spaces = spacesForLevel(indent_level);
-  os << spaces << "HappyEyeballsConnectionImpl " << this << DUMP_MEMBER(id_)
-     << DUMP_MEMBER(connect_finished_) << "\n";
-
-  for (auto& connection : connections_) {
-    DUMP_DETAILS(connection);
-  }
-}
-
-ClientConnectionPtr HappyEyeballsConnectionImpl::createNextConnection() {
-  ASSERT(next_address_ < address_list_.size());
-  auto connection = dispatcher_.createClientConnection(
-      address_list_[next_address_++], connection_construction_state_.source_address_,
-      connection_construction_state_.socket_factory_.createTransportSocket(
-          connection_construction_state_.transport_socket_options_),
-      connection_construction_state_.options_);
-  callbacks_wrappers_.push_back(std::make_unique<ConnectionCallbacksWrapper>(*this, *connection));
-  connection->addConnectionCallbacks(*callbacks_wrappers_.back());
-
-  if (per_connection_state_.detect_early_close_when_read_disabled_.has_value()) {
-    connection->detectEarlyCloseWhenReadDisabled(
-        per_connection_state_.detect_early_close_when_read_disabled_.value());
-  }
-  if (per_connection_state_.no_delay_.has_value()) {
-    connection->noDelay(per_connection_state_.no_delay_.value());
-  }
-  if (per_connection_state_.connection_stats_) {
-    connection->setConnectionStats(*per_connection_state_.connection_stats_);
-  }
-  if (per_connection_state_.buffer_limits_.has_value()) {
-    connection->setBufferLimits(per_connection_state_.buffer_limits_.value());
-  }
-  if (per_connection_state_.enable_half_close_.has_value()) {
-    connection->enableHalfClose(per_connection_state_.enable_half_close_.value());
-  }
-  if (per_connection_state_.delayed_close_timeout_.has_value()) {
-    connection->setDelayedCloseTimeout(per_connection_state_.delayed_close_timeout_.value());
-  }
-  if (per_connection_state_.start_secure_transport_.has_value()) {
-    ASSERT(per_connection_state_.start_secure_transport_);
-    connection->startSecureTransport();
-  }
-
-  return connection;
-}
-
-void HappyEyeballsConnectionImpl::tryAnotherConnection() {
-  ENVOY_LOG(trace, "Trying another connection.");
-  connections_.push_back(createNextConnection());
-  connections_.back()->connect();
-  maybeScheduleNextAttempt();
-}
-
-void HappyEyeballsConnectionImpl::maybeScheduleNextAttempt() {
-  if (next_address_ >= address_list_.size()) {
-    return;
-  }
-  ENVOY_LOG(trace, "Scheduling next attempt.");
-  next_attempt_timer_->enableTimer(std::chrono::milliseconds(300));
-}
-
-void HappyEyeballsConnectionImpl::onEvent(ConnectionEvent event,
-                                          ConnectionCallbacksWrapper* wrapper) {
-  if (event != ConnectionEvent::Connected) {
-    ENVOY_LOG(trace, "Connection failed to connect");
-    // This connection attempt has failed. If possible, start another connection attempt
-    // immediately, instead of waiting for the timer.
-    if (next_address_ < address_list_.size()) {
-      ENVOY_LOG(trace, "Disabling next attempt timer.");
-      next_attempt_timer_->disableTimer();
-      tryAnotherConnection();
-    }
-    // If there is at least one more attempt running then the current attempt can be destroyed.
-    if (connections_.size() > 1) {
-      // Nuke this connection and associated callbacks and let a subsequent attempt proceed.
-      cleanupWrapperAndConnection(wrapper);
-      return;
-    }
-    ASSERT(connections_.size() == 1);
-    // This connection attempt failed but there are no more attempts to be made, so pass
-    // the failure up by setting up this connection as the final one.
-  }
-
-  // Close all other connections and configure the final connection.
-  setUpFinalConnection(event, wrapper);
-}
-
-void HappyEyeballsConnectionImpl::setUpFinalConnection(ConnectionEvent event,
-                                                       ConnectionCallbacksWrapper* wrapper) {
-  connect_finished_ = true;
-  ENVOY_LOG(trace, "Disabling next attempt timer due to final connection.");
-  next_attempt_timer_->disableTimer();
-  // Remove the proxied connection callbacks from all connections.
-  for (auto& w : callbacks_wrappers_) {
-    w->connection().removeConnectionCallbacks(*w);
-  }
-
-  // Close and delete any other connections.
-  auto it = connections_.begin();
-  while (it != connections_.end()) {
-    if (it->get() != &(wrapper->connection())) {
-      (*it)->close(ConnectionCloseType::NoFlush);
-      dispatcher_.deferredDelete(std::move(*it));
-      it = connections_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  ASSERT(connections_.size() == 1);
-  callbacks_wrappers_.clear();
-
-  // Apply post-connect state to the final socket.
-  for (const auto& cb : post_connect_state_.bytes_sent_callbacks_) {
-    connections_[0]->addBytesSentCallback(cb);
-  }
-
-  if (event == ConnectionEvent::Connected) {
-    // Apply post-connect state which is only connections which have succeeded.
-    for (auto& filter : post_connect_state_.filters_) {
-      connections_[0]->addFilter(filter);
-    }
-    for (auto& filter : post_connect_state_.write_filters_) {
-      connections_[0]->addWriteFilter(filter);
-    }
-    for (auto& filter : post_connect_state_.read_filters_) {
-      connections_[0]->addReadFilter(filter);
-    }
-    if (post_connect_state_.initialize_read_filters_.has_value() &&
-        post_connect_state_.initialize_read_filters_.value()) {
-      // initialize_read_filters_ is set to true in initializeReadFilters() only when
-      // there are read filters installed. The underlying connection's initializeReadFilters()
-      // will always return true when read filters are installed so this should always
-      // return true.
-      ASSERT(!post_connect_state_.read_filters_.empty());
-      bool initialized = connections_[0]->initializeReadFilters();
-      ASSERT(initialized);
-    }
-    if (post_connect_state_.read_disable_count_.has_value()) {
-      for (int i = 0; i < post_connect_state_.read_disable_count_.value(); ++i) {
-        connections_[0]->readDisable(true);
+  // Group addresses by family, preserving original family order except placing preferred_family
+  // in the first position. Store each family with an index that will be used for iterating through
+  // the bucket of addresses with that address family.
+  std::vector<std::pair<AddressFamily, uint32_t>> family_order;
+  std::map<AddressFamily, std::vector<Address::InstanceConstSharedPtr>> buckets;
+  for (const auto& addr : in) {
+    AddressFamily family = getFamily(addr);
+    auto& bucket = buckets[family];
+    if (bucket.empty()) {
+      if (family == preferred_family) {
+        family_order.insert(family_order.begin(), {family, 0});
+      } else {
+        family_order.push_back({family, 0});
       }
     }
+    bucket.push_back(addr);
+  }
 
-    if (post_connect_state_.write_buffer_.has_value()) {
-      // write_buffer_ and end_stream_ are both set together in write().
-      ASSERT(post_connect_state_.end_stream_.has_value());
-      // If a buffer limit was set, ensure that it was applied to the connection.
-      if (per_connection_state_.buffer_limits_.has_value()) {
-        ASSERT(connections_[0]->bufferLimit() == per_connection_state_.buffer_limits_.value());
-      }
-      connections_[0]->write(*post_connect_state_.write_buffer_.value(),
-                             post_connect_state_.end_stream_.value());
+  const auto first_address_family_count =
+      PROTOBUF_GET_WRAPPED_OR_DEFAULT(happy_eyeballs_config, first_address_family_count, 1);
+
+  // Loop through address families.
+  for (int i = 0; address_list.size() < in.size(); i = (i + 1) % family_order.size()) {
+    std::vector<Address::InstanceConstSharedPtr>& bucket = buckets[family_order[i].first];
+    // Push first_address_family_count addresses for the preferred family. We can't just check if
+    // i == 0 because the preferred family may not be present.
+    int num_addrs_to_push =
+        (family_order[i].first == preferred_family) ? first_address_family_count : 1;
+    for (int j = 0; family_order[i].second < bucket.size() && j < num_addrs_to_push; ++j) {
+      address_list.push_back(std::move(bucket[family_order[i].second++]));
     }
   }
 
-  // Add connection callbacks after moving data from the deferred write buffer so that
-  // any high watermark notification is swallowed and not conveyed to the callbacks, since
-  // that was already delivered to the callbacks when the data was written to the buffer.
-  for (auto cb : post_connect_state_.connection_callbacks_) {
-    if (cb) {
-      connections_[0]->addConnectionCallbacks(*cb);
-    }
-  }
-}
-
-void HappyEyeballsConnectionImpl::cleanupWrapperAndConnection(ConnectionCallbacksWrapper* wrapper) {
-  wrapper->connection().removeConnectionCallbacks(*wrapper);
-  for (auto it = connections_.begin(); it != connections_.end();) {
-    if (it->get() == &(wrapper->connection())) {
-      (*it)->close(ConnectionCloseType::NoFlush);
-      dispatcher_.deferredDelete(std::move(*it));
-      it = connections_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  for (auto it = callbacks_wrappers_.begin(); it != callbacks_wrappers_.end();) {
-    if (it->get() == wrapper) {
-      it = callbacks_wrappers_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
-
-void HappyEyeballsConnectionImpl::onWriteBufferLowWatermark() {
-  // Only called when moving write data from the deferred write buffer to
-  // the underlying connection. In this case, the connection callbacks must
-  // not be notified since this should be transparent to the callbacks.
-}
-
-void HappyEyeballsConnectionImpl::onWriteBufferHighWatermark() {
-  ASSERT(!connect_finished_);
-  for (auto callback : post_connect_state_.connection_callbacks_) {
-    if (callback) {
-      callback->onAboveWriteBufferHighWatermark();
-    }
-  }
+  ASSERT(address_list.size() == in.size());
+  return address_list;
 }
 
 } // namespace Network

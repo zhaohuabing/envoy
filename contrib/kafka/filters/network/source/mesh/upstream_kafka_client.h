@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <utility>
@@ -69,7 +70,7 @@ public:
   // Theoretically we do not need to do this and leave it all to destructor, but then closing N
   // producers would require doing that in sequence, while we can optimize it somewhat (so we just
   // wait for the slowest one).
-  // See https://github.com/edenhill/librdkafka/issues/2972
+  // See https://github.com/confluentinc/librdkafka/issues/2972
   virtual void markFinished() PURE;
 };
 

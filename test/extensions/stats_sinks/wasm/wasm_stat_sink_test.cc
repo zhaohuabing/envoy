@@ -1,3 +1,5 @@
+#include <optional>
+
 #include "envoy/server/lifecycle_notifier.h"
 
 #include "source/extensions/common/wasm/wasm.h"
@@ -6,7 +8,6 @@
 #include "test/mocks/upstream/mocks.h"
 #include "test/test_common/wasm_base.h"
 
-#include "absl/types/optional.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -31,14 +32,14 @@ public:
   MOCK_METHOD(void, log_, (spdlog::level::level_enum level, absl::string_view message));
 };
 
-class WasmCommonContextTest
-    : public Common::Wasm::WasmTestBase<testing::TestWithParam<std::string>> {
+class WasmCommonContextTest : public Common::Wasm::WasmTestBase<
+                                  testing::TestWithParam<std::tuple<std::string, std::string>>> {
 public:
   WasmCommonContextTest() = default;
 
   void setup(const std::string& code, std::string root_id = "") {
     setRootId(root_id);
-    setupBase(GetParam(), code,
+    setupBase(std::get<0>(GetParam()), code,
               [](Wasm* wasm, const std::shared_ptr<Plugin>& plugin) -> ContextBase* {
                 return new TestContext(wasm, plugin);
               });
@@ -56,16 +57,13 @@ public:
 };
 
 INSTANTIATE_TEST_SUITE_P(Runtimes, WasmCommonContextTest,
-                         Envoy::Extensions::Common::Wasm::runtime_values);
+                         Envoy::Extensions::Common::Wasm::runtime_and_cpp_values,
+                         Envoy::Extensions::Common::Wasm::wasmTestParamsToString);
 
 TEST_P(WasmCommonContextTest, OnStat) {
   std::string code;
   NiceMock<Stats::MockMetricSnapshot> snapshot_;
-  if (GetParam() != "null") {
-#if defined(__aarch64__)
-    // TODO(PiotrSikora): There are no Emscripten releases for arm64.
-    return;
-#endif
+  if (std::get<0>(GetParam()) != "null") {
     code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(absl::StrCat(
         "{{ test_rundir }}/test/extensions/stats_sinks/wasm/test_data/test_context_cpp.wasm")));
   } else {

@@ -3,16 +3,32 @@
 #include "test/test_common/logging.h"
 #include "test/test_common/utility.h"
 
+#include "absl/base/attributes.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
 
+static ABSL_ATTRIBUTE_NOINLINE void releaseAssertInAFunction() { RELEASE_ASSERT(0, ""); }
+
 TEST(ReleaseAssertDeathTest, VariousLogs) {
   EXPECT_DEATH({ RELEASE_ASSERT(0, ""); }, ".*assert failure: 0.*");
-  EXPECT_DEATH({ RELEASE_ASSERT(0, "With some logs"); },
-               ".*assert failure: 0. Details: With some logs.*");
-  EXPECT_DEATH({ RELEASE_ASSERT(0 == EAGAIN, fmt::format("using {}", "fmt")); },
-               ".*assert failure: 0 == EAGAIN. Details: using fmt.*");
+  EXPECT_DEATH(
+      { RELEASE_ASSERT(0, "With some logs"); }, ".*assert failure: 0. Details: With some logs.*");
+  EXPECT_DEATH(
+      { RELEASE_ASSERT(0 == EAGAIN, fmt::format("using {}", "fmt")); },
+      ".*assert failure: 0 == EAGAIN. Details: using fmt.*");
+}
+
+TEST(ReleaseAssertDeathTest, AssertIncludesStackTrace) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "optimized build inlines functions so the stack trace won't be reliable";
+#endif
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+  GTEST_SKIP() << "memory sanitizer build inlines functions so the stack trace won't be reliable";
+#endif
+#endif
+  EXPECT_DEATH({ releaseAssertInAFunction(); }, "releaseAssertInAFunction");
 }
 
 TEST(AssertDeathTest, VariousLogs) {
@@ -69,6 +85,70 @@ TEST(AssertInReleaseTest, AssertLocation) {
 #endif
 }
 
+TEST(EnvoyBugStackTrace, TestStackTrace) {
+  Assert::EnvoyBugStackTrace st;
+  st.capture();
+  EXPECT_LOG_CONTAINS("error", "stacktrace for envoy bug", st.logStackTrace());
+  EXPECT_LOG_CONTAINS("error", "#0 ", st.logStackTrace());
+}
+
+TEST(EnvoyBugStackTrace, TestStackTraceSingleEntry) {
+  const bool saved = Assert::EnvoyBugStackTrace::singleLine();
+  Assert::EnvoyBugStackTrace::setSingleLine(true);
+  Assert::EnvoyBugStackTrace st;
+  st.capture();
+  {
+    LogLevelSetter save_levels(spdlog::level::trace);
+    StartStopRecording recording(GetLogSink());
+    st.logStackTrace();
+    auto messages = recording.messages();
+    ASSERT_EQ(1, messages.size());
+    EXPECT_THAT(messages[0], testing::HasSubstr("stacktrace for envoy bug"));
+    EXPECT_THAT(messages[0], testing::HasSubstr("#0"));
+  }
+  Assert::EnvoyBugStackTrace::setSingleLine(saved);
+}
+
+TEST(EnvoyBugStackTrace, TestStackTraceSingleEntryWithMessage) {
+  const bool saved = Assert::EnvoyBugStackTrace::singleLine();
+  Assert::EnvoyBugStackTrace::setSingleLine(true);
+  Assert::EnvoyBugStackTrace st;
+  st.capture();
+  {
+    LogLevelSetter save_levels(spdlog::level::trace);
+    StartStopRecording recording(GetLogSink());
+    st.logStackTrace("envoy bug failure: some_condition. Details: something went wrong");
+    auto messages = recording.messages();
+    ASSERT_EQ(1, messages.size());
+    EXPECT_THAT(
+        messages[0],
+        testing::HasSubstr("envoy bug failure: some_condition. Details: something went wrong"));
+    EXPECT_THAT(messages[0], testing::HasSubstr("#0"));
+    EXPECT_THAT(messages[0], testing::Not(testing::HasSubstr("stacktrace for envoy bug")));
+  }
+  Assert::EnvoyBugStackTrace::setSingleLine(saved);
+}
+
+TEST(EnvoyBugDeathTest, SingleEntryIncludesMessage) {
+#if !defined(NDEBUG) && !defined(ENVOY_CONFIG_COVERAGE)
+  GTEST_SKIP() << "ENVOY_BUG aborts in debug mode, cannot verify log entry count";
+#endif
+  const bool saved = Assert::EnvoyBugStackTrace::singleLine();
+  Assert::EnvoyBugStackTrace::setSingleLine(true);
+  Assert::resetEnvoyBugCountersForTest();
+  auto envoy_bug_action_registration = Assert::addEnvoyBugFailureRecordAction([](const char*) {});
+  {
+    LogLevelSetter save_levels(spdlog::level::trace);
+    StartStopRecording recording(GetLogSink());
+    ENVOY_BUG(false, "test details");
+    auto messages = recording.messages();
+    ASSERT_EQ(1, messages.size());
+    EXPECT_THAT(messages[0], testing::HasSubstr("envoy bug failure: false. Details: test details"));
+    EXPECT_THAT(messages[0], testing::HasSubstr("#0"));
+  }
+  Assert::EnvoyBugStackTrace::setSingleLine(saved);
+}
+
 TEST(EnvoyBugDeathTest, VariousLogs) {
   // Use 2 envoy bug action registrations to verify that action chaining is working correctly.
   int envoy_bug_fail_count = 0;
@@ -81,12 +161,14 @@ TEST(EnvoyBugDeathTest, VariousLogs) {
 
   EXPECT_ENVOY_BUG({ ENVOY_BUG(false, ""); }, "envoy bug failure: false.");
   EXPECT_ENVOY_BUG({ ENVOY_BUG(false, ""); }, "envoy bug failure: false.");
-  EXPECT_ENVOY_BUG({ ENVOY_BUG(false, "With some logs"); },
-                   "envoy bug failure: false. Details: With some logs");
+  EXPECT_ENVOY_BUG(
+      { ENVOY_BUG(false, "With some logs"); }, "envoy bug failure: false. Details: With some logs");
+  EXPECT_ENVOY_BUG({ ENVOY_BUG(false, ""); }, "stacktrace for envoy bug");
+  EXPECT_ENVOY_BUG({ ENVOY_BUG(false, ""); }, "#0 ");
 
 #ifdef NDEBUG
-  EXPECT_EQ(3, envoy_bug_fail_count);
-  EXPECT_EQ(3, envoy_bug_fail_count2);
+  EXPECT_EQ(5, envoy_bug_fail_count);
+  EXPECT_EQ(5, envoy_bug_fail_count2);
   // Reset envoy bug count to simplify testing exponential back-off below.
   envoy_bug_fail_count = 0;
   envoy_bug_fail_count2 = 0;
@@ -139,8 +221,8 @@ TEST(SlowAssertTest, TestSlowAssertInFastAssertInReleaseMode) {
 #ifndef NDEBUG
   EXPECT_DEATH({ SLOW_ASSERT(0); }, ".*assert failure: 0.*");
   EXPECT_DEATH({ SLOW_ASSERT(0, ""); }, ".*assert failure: 0.*");
-  EXPECT_DEATH({ SLOW_ASSERT(0, "With some logs"); },
-               ".*assert failure: 0. Details: With some logs.*");
+  EXPECT_DEATH(
+      { SLOW_ASSERT(0, "With some logs"); }, ".*assert failure: 0. Details: With some logs.*");
   expected_counted_failures = 0;
 #elif defined(ENVOY_LOG_DEBUG_ASSERT_IN_RELEASE)
   // SLOW_ASSERTs are included in ENVOY_LOG_DEBUG_ASSERT_IN_RELEASE

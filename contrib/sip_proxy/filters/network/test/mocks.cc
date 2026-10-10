@@ -1,6 +1,7 @@
 #include "contrib/sip_proxy/filters/network/test/mocks.h"
 
 #include <memory>
+#include <optional>
 
 #include "source/common/protobuf/protobuf.h"
 
@@ -12,9 +13,9 @@ using testing::ReturnRef;
 
 namespace Envoy {
 
-// Provide a specialization for ProtobufWkt::Struct (for MockFilterConfigFactory)
+// Provide a specialization for Protobuf::Struct (for MockFilterConfigFactory)
 template <>
-void MessageUtil::validate(const ProtobufWkt::Struct&, ProtobufMessage::ValidationVisitor&) {}
+void MessageUtil::validate(const Protobuf::Struct&, ProtobufMessage::ValidationVisitor&, bool) {}
 
 namespace Extensions {
 namespace NetworkFilters {
@@ -23,11 +24,7 @@ namespace SipProxy {
 MockConfig::MockConfig() = default;
 MockConfig::~MockConfig() = default;
 
-MockDecoderCallbacks::MockDecoderCallbacks() {
-  ON_CALL(*this, getLocalIp()).WillByDefault(Return("127.0.0.1"));
-  ON_CALL(*this, getOwnDomain()).WillByDefault(Return("pcsf-cfed.cncs.svc.cluster.local"));
-  ON_CALL(*this, getDomainMatchParamName()).WillByDefault(Return("x-suri"));
-}
+MockDecoderCallbacks::MockDecoderCallbacks() = default;
 MockDecoderCallbacks::~MockDecoderCallbacks() = default;
 
 MockDecoderEventHandler::MockDecoderEventHandler() {
@@ -51,11 +48,13 @@ MockDecoderFilter::MockDecoderFilter() {
 }
 MockDecoderFilter::~MockDecoderFilter() = default;
 
-MockDecoderFilterCallbacks::MockDecoderFilterCallbacks() {
+MockDecoderFilterCallbacks::MockDecoderFilterCallbacks()
+    : stats_(SipFilterStats::generateStats("test", *store_.rootScope())) {
 
   ON_CALL(*this, streamId()).WillByDefault(Return(stream_id_));
   ON_CALL(*this, transactionInfos()).WillByDefault(Return(transaction_infos_));
-  ON_CALL(*this, streamInfo()).WillByDefault(ReturnRef(stream_info_));
+  ON_CALL(*this, streamInfo()).WillByDefault(ReturnRef(connection_.stream_info_));
+  ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
 }
 MockDecoderFilterCallbacks::~MockDecoderFilterCallbacks() = default;
 
@@ -70,7 +69,7 @@ FilterFactoryCb MockFilterConfigFactory::createFilterFactoryFromProto(
     Server::Configuration::FactoryContext& context) {
   UNREFERENCED_PARAMETER(context);
 
-  config_struct_ = dynamic_cast<const ProtobufWkt::Struct&>(proto_config);
+  config_struct_ = dynamic_cast<const Protobuf::Struct&>(proto_config);
   config_stat_prefix_ = stats_prefix;
 
   return [this](FilterChainFactoryCallbacks& callbacks) -> void {
@@ -91,6 +90,25 @@ MockRoute::MockRoute() { ON_CALL(*this, routeEntry()).WillByDefault(Return(&rout
 MockRoute::~MockRoute() = default;
 
 } // namespace Router
+
+MockConnectionManager::~MockConnectionManager() = default;
+
+MockTrafficRoutingAssistantHandler::MockTrafficRoutingAssistantHandler(
+    ConnectionManager& parent, Event::Dispatcher& dispatcher,
+    const envoy::extensions::filters::network::sip_proxy::tra::v3alpha::TraServiceConfig& config,
+    Server::Configuration::FactoryContext& context, StreamInfo::StreamInfoImpl& stream_info)
+    : TrafficRoutingAssistantHandler(parent, dispatcher, config, context, stream_info) {
+  ON_CALL(*this, retrieveTrafficRoutingAssistant(_, _, _, _, _))
+      .WillByDefault(
+          Invoke([&](const std::string&, const std::string&, const std::optional<TraContextMap>,
+                     SipFilters::DecoderFilterCallbacks&, std::string& host) -> QueryStatus {
+            host = "10.0.0.11";
+            return QueryStatus::Continue;
+          }));
+}
+
+MockTrafficRoutingAssistantHandler::~MockTrafficRoutingAssistantHandler() = default;
+
 } // namespace SipProxy
 } // namespace NetworkFilters
 } // namespace Extensions

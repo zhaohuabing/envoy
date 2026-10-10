@@ -8,7 +8,7 @@
 
 #include "source/common/common/matchers.h"
 #include "source/common/protobuf/protobuf.h"
-#include "source/common/stats/symbol_table_impl.h"
+#include "source/common/stats/symbol_table.h"
 
 #include "absl/strings/string_view.h"
 
@@ -20,8 +20,11 @@ namespace Stats {
  */
 class StatsMatcherImpl : public StatsMatcher {
 public:
-  StatsMatcherImpl(const envoy::config::metrics::v3::StatsConfig& config,
-                   SymbolTable& symbol_table);
+  StatsMatcherImpl(const envoy::config::metrics::v3::StatsConfig& config, SymbolTable& symbol_table,
+                   Server::Configuration::CommonFactoryContext& context)
+      : StatsMatcherImpl(config.stats_matcher(), symbol_table, context) {}
+  StatsMatcherImpl(const envoy::config::metrics::v3::StatsMatcher& stats_matcher,
+                   SymbolTable& symbol_table, Server::Configuration::CommonFactoryContext& context);
 
   // Default constructor simply allows everything.
   StatsMatcherImpl() = default;
@@ -52,7 +55,7 @@ private:
   OptRef<SymbolTable> symbol_table_;
   std::unique_ptr<StatNamePool> stat_name_pool_;
 
-  std::vector<Matchers::StringMatcherImpl<envoy::type::matcher::v3::StringMatcher>> matchers_;
+  std::vector<Matchers::StringMatcherImpl> matchers_;
   std::vector<StatName> prefixes_;
 };
 

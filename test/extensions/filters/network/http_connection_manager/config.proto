@@ -11,3 +11,12 @@ message UnknownRequestIDExtension {
 
 message FilterDependencyTestFilter {
 }
+
+message PantryFilterConfig {
+}
+
+message ChefFilterConfig {
+}
+
+message CustomHeaderValidator {
+}

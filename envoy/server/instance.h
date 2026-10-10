@@ -1,36 +1,52 @@
 #pragma once
 
 #include <chrono>
-#include <cstdint>
-#include <string>
+#include <ctime>
+#include <memory>
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/api/api.h"
 #include "envoy/common/mutex_tracer.h"
-#include "envoy/common/random_generator.h"
+#include "envoy/common/optref.h"
+#include "envoy/common/pure.h"
+#include "envoy/common/time.h"
 #include "envoy/config/trace/v3/http_tracer.pb.h"
+#include "envoy/config/xds_manager.h"
 #include "envoy/event/timer.h"
 #include "envoy/grpc/context.h"
 #include "envoy/http/context.h"
+#include "envoy/http/http_server_properties_cache.h"
 #include "envoy/init/manager.h"
 #include "envoy/local_info/local_info.h"
-#include "envoy/network/listen_socket.h"
+#include "envoy/network/connection_handler.h"
+#include "envoy/network/dns.h"
+#include "envoy/protobuf/message_validator.h"
+#include "envoy/router/context.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/secret/secret_manager.h"
 #include "envoy/server/admin.h"
 #include "envoy/server/configuration.h"
 #include "envoy/server/drain_manager.h"
+#include "envoy/server/factory_context.h"
 #include "envoy/server/hot_restart.h"
 #include "envoy/server/lifecycle_notifier.h"
 #include "envoy/server/listener_manager.h"
 #include "envoy/server/options.h"
 #include "envoy/server/overload/overload_manager.h"
+#include "envoy/server/process_context.h"
+#include "envoy/singleton/manager.h"
 #include "envoy/ssl/context_manager.h"
+#include "envoy/ssl/private_key/private_key.h"
+#include "envoy/stats/store.h"
 #include "envoy/thread_local/thread_local.h"
-#include "envoy/tracing/http_tracer.h"
 #include "envoy/upstream/cluster_manager.h"
 
 namespace Envoy {
+
+namespace Stats {
+class SinkPredicates;
+}
+
 namespace Server {
 
 /**
@@ -41,9 +57,14 @@ public:
   virtual ~Instance() = default;
 
   /**
-   * @return Admin& the global HTTP admin endpoint for the server.
+   * Runs the server.
    */
-  virtual Admin& admin() PURE;
+  virtual void run() PURE;
+
+  /**
+   * @return OptRef<Admin> the global HTTP admin endpoint for the server.
+   */
+  virtual OptRef<Admin> admin() PURE;
 
   /**
    * @return Api::Api& the API used by the server.
@@ -54,6 +75,16 @@ public:
    * @return Upstream::ClusterManager& singleton for use by the entire server.
    */
   virtual Upstream::ClusterManager& clusterManager() PURE;
+
+  /**
+   * @return const Upstream::ClusterManager& singleton for use by the entire server.
+   */
+  virtual const Upstream::ClusterManager& clusterManager() const PURE;
+
+  /**
+   * @return const Http::HttpServerPropertiesCacheManager& instance for use by the entire server.
+   */
+  virtual Http::HttpServerPropertiesCacheManager& httpServerPropertiesCacheManager() PURE;
 
   /**
    * @return Ssl::ContextManager& singleton for use by the entire server.
@@ -73,8 +104,10 @@ public:
 
   /**
    * Close the server's listening sockets and begin draining the listeners.
+   * @param options - if provided, options are passed through to shutdownListener.
    */
-  virtual void drainListeners() PURE;
+  virtual void
+  drainListeners(OptRef<const Network::ExtraShutdownListenerOptions> options = std::nullopt) PURE;
 
   /**
    * @return DrainManager& singleton for use by the entire server.
@@ -125,6 +158,11 @@ public:
    * @return the server's overload manager.
    */
   virtual OverloadManager& overloadManager() PURE;
+
+  /**
+   * @return the server's null overload manager in case we want to skip overloading the server.
+   */
+  virtual OverloadManager& nullOverloadManager() PURE;
 
   /**
    * @return the server's secret manager
@@ -231,9 +269,20 @@ public:
   virtual ProtobufMessage::ValidationContext& messageValidationContext() PURE;
 
   /**
+   * @return ProtobufMessage::ValidationVisitor& validation visitor for configuration
+   *         messages.
+   */
+  virtual ProtobufMessage::ValidationVisitor& messageValidationVisitor() PURE;
+
+  /**
    * @return const StatsConfig& the configuration of server stats.
    */
   virtual Configuration::StatsConfig& statsConfig() PURE;
+
+  /**
+   * @return the server regex engine.
+   */
+  virtual Regex::Engine& regexEngine() PURE;
 
   /**
    * @return envoy::config::bootstrap::v3::Bootstrap& the servers bootstrap configuration.
@@ -269,6 +318,23 @@ public:
    * TODO(mattklein123): This can be removed when version 1.20.0 is no longer supported.
    */
   virtual bool enableReusePortDefault() PURE;
+
+  /**
+   * Set predicates for filtering stats to be flushed to sinks.
+   */
+  virtual void
+  setSinkPredicates(std::unique_ptr<Envoy::Stats::SinkPredicates>&& sink_predicates) PURE;
+
+  /**
+   * @return Envoy's xDS manager.
+   */
+  virtual Config::XdsManager& xdsManager() PURE;
+};
+
+// Pick a class HdsDelegate inherits from
+class HdsDelegateApi : public Logger::Loggable<Logger::Id::upstream> {
+public:
+  virtual ~HdsDelegateApi() = default;
 };
 
 } // namespace Server

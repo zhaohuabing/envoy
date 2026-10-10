@@ -1,3 +1,5 @@
+#include <optional>
+
 #include "test/test_common/utility.h"
 
 #include "contrib/kafka/filters/network/source/tagged_fields.h"
@@ -41,6 +43,8 @@ TEST_EmptyDeserializerShouldNotBeReady(BytesDeserializer);
 TEST_EmptyDeserializerShouldNotBeReady(CompactBytesDeserializer);
 TEST_EmptyDeserializerShouldNotBeReady(NullableBytesDeserializer);
 TEST_EmptyDeserializerShouldNotBeReady(NullableCompactBytesDeserializer);
+using ExampleNullableStructDeserializer = NullableStructDeserializer<Int8Deserializer>;
+TEST_EmptyDeserializerShouldNotBeReady(ExampleNullableStructDeserializer);
 TEST_EmptyDeserializerShouldNotBeReady(UuidDeserializer);
 
 TEST(ArrayDeserializer, EmptyBufferShouldNotBeReady) {
@@ -304,7 +308,7 @@ TEST(NullableStringDeserializer, ShouldDeserializeEmptyString) {
 
 TEST(NullableStringDeserializer, ShouldDeserializeAbsentString) {
   // given
-  const NullableString value = absl::nullopt;
+  const NullableString value = std::nullopt;
   serializeThenDeserializeAndCheckEquality<NullableStringDeserializer>(value);
 }
 
@@ -339,7 +343,7 @@ TEST(NullableCompactStringDeserializer, ShouldDeserializeEmptyString) {
 
 TEST(NullableCompactStringDeserializer, ShouldDeserializeAbsentString) {
   // given
-  const NullableString value = absl::nullopt;
+  const NullableString value = std::nullopt;
   serializeCompactThenDeserializeAndCheckEquality<NullableCompactStringDeserializer>(value);
 }
 
@@ -411,7 +415,7 @@ TEST(NullableBytesDeserializer, ShouldDeserializeEmptyBytes) {
 }
 
 TEST(NullableBytesDeserializer, ShouldDeserializeNullBytes) {
-  const NullableBytes value = absl::nullopt;
+  const NullableBytes value = std::nullopt;
   serializeThenDeserializeAndCheckEquality<NullableBytesDeserializer>(value);
 }
 
@@ -443,7 +447,7 @@ TEST(NullableCompactBytesDeserializer, ShouldDeserializeEmptyBytes) {
 }
 
 TEST(NullableCompactBytesDeserializer, ShouldDeserializeNullBytes) {
-  const NullableBytes value = absl::nullopt;
+  const NullableBytes value = std::nullopt;
   serializeCompactThenDeserializeAndCheckEquality<NullableCompactBytesDeserializer>(value);
 }
 
@@ -500,7 +504,7 @@ TEST(NullableArrayDeserializer, ShouldConsumeCorrectAmountOfData) {
 }
 
 TEST(NullableArrayDeserializer, ShouldConsumeNullArray) {
-  const NullableArray<std::string> value = absl::nullopt;
+  const NullableArray<std::string> value = std::nullopt;
   serializeThenDeserializeAndCheckEquality<NullableArrayDeserializer<StringDeserializer>>(value);
 }
 
@@ -528,7 +532,7 @@ TEST(NullableCompactArrayDeserializer, ShouldConsumeCorrectAmountOfData) {
 }
 
 TEST(NullableCompactArrayDeserializer, ShouldConsumeNullArray) {
-  const NullableArray<int32_t> value = absl::nullopt;
+  const NullableArray<int32_t> value = std::nullopt;
   serializeCompactThenDeserializeAndCheckEquality<
       NullableCompactArrayDeserializer<Int32Deserializer>>(value);
 }
@@ -542,6 +546,20 @@ TEST(NullableCompactArrayDeserializer, ShouldConsumeCorrectAmountOfDataForLargeI
   const NullableArray<int32_t> value{raw};
   serializeCompactThenDeserializeAndCheckEquality<
       NullableCompactArrayDeserializer<Int32Deserializer>>(value);
+}
+
+// Nullable struct.
+
+using ExampleNSD = NullableStructDeserializer<Int32Deserializer>;
+
+TEST(NullableStructDeserializer, ShouldConsumeCorrectAmountOfData) {
+  const ExampleNSD::ResponseType value = {42};
+  serializeThenDeserializeAndCheckEquality<ExampleNSD>(value);
+}
+
+TEST(NullableStructDeserializer, ShouldConsumeNullStruct) {
+  const ExampleNSD::ResponseType value = std::nullopt;
+  serializeThenDeserializeAndCheckEquality<ExampleNSD>(value);
 }
 
 // UUID.
@@ -558,14 +576,135 @@ TEST(TaggedFieldDeserializer, ShouldConsumeCorrectAmountOfData) {
   serializeCompactThenDeserializeAndCheckEquality<TaggedFieldDeserializer>(value);
 }
 
+TEST(TaggedFieldDeserializer, ShouldConsumeEmptyData) {
+  const TaggedField value{0, Bytes{}};
+  serializeCompactThenDeserializeAndCheckEquality<TaggedFieldDeserializer>(value);
+}
+
+TEST(TaggedFieldDeserializer, ShouldConsumeDataInChunks) {
+  const TaggedField value{42, Bytes{10, 20, 30, 40, 50}};
+  serializeCompactThenDeserializeAndCheckEqualityWithChunks<TaggedFieldDeserializer>(value);
+}
+
+TEST(TaggedFieldDeserializer, ShouldThrowOnExcessiveDataLength) {
+  // given
+  TaggedFieldDeserializer testee;
+  Buffer::OwnedImpl buffer;
+
+  const uint32_t tag = 0;
+  encoder.encodeCompact(tag, buffer);
+  const uint32_t oversized_length = TaggedFieldDeserializer::MAX_TAGGED_FIELD_DATA_SIZE + 1;
+  encoder.encodeCompact(oversized_length, buffer);
+
+  absl::string_view data = {getRawData(buffer), buffer.length()};
+
+  // when, then
+  EXPECT_THROW_WITH_REGEX(testee.feed(data), EnvoyException, "exceeds maximum allowed");
+}
+
+TEST(TaggedFieldDeserializer, ShouldAcceptDataLengthAtLimit) {
+  // given
+  TaggedFieldDeserializer testee;
+  Buffer::OwnedImpl buffer;
+
+  const uint32_t tag = 0;
+  encoder.encodeCompact(tag, buffer);
+  const uint32_t max_length = TaggedFieldDeserializer::MAX_TAGGED_FIELD_DATA_SIZE;
+  encoder.encodeCompact(max_length, buffer);
+
+  absl::string_view data = {getRawData(buffer), buffer.length()};
+
+  // when, then
+  EXPECT_NO_THROW(testee.feed(data));
+  ASSERT_EQ(testee.ready(), false);
+}
+
 TEST(TaggedFieldsDeserializer, ShouldConsumeCorrectAmountOfData) {
   std::vector<TaggedField> fields;
-  for (uint32_t i = 0; i < 200; ++i) {
+  for (uint32_t i = 0; i < 10; ++i) {
     const TaggedField tagged_field = {i, Bytes{1, 2, 3, 4}};
     fields.push_back(tagged_field);
   }
   const TaggedFields value{fields};
   serializeCompactThenDeserializeAndCheckEquality<TaggedFieldsDeserializer>(value);
+}
+
+TEST(TaggedFieldsDeserializer, ShouldConsumeZeroFields) {
+  const TaggedFields value{{}};
+  serializeCompactThenDeserializeAndCheckEquality<TaggedFieldsDeserializer>(value);
+}
+
+TEST(TaggedFieldsDeserializer, ShouldThrowOnExcessiveFieldCount) {
+  // given
+  TaggedFieldsDeserializer testee;
+  Buffer::OwnedImpl buffer;
+
+  const uint32_t oversized_count = TaggedFieldsDeserializer::MAX_TAGGED_FIELD_COUNT + 1;
+  encoder.encodeCompact(oversized_count, buffer);
+
+  absl::string_view data = {getRawData(buffer), buffer.length()};
+
+  // when, then
+  EXPECT_THROW_WITH_REGEX(testee.feed(data), EnvoyException, "exceeds maximum allowed");
+}
+
+TEST(TaggedFieldsDeserializer, ShouldAcceptFieldCountAtLimit) {
+  // given
+  TaggedFieldsDeserializer testee;
+  Buffer::OwnedImpl buffer;
+
+  const uint32_t max_count = TaggedFieldsDeserializer::MAX_TAGGED_FIELD_COUNT;
+  encoder.encodeCompact(max_count, buffer);
+
+  absl::string_view data = {getRawData(buffer), buffer.length()};
+
+  // when, then
+  EXPECT_NO_THROW(testee.feed(data));
+  ASSERT_EQ(testee.ready(), false);
+}
+
+// Just a helper to write shorter tests.
+template <typename T> Bytes toBytes(uint32_t fn(const T arg, Bytes& out), const T arg) {
+  Bytes res;
+  fn(arg, res);
+  return res;
+}
+
+TEST(VarlenUtils, ShouldEncodeUnsignedVarInt) {
+  const auto testee = VarlenUtils::writeUnsignedVarint;
+  ASSERT_EQ(toBytes<uint32_t>(testee, 0), Bytes({0x00}));
+  ASSERT_EQ(toBytes<uint32_t>(testee, 1), Bytes({0x01}));
+  ASSERT_EQ(toBytes<uint32_t>(testee, 127), Bytes({0x7f}));
+  ASSERT_EQ(toBytes<uint32_t>(testee, 128), Bytes({0x80, 0x01}));
+  ASSERT_EQ(toBytes<uint32_t>(testee, 2147483647), Bytes({0xFF, 0xFF, 0xFF, 0xFF, 0x07}));
+  ASSERT_EQ(toBytes<uint32_t>(testee, std::numeric_limits<uint32_t>::max()),
+            Bytes({0xFF, 0xFF, 0xFF, 0xFF, 0x0F}));
+}
+
+TEST(VarlenUtils, ShouldEncodeSignedVarInt) {
+  const auto testee = VarlenUtils::writeVarint;
+  ASSERT_EQ(toBytes<int32_t>(testee, 0), Bytes({0x00}));
+  ASSERT_EQ(toBytes<int32_t>(testee, 1), Bytes({0x02}));
+  ASSERT_EQ(toBytes<int32_t>(testee, 63), Bytes({0x7e}));
+  ASSERT_EQ(toBytes<int32_t>(testee, 64), Bytes({0x80, 0x01}));
+  ASSERT_EQ(toBytes<int32_t>(testee, -1), Bytes({0x01}));
+  ASSERT_EQ(toBytes<int32_t>(testee, std::numeric_limits<int32_t>::min()),
+            Bytes({0xFF, 0xFF, 0xFF, 0xFF, 0x0F}));
+  ASSERT_EQ(toBytes<int32_t>(testee, std::numeric_limits<int32_t>::max()),
+            Bytes({0xFE, 0xFF, 0xFF, 0xFF, 0x0F}));
+}
+
+TEST(VarlenUtils, ShouldEncodeVarLong) {
+  const auto testee = VarlenUtils::writeVarlong;
+  ASSERT_EQ(toBytes<int64_t>(testee, 0), Bytes({0x00}));
+  ASSERT_EQ(toBytes<int64_t>(testee, 1), Bytes({0x02}));
+  ASSERT_EQ(toBytes<int64_t>(testee, 63), Bytes({0x7e}));
+  ASSERT_EQ(toBytes<int64_t>(testee, 64), Bytes({0x80, 0x01}));
+  ASSERT_EQ(toBytes<int64_t>(testee, -1), Bytes({0x01}));
+  ASSERT_EQ(toBytes<int64_t>(testee, std::numeric_limits<int64_t>::min()),
+            Bytes({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}));
+  ASSERT_EQ(toBytes<int64_t>(testee, std::numeric_limits<int64_t>::max()),
+            Bytes({0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}));
 }
 
 } // namespace SerializationTest

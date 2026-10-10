@@ -6,8 +6,6 @@
 #include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
 #include "test/test_common/simulated_time_system.h"
-#include "test/test_common/test_runtime.h"
-#include "test/test_common/utility.h"
 
 #include "event2/event.h"
 #include "gtest/gtest.h"
@@ -20,7 +18,8 @@ namespace {
 class SimulatedTimeSystemTest : public testing::Test {
 protected:
   SimulatedTimeSystemTest()
-      : scheduler_(time_system_.createScheduler(base_scheduler_, base_scheduler_)),
+      : base_scheduler_(time_system_),
+        scheduler_(time_system_.createScheduler(base_scheduler_, base_scheduler_)),
         start_monotonic_time_(time_system_.monotonicTime()),
         start_system_time_(time_system_.systemTime()) {}
 
@@ -29,8 +28,7 @@ protected:
   }
 
   void addTask(int64_t delay_ms, char marker, bool expect_monotonic = true) {
-    addCustomTask(
-        delay_ms, marker, []() {}, expect_monotonic);
+    addCustomTask(delay_ms, marker, []() {}, expect_monotonic);
   }
 
   void addCustomTask(int64_t delay_ms, char marker, std::function<void()> cb,
@@ -59,10 +57,9 @@ protected:
     base_scheduler_.run(Dispatcher::RunType::NonBlock);
   }
 
-  TestScopedRuntime scoped_runtime_;
   Event::MockDispatcher dispatcher_;
-  LibeventScheduler base_scheduler_;
   SimulatedTimeSystem time_system_;
+  LibeventScheduler base_scheduler_;
   SchedulerPtr scheduler_;
   std::string output_;
   std::vector<TimerPtr> timers_;
@@ -266,7 +263,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
   auto thread = Thread::threadFactoryForTest().createThread([this, &mutex, &done]() {
     for (;;) {
       {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         if (done) {
           return;
         }
@@ -278,7 +275,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
 
   TimerPtr timer = scheduler_->createTimer(
       [&mutex, &done]() {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         done = true;
       },
       dispatcher_);
@@ -287,7 +284,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
   // Wait 1ms of real time. waitFor() does not advance simulated time, so this is just going to
   // verify that we return quickly and nothing has fired.
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_FALSE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::milliseconds(1)));
   }
   EXPECT_FALSE(done);
@@ -296,7 +293,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
   // Fire the timeout by advancing time and then verify that waitFor() returns without any timeout.
   time_system_.advanceTimeWait(std::chrono::seconds(60));
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_TRUE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_TRUE(done);
@@ -307,7 +304,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
   // the max duration and return a timeout.
   done = false;
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_FALSE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_FALSE(done);
@@ -420,7 +417,7 @@ TEST_F(SimulatedTimeSystemTest, DuplicateTimer2) {
   auto thread = Thread::threadFactoryForTest().createThread([this, &mutex, &done]() {
     for (;;) {
       {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         if (done) {
           return;
         }
@@ -432,21 +429,21 @@ TEST_F(SimulatedTimeSystemTest, DuplicateTimer2) {
 
   TimerPtr timer = scheduler_->createTimer(
       [&mutex, &done]() {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         done = true;
       },
       dispatcher_);
   timer->enableTimer(std::chrono::seconds(10));
 
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_FALSE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_FALSE(done);
 
   time_system_.advanceTimeWait(std::chrono::seconds(10));
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_TRUE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_TRUE(done);

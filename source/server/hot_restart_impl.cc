@@ -96,9 +96,11 @@ void initializeMutex(pthread_mutex_t& mutex) {
 // TODO(zuercher): ideally, the base_id would be separated from the restart_epoch in
 // the socket names to entirely prevent collisions between consecutive base ids.
 HotRestartImpl::HotRestartImpl(uint32_t base_id, uint32_t restart_epoch,
-                               const std::string& socket_path, mode_t socket_mode)
+                               const std::string& socket_path, mode_t socket_mode,
+                               bool skip_hot_restart_on_no_parent, bool skip_parent_stats)
     : base_id_(base_id), scaled_base_id_(base_id * 10),
-      as_child_(HotRestartingChild(scaled_base_id_, restart_epoch, socket_path, socket_mode)),
+      as_child_(HotRestartingChild(scaled_base_id_, restart_epoch, socket_path, socket_mode,
+                                   skip_hot_restart_on_no_parent, skip_parent_stats)),
       as_parent_(HotRestartingParent(scaled_base_id_, restart_epoch, socket_path, socket_mode)),
       shmem_(attachSharedMemory(scaled_base_id_, restart_epoch)), log_lock_(shmem_->log_lock_),
       access_log_lock_(shmem_->access_log_lock_) {
@@ -114,15 +116,31 @@ void HotRestartImpl::drainParentListeners() {
   shmem_->flags_ &= ~SHMEM_FLAGS_INITIALIZING;
 }
 
-int HotRestartImpl::duplicateParentListenSocket(const std::string& address, uint32_t worker_index) {
-  return as_child_.duplicateParentListenSocket(address, worker_index);
+bool HotRestartImpl::parentStopAcceptingRequested() {
+  return as_child_.parentStopAcceptingRequested();
+}
+
+int HotRestartImpl::duplicateParentListenSocket(const std::string& address, uint32_t worker_index,
+                                                absl::string_view network_namespace) {
+  return as_child_.duplicateParentListenSocket(address, worker_index, network_namespace);
+}
+
+void HotRestartImpl::registerUdpForwardingListener(
+    Network::Address::InstanceConstSharedPtr address,
+    std::shared_ptr<Network::UdpListenerConfig> listener_config) {
+  as_child_.registerUdpForwardingListener(address, listener_config);
+}
+
+OptRef<Network::ParentDrainedCallbackRegistrar> HotRestartImpl::parentDrainedCallbackRegistrar() {
+  return as_child_;
 }
 
 void HotRestartImpl::initialize(Event::Dispatcher& dispatcher, Server::Instance& server) {
   as_parent_.initialize(dispatcher, server);
+  as_child_.initialize(dispatcher);
 }
 
-absl::optional<HotRestart::AdminShutdownResponse> HotRestartImpl::sendParentAdminShutdownRequest() {
+std::optional<HotRestart::AdminShutdownResponse> HotRestartImpl::sendParentAdminShutdownRequest() {
   return as_child_.sendParentAdminShutdownRequest();
 }
 
@@ -141,10 +159,17 @@ HotRestartImpl::mergeParentStatsIfAny(Stats::StoreRoot& stats_store) {
   return response;
 }
 
-void HotRestartImpl::shutdown() { as_parent_.shutdown(); }
+void HotRestartImpl::shutdown() {
+  as_parent_.shutdown();
+  as_child_.shutdown();
+}
 
 uint32_t HotRestartImpl::baseId() { return base_id_; }
 std::string HotRestartImpl::version() { return hotRestartVersion(); }
+
+bool HotRestartImpl::isInitializing() const {
+  return (shmem_->flags_.load() & SHMEM_FLAGS_INITIALIZING) != 0;
+}
 
 std::string HotRestartImpl::hotRestartVersion() {
   return fmt::format("{}.{}", HOT_RESTART_VERSION, sizeof(SharedMemory));

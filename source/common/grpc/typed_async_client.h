@@ -6,6 +6,7 @@
 #include "envoy/grpc/async_client.h"
 
 #include "source/common/common/empty_string.h"
+#include "source/common/protobuf/arena_wrapped_proto.h"
 
 namespace Envoy {
 namespace Grpc {
@@ -15,8 +16,7 @@ namespace Internal {
  * Forward declarations for helper functions.
  */
 void sendMessageUntyped(RawAsyncStream* stream, const Protobuf::Message& request, bool end_stream);
-ProtobufTypes::MessagePtr parseMessageUntyped(ProtobufTypes::MessagePtr&& message,
-                                              Buffer::InstancePtr&& response);
+bool parseMessageUntyped(Protobuf::Message& message, Buffer::InstancePtr&& response);
 RawAsyncStream* startUntyped(RawAsyncClient* client,
                              const Protobuf::MethodDescriptor& service_method,
                              RawAsyncStreamCallbacks& callbacks,
@@ -35,15 +35,22 @@ template <typename Request> class AsyncStream /* : public RawAsyncStream */ {
 public:
   AsyncStream() = default;
   AsyncStream(RawAsyncStream* stream) : stream_(stream) {}
-  AsyncStream(const AsyncStream& other) = default;
   void sendMessage(const Protobuf::Message& request, bool end_stream) {
     Internal::sendMessageUntyped(stream_, std::move(request), end_stream);
   }
   void closeStream() { stream_->closeStream(); }
   void resetStream() { stream_->resetStream(); }
+  void waitForRemoteCloseAndDelete() { stream_->waitForRemoteCloseAndDelete(); }
   bool isAboveWriteBufferHighWatermark() const {
     return stream_->isAboveWriteBufferHighWatermark();
   }
+
+  void setWatermarkCallbacks(Http::SidestreamWatermarkCallbacks& callbacks) {
+    stream_->setWatermarkCallbacks(callbacks);
+  }
+
+  void removeWatermarkCallbacks() { stream_->removeWatermarkCallbacks(); }
+
   AsyncStream* operator->() { return this; }
   AsyncStream<Request> operator=(RawAsyncStream* stream) {
     stream_ = stream;
@@ -51,12 +58,14 @@ public:
   }
   bool operator==(RawAsyncStream* stream) const { return stream_ == stream; }
   bool operator!=(RawAsyncStream* stream) const { return stream_ != stream; }
+  const StreamInfo::StreamInfo& streamInfo() const { return stream_->streamInfo(); }
+  StreamInfo::StreamInfo& streamInfo() { return stream_->streamInfo(); }
 
 private:
   RawAsyncStream* stream_{};
 };
 
-template <typename Response> using ResponsePtr = std::unique_ptr<Response>;
+template <typename Response> using ResponsePtr = ArenaWrappedProto<Response>;
 
 /**
  * Convenience subclasses for AsyncRequestCallbacks.
@@ -68,10 +77,8 @@ public:
 
 private:
   void onSuccessRaw(Buffer::InstancePtr&& response, Tracing::Span& span) override {
-    auto message = ResponsePtr<Response>(dynamic_cast<Response*>(
-        Internal::parseMessageUntyped(std::make_unique<Response>(), std::move(response))
-            .release()));
-    if (!message) {
+    ResponsePtr<Response> message;
+    if (!Internal::parseMessageUntyped(*message, std::move(response))) {
       onFailure(Status::WellKnownGrpcStatus::Internal, "", span);
       return;
     }
@@ -89,10 +96,8 @@ public:
 
 private:
   bool onReceiveMessageRaw(Buffer::InstancePtr&& response) override {
-    auto message = ResponsePtr<Response>(dynamic_cast<Response*>(
-        Internal::parseMessageUntyped(std::make_unique<Response>(), std::move(response))
-            .release()));
-    if (!message) {
+    ResponsePtr<Response> message;
+    if (!Internal::parseMessageUntyped(*message, std::move(response))) {
       return false;
     }
     onReceiveMessage(std::move(message));
@@ -104,7 +109,8 @@ template <typename Request, typename Response> class AsyncClient /* : public Raw
 public:
   AsyncClient() = default;
   AsyncClient(RawAsyncClientPtr&& client) : client_(std::move(client)) {}
-  AsyncClient(RawAsyncClientSharedPtr client) : client_(client) {}
+  AsyncClient(const RawAsyncClientSharedPtr& client) : client_(client) {}
+  AsyncClient(RawAsyncClientSharedPtr&& client) : client_(std::move(client)) {}
   virtual ~AsyncClient() = default;
 
   virtual AsyncRequest* send(const Protobuf::MethodDescriptor& service_method,
@@ -122,12 +128,14 @@ public:
         Internal::startUntyped(client_.get(), service_method, callbacks, options));
   }
 
+  absl::string_view destination() { return client_->destination(); }
+
   AsyncClient* operator->() { return this; }
   void operator=(RawAsyncClientPtr&& client) { client_ = std::move(client); }
   void reset() { client_.reset(); }
 
 private:
-  RawAsyncClientSharedPtr client_{};
+  RawAsyncClientSharedPtr client_;
 };
 
 } // namespace Grpc

@@ -1,9 +1,15 @@
 #pragma once
 
+#include <optional>
+
 #include "envoy/compression/compressor/factory.h"
 #include "envoy/extensions/filters/http/compressor/v3/compressor.pb.h"
+#include "envoy/server/factory_context.h"
 #include "envoy/stats/stats_macros.h"
+#include "envoy/type/matcher/v3/string.pb.h"
 
+#include "source/common/common/logger.h"
+#include "source/common/common/matchers.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/runtime/runtime_protos.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
@@ -34,9 +40,6 @@ namespace Compressor {
  *
  * "header_compressor_overshadowed" is a number of requests skipped by this filter instance because
  * they were handled by another filter in the same filter chain.
- *
- * "header_gzip" is specific to the gzip filter and is deprecated since it duplicates
- * "header_compressor_used".
  */
 #define RESPONSE_COMPRESSOR_STATS(COUNTER)                                                         \
   COUNTER(no_accept_header)                                                                        \
@@ -67,17 +70,18 @@ public:
     DirectionConfig(
         const envoy::extensions::filters::http::compressor::v3::Compressor::CommonDirectionConfig&
             proto_config,
-        const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime);
+        const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime,
+        Server::Configuration::CommonFactoryContext& context);
 
     virtual ~DirectionConfig() = default;
 
     virtual bool compressionEnabled() const PURE;
 
     const CompressorStats& stats() const { return stats_; }
-    const StringUtil::CaseUnorderedSet& contentTypeValues() const { return content_type_values_; }
     uint32_t minimumLength() const { return min_content_length_; }
     bool isMinimumContentLength(const Http::RequestOrResponseHeaderMap& headers) const;
     bool isContentTypeAllowed(const Http::RequestOrResponseHeaderMap& headers) const;
+    bool isContentTypeAllowed(absl::string_view normalized_content_type) const;
 
   protected:
     const Runtime::FeatureFlag compression_enabled_;
@@ -90,10 +94,14 @@ public:
     static uint32_t contentLengthUint(Protobuf::uint32 length);
 
     static StringUtil::CaseUnorderedSet
-    contentTypeSet(const Protobuf::RepeatedPtrField<std::string>& types);
+    contentTypeSet(const Protobuf::RepeatedPtrField<std::string>& types, bool has_matchers);
+    static std::vector<Matchers::StringMatcherPtr> contentTypeMatcherList(
+        const Protobuf::RepeatedPtrField<std::string>& content_types,
+        const Protobuf::RepeatedPtrField<envoy::type::matcher::v3::StringMatcher>& matchers,
+        Server::Configuration::CommonFactoryContext& context);
 
     const uint32_t min_content_length_;
-    const StringUtil::CaseUnorderedSet content_type_values_;
+    const std::vector<Matchers::StringMatcherPtr> content_type_matchers_;
     const CompressorStats stats_;
   };
 
@@ -101,7 +109,8 @@ public:
   public:
     RequestDirectionConfig(
         const envoy::extensions::filters::http::compressor::v3::Compressor& proto_config,
-        const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime);
+        const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime,
+        Server::Configuration::CommonFactoryContext& context);
 
     bool compressionEnabled() const override { return is_set_ && compression_enabled_.enabled(); }
 
@@ -113,12 +122,17 @@ public:
   public:
     ResponseDirectionConfig(
         const envoy::extensions::filters::http::compressor::v3::Compressor& proto_config,
-        const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime);
+        const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime,
+        Server::Configuration::CommonFactoryContext& context);
 
     bool compressionEnabled() const override { return compression_enabled_.enabled(); }
     const ResponseCompressorStats& responseStats() const { return response_stats_; }
     bool disableOnEtagHeader() const { return disable_on_etag_header_; }
+    bool weakenEtagOnCompress() const { return weaken_etag_on_compress_; }
     bool removeAcceptEncodingHeader() const { return remove_accept_encoding_header_; }
+    bool statusHeaderEnabled() const { return status_header_enabled_; }
+    bool areAllResponseCodesCompressible() const;
+    bool isResponseCodeCompressible(uint32_t response_code) const;
 
   private:
     static ResponseCompressorStats generateResponseStats(const std::string& prefix,
@@ -132,7 +146,10 @@ public:
     commonConfig(const envoy::extensions::filters::http::compressor::v3::Compressor&);
 
     const bool disable_on_etag_header_;
+    const bool weaken_etag_on_compress_;
     const bool remove_accept_encoding_header_;
+    const bool status_header_enabled_;
+    const absl::flat_hash_set<uint32_t> uncompressible_response_codes_;
     const ResponseCompressorStats response_stats_;
   };
 
@@ -140,13 +157,18 @@ public:
   CompressorFilterConfig(
       const envoy::extensions::filters::http::compressor::v3::Compressor& proto_config,
       const std::string& stats_prefix, Stats::Scope& scope, Runtime::Loader& runtime,
-      Envoy::Compression::Compressor::CompressorFactoryPtr compressor_factory);
+      Envoy::Compression::Compressor::CompressorFactoryPtr compressor_factory,
+      Server::Configuration::CommonFactoryContext& context);
 
   Envoy::Compression::Compressor::CompressorPtr makeCompressor();
 
   const std::string contentEncoding() const { return content_encoding_; };
+  bool chooseFirst() const { return choose_first_; };
   const RequestDirectionConfig& requestDirectionConfig() { return request_direction_config_; }
   const ResponseDirectionConfig& responseDirectionConfig() { return response_direction_config_; }
+  const Envoy::Compression::Compressor::CompressorFactory& compressorFactory() const {
+    return *compressor_factory_;
+  }
 
 private:
   const std::string common_stats_prefix_;
@@ -155,13 +177,44 @@ private:
 
   const std::string content_encoding_;
   const Envoy::Compression::Compressor::CompressorFactoryPtr compressor_factory_;
+  const bool choose_first_;
 };
 using CompressorFilterConfigSharedPtr = std::shared_ptr<CompressorFilterConfig>;
+
+class CompressorPerRouteFilterConfig : public Router::RouteSpecificFilterConfig,
+                                       public Logger::Loggable<Logger::Id::filter> {
+public:
+  CompressorPerRouteFilterConfig(
+      const envoy::extensions::filters::http::compressor::v3::CompressorPerRoute& config,
+      Server::Configuration::GenericFactoryContext& context);
+
+  // If a value is present, that value overrides
+  // ResponseDirectionConfig::compressionEnabled.
+  std::optional<bool> responseCompressionEnabled() const { return response_compression_enabled_; }
+  std::optional<bool> removeAcceptEncodingHeader() const { return remove_accept_encoding_header_; }
+
+  // Returns the per-route compressor factory if configured, nullptr otherwise.
+  const Envoy::Compression::Compressor::CompressorFactory* compressorFactory() const {
+    return compressor_factory_.get();
+  }
+
+  // Returns the content encoding for the per-route compressor if configured.
+  std::optional<std::string> contentEncoding() const {
+    return compressor_factory_ ? std::make_optional(compressor_factory_->contentEncoding())
+                               : std::nullopt;
+  }
+
+private:
+  std::optional<bool> response_compression_enabled_;
+  std::optional<bool> remove_accept_encoding_header_;
+  Envoy::Compression::Compressor::CompressorFactoryPtr compressor_factory_;
+};
 
 /**
  * A filter that compresses data dispatched from the upstream upon client request.
  */
-class CompressorFilter : public Http::PassThroughFilter {
+class CompressorFilter : public Http::PassThroughFilter,
+                         public Logger::Loggable<Logger::Id::filter> {
 public:
   explicit CompressorFilter(const CompressorFilterConfigSharedPtr config);
 
@@ -178,13 +231,39 @@ public:
   Http::FilterDataStatus encodeData(Buffer::Instance& buffer, bool end_stream) override;
   Http::FilterTrailersStatus encodeTrailers(Http::ResponseTrailerMap&) override;
 
+  // Grant testing peer access.
+  friend class CompressorFilterTestingPeer;
+
 private:
+  // Initialize and cache the most specific per-route config only once for this stream.
+  // Subsequent accesses should use the cached pointer to avoid any inconsistencies if
+  // the route is refreshed mid-stream.
+  void initPerRouteConfig();
+
+  Http::FilterHeadersStatus
+  encodeHeadersWithStatusHeader(Http::ResponseHeaderMap& headers, bool end_stream,
+                                const CompressorFilterConfig::ResponseDirectionConfig& config,
+                                const CompressorPerRouteFilterConfig* per_route_config);
+  bool compressionEnabled(const CompressorFilterConfig::ResponseDirectionConfig& config,
+                          const CompressorPerRouteFilterConfig* per_route_config) const;
+  bool removeAcceptEncodingHeader(const CompressorFilterConfig::ResponseDirectionConfig& config,
+                                  const CompressorPerRouteFilterConfig* per_route_config) const;
   bool hasCacheControlNoTransform(Http::ResponseHeaderMap& headers) const;
+  bool isAcceptEncodingAllowed(bool maybe_compress, const Http::ResponseHeaderMap& headers) const;
   bool isAcceptEncodingAllowed(const Http::ResponseHeaderMap& headers) const;
+  bool checkIsEtagAllowedLogResponseStats(Http::ResponseHeaderMap& headers) const;
   bool isEtagAllowed(Http::ResponseHeaderMap& headers) const;
   bool isTransferEncodingAllowed(Http::RequestOrResponseHeaderMap& headers) const;
 
   void sanitizeEtagHeader(Http::ResponseHeaderMap& headers);
+  void weakenEtagHeader(Http::ResponseHeaderMap& headers);
+  std::string createEnvoyCompressionStatusHeaderValue(
+      absl::string_view encoding_type, absl::string_view status_to_set,
+      std::optional<absl::string_view> original_length = std::nullopt);
+  void insertEnvoyCompressionStatusHeader(
+      Http::ResponseHeaderMap& headers, absl::string_view encoding_type,
+      absl::string_view status_to_set,
+      std::optional<absl::string_view> original_length = std::nullopt);
   void insertVaryHeader(Http::ResponseHeaderMap& headers);
 
   class EncodingDecision : public StreamInfo::FilterState::Object {
@@ -200,13 +279,30 @@ private:
     const HeaderStat stat_;
   };
 
+  struct CompressorInChain {
+    uint32_t registration_count_;
+    bool choose_first_;
+  };
+
   std::unique_ptr<EncodingDecision> chooseEncoding(const Http::ResponseHeaderMap& headers) const;
   bool shouldCompress(const EncodingDecision& decision) const;
+
+  // Returns the appropriate compressor factory for the current route.
+  // Checks for per-route config first, then falls back to main config.
+  Envoy::Compression::Compressor::CompressorFactory& getCompressorFactory() const;
+
+  // Returns the appropriate content encoding for the current route.
+  std::string getContentEncoding() const;
+
+  // Returns the request stream info (downstream or upstream depending on the filter type).
+  StreamInfo::StreamInfo& streamInfo() const;
 
   Envoy::Compression::Compressor::CompressorPtr response_compressor_;
   Envoy::Compression::Compressor::CompressorPtr request_compressor_;
   const CompressorFilterConfigSharedPtr config_;
   std::unique_ptr<std::string> accept_encoding_;
+  // Cached per-route configuration pointer, initialized once per stream.
+  const CompressorPerRouteFilterConfig* per_route_config_{};
 };
 
 } // namespace Compressor

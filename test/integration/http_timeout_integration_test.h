@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "envoy/extensions/filters/http/router/v3/router.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 
@@ -24,6 +26,7 @@ public:
   void testRouterRequestAndResponseWithHedgedPerTryTimeout(uint64_t request_size,
                                                            uint64_t response_size,
                                                            bool first_request_wins);
+  void testIsTimeoutRetryHeader(bool use_hedged_retry);
 
   void initialize() override {
     if (respect_expected_rq_timeout) {
@@ -34,7 +37,8 @@ public:
             router_config.set_respect_expected_rq_timeout(respect_expected_rq_timeout);
             // TestUtility::jsonConvert(router_config,
             // *hcm.mutable_http_filters(0)->mutable_config());
-            hcm.mutable_http_filters(0)->mutable_typed_config()->PackFrom(router_config);
+            std::ignore =
+                hcm.mutable_http_filters(0)->mutable_typed_config()->PackFrom(router_config);
           });
     }
 

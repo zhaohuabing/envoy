@@ -14,8 +14,9 @@ public:
   MockClusterUpdateCallbacks();
   ~MockClusterUpdateCallbacks() override;
 
-  MOCK_METHOD(void, onClusterAddOrUpdate, (ThreadLocalCluster & cluster));
-  MOCK_METHOD(void, onClusterRemoval, (const std::string& cluster_name));
+  MOCK_METHOD(void, onClusterAddOrUpdate,
+              (absl::string_view cluster_name, ThreadLocalClusterCommand& command));
+  MOCK_METHOD(void, onClusterRemoval, (absl::string_view cluster_name));
 };
 } // namespace Upstream
 } // namespace Envoy

@@ -31,20 +31,24 @@ public:
     return {nullptr, 0, nullptr};
   }
   Api::IoCallUint64Result flush() override {
-    return Api::IoCallUint64Result(
-        /*rc=*/0,
-        /*err=*/Api::IoErrorPtr(nullptr, Network::IoSocketError::deleteIoError));
+    return {/*rc=*/0,
+            /*err=*/Api::IoError::none()};
   }
 
+  void setBlocked() { write_blocked_ = true; }
+
+  Network::IoHandle& ioHandle() { return io_handle_; }
+
 private:
-  bool write_blocked_;
+  bool write_blocked_{false};
   Network::IoHandle& io_handle_;
 };
 
 class UdpDefaultWriterFactory : public Network::UdpPacketWriterFactory {
 public:
-  Network::UdpPacketWriterPtr createUdpPacketWriter(Network::IoHandle& io_handle,
-                                                    Stats::Scope&) override {
+  Network::UdpPacketWriterPtr createUdpPacketWriter(Network::IoHandle& io_handle, Stats::Scope&,
+                                                    Envoy::Event::Dispatcher&,
+                                                    absl::AnyInvocable<void() &&>) override {
     return std::make_unique<UdpDefaultWriter>(io_handle);
   }
 };

@@ -20,37 +20,35 @@ namespace Http {
 
 class HttpConnPool : public Router::GenericConnPool, public Envoy::Http::ConnectionPool::Callbacks {
 public:
-  // GenericConnPool
-  HttpConnPool(Upstream::ThreadLocalCluster& thread_local_cluster, bool is_connect,
-               const Router::RouteEntry& route_entry,
-               absl::optional<Envoy::Http::Protocol> downstream_protocol,
+  HttpConnPool(Upstream::HostConstSharedPtr host,
+               Upstream::ThreadLocalCluster& thread_local_cluster,
+               Upstream::ResourcePriority priority,
+               std::optional<Envoy::Http::Protocol> downstream_protocol,
                Upstream::LoadBalancerContext* ctx) {
-    ASSERT(!is_connect);
-    pool_data_ =
-        thread_local_cluster.httpConnPool(route_entry.priority(), downstream_protocol, ctx);
+    pool_data_ = thread_local_cluster.httpConnPool(host, priority, downstream_protocol, ctx);
   }
   ~HttpConnPool() override {
     ASSERT(conn_pool_stream_handle_ == nullptr, "conn_pool_stream_handle not null");
   }
+  // GenericConnPool
   void newStream(Router::GenericConnectionPoolCallbacks* callbacks) override;
   bool cancelAnyPendingStream() override;
+  bool valid() const override { return pool_data_.has_value(); }
+  Upstream::HostDescriptionConstSharedPtr host() const override {
+    return pool_data_.value().host();
+  }
 
   // Http::ConnectionPool::Callbacks
   void onPoolFailure(ConnectionPool::PoolFailureReason reason,
                      absl::string_view transport_failure_reason,
                      Upstream::HostDescriptionConstSharedPtr host) override;
   void onPoolReady(Envoy::Http::RequestEncoder& callbacks_encoder,
-                   Upstream::HostDescriptionConstSharedPtr host, const StreamInfo::StreamInfo& info,
-                   absl::optional<Envoy::Http::Protocol> protocol) override;
-  Upstream::HostDescriptionConstSharedPtr host() const override {
-    return pool_data_.value().host();
-  }
-
-  bool valid() { return pool_data_.has_value(); }
+                   Upstream::HostDescriptionConstSharedPtr host, StreamInfo::StreamInfo& info,
+                   std::optional<Envoy::Http::Protocol> protocol) override;
 
 protected:
   // Points to the actual connection pool to create streams from.
-  absl::optional<Envoy::Upstream::HttpPoolData> pool_data_{};
+  std::optional<Envoy::Upstream::HttpPoolData> pool_data_;
   Envoy::Http::ConnectionPool::Cancellable* conn_pool_stream_handle_{};
   Router::GenericConnectionPoolCallbacks* callbacks_{};
 };
@@ -76,6 +74,7 @@ public:
   void encodeTrailers(const Envoy::Http::RequestTrailerMap& trailers) override {
     request_encoder_->encodeTrailers(trailers);
   }
+  void enableTcpTunneling() override { request_encoder_->enableTcpTunneling(); }
 
   void readDisable(bool disable) override { request_encoder_->getStream().readDisable(disable); }
 

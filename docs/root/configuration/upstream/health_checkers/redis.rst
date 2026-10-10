@@ -23,3 +23,17 @@ Redis health checker is shown below:
         key: foo
 
 * :ref:`v3 API reference <envoy_v3_api_msg_config.core.v3.HealthCheck.CustomHealthCheck>`
+
+The redis health checker can also be configured with AWS IAM Authentication, in the same way as the `redis_proxy` filter. see
+:ref:`AWS IAM Authentication <config_network_filters_redis_proxy_aws_iam>` for more information.
+
+Statistics
+----------
+
+The Redis health checker emits some statistics in the *health_check.redis.* namespace.
+
+.. csv-table::
+     :header: Name, Description
+     :widths: 1, 2
+
+     exists_failure, Total number of health check failures caused by EXISTS check failure.

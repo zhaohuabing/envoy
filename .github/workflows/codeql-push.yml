@@ -1,67 +1,108 @@
+name: CodeQL/push
+
+permissions:
+  contents: read
+
 on:
   push:
-    paths:
-    - 'source/common/**'
+    branches:
+    - main
   pull_request:
+    branches:
+    - main
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  SEARCH_FOLDER: //source/common/...
 
 jobs:
-  CodeQL-Build:
-
-    strategy:
-      fail-fast: false
-
-    # CodeQL runs on ubuntu-latest and windows-latest
-    runs-on: ubuntu-latest
-
+  targets:
+    if: github.repository == 'envoyproxy/envoy'
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    outputs:
+      build_targets: ${{ steps.build-targets.outputs.targets }}
+      cpp_changed: ${{ steps.detect.outputs.cpp_changed }}
     steps:
     - name: Checkout repository
-      uses: actions/checkout@5a4ac9002d0be2fb38bd78e4b4dbde5606d7042f # v2.3.4
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       with:
-        # We must fetch at least the immediate parents so that if this is
-        # a pull request then we can checkout the head.
         fetch-depth: 2
 
+    - name: Detect C++ changes
+      id: detect
+      run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --depth=1 "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" main 2>/dev/null
+            TO_OTHER=FETCH_HEAD
+        else
+            TO_OTHER=HEAD^1
+        fi
+        echo "to_other=${TO_OTHER}" >> "$GITHUB_OUTPUT"
+        if git diff --name-only HEAD "${TO_OTHER}" -- source/common/ envoy/ | grep -q .; then
+            echo "cpp_changed=true" >> "$GITHUB_OUTPUT"
+        else
+            echo "cpp_changed=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Get build targets
+      id: build-targets
+      if: steps.detect.outputs.cpp_changed == 'true'
+      env:
+        TO_OTHER: ${{ steps.detect.outputs.to_other }}
       run: |
-       . .github/workflows/get_build_targets.sh
-       echo 'BUILD_TARGETS<<EOF' >> $GITHUB_ENV
-       echo $BUILD_TARGETS_LOCAL >> $GITHUB_ENV
-       echo 'EOF' >> $GITHUB_ENV
-    # If this run was triggered by a pull request event, then checkout
-    # the head of the pull request instead of the merge commit.
-    - run: git checkout HEAD^2
-      if: ${{ github.event_name == 'pull_request' }}
+        # TODO(phlax): Shift this to an action
+        compare_head () {
+            while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    bazel query "rdeps($SEARCH_FOLDER, $line, 1)" 2>/dev/null
+                fi
+            done < <(git diff --name-only HEAD "${TO_OTHER}" -- source/common/* envoy/*)
+        }
+        BUILD_TARGETS="$(compare_head | grep -v '\.cc\|\.h' | sort -u | head -n 3)"
+        if [[ -z "$BUILD_TARGETS" ]]; then
+            BUILD_TARGETS="//source/common/common:assert_lib"
+        fi
+        {
+            echo 'targets<<EOF'
+            sed 's|^//|@envoy//|' <<< "$BUILD_TARGETS"
+            echo 'EOF'
+        } >> "$GITHUB_OUTPUT"
 
-    # Initializes the CodeQL tools for scanning.
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@a66b44a48a44d63acf71688c56aa168ac171d4cf # v1
-      # Override language selection by uncommenting this and choosing your languages
+  CodeQL-Build:
+    if: needs.targets.outputs.cpp_changed == 'true'
+    needs: targets
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      pull-requests: read
+    uses: ./.github/workflows/_codeql.yml
+    with:
+      targets: ${{ needs.targets.outputs.build_targets }}
+
+  CodeQL-Noop:
+    if: needs.targets.outputs.cpp_changed != 'true'
+    needs: targets
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+    # No-op analysis satisfies Scorecard SAST when no C++ changes are present.
+    - name: Initialize CodeQL (noop)
+      uses: github/codeql-action/init@87557b9c84dde89fdd9b10e88954ac2f4248e463  # codeql-bundle-v4.36.1
       with:
-        languages: cpp
-
-    - name: Install deps
-      shell: bash
-      run: |
-       sudo apt-get update --error-on=any
-       sudo apt-get install --yes libtool cmake automake autoconf make ninja-build curl unzip virtualenv openjdk-11-jdk build-essential libc++1
-       mkdir -p bin/clang11
-       cd bin/clang11
-       wget https://github.com/llvm/llvm-project/releases/download/llvmorg-11.0.1/clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz
-       tar -xf clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz --strip-components 1
-       export PATH=bin/clang11/bin:$PATH
-
-
-    - name: Build
-      run: |
-       bazel/setup_clang.sh bin/clang11
-       bazelisk shutdown
-       bazelisk build -c fastbuild --spawn_strategy=local --discard_analysis_cache --nouse_action_cache --config clang --config libc++ $BUILD_TARGETS
-       echo -e "Built targets...\n$BUILD_TARGETS"
-
-    - name: Clean Artifacts
-      run: |
-        git clean -xdf
+        languages: javascript
+        trap-caching: false
 
     - name: Perform CodeQL Analysis
-      if: env.BUILD_TARGETS != ''
-      uses: github/codeql-action/analyze@a66b44a48a44d63acf71688c56aa168ac171d4cf # v1
+      uses: github/codeql-action/analyze@87557b9c84dde89fdd9b10e88954ac2f4248e463  # codeql-bundle-v4.36.1

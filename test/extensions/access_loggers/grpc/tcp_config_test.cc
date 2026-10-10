@@ -1,9 +1,10 @@
+#include "envoy/access_log/access_log_config.h"
 #include "envoy/config/core/v3/grpc_service.pb.h"
 #include "envoy/extensions/access_loggers/grpc/v3/als.pb.h"
 #include "envoy/registry/registry.h"
-#include "envoy/server/access_log_config.h"
 #include "envoy/stats/scope.h"
 
+#include "source/common/formatter/substitution_formatter.h"
 #include "source/extensions/access_loggers/grpc/tcp_grpc_access_log_impl.h"
 
 #include "test/mocks/server/factory_context.h"
@@ -20,12 +21,22 @@ namespace AccessLoggers {
 namespace TcpGrpc {
 namespace {
 
+class TestCustomCommandParser : public Formatter::CommandParser {
+public:
+  absl::StatusOr<Formatter::FormatterProviderPtr>
+  parse(absl::string_view command, absl::string_view, std::optional<size_t>) const override {
+    if (command == "TEST_CUSTOM") {
+      return std::make_unique<Formatter::PlainStringFormatter>("custom-value");
+    }
+    return nullptr;
+  }
+};
+
 class TcpGrpcAccessLogConfigTest : public testing::Test {
 public:
   void SetUp() override {
-    factory_ =
-        Registry::FactoryRegistry<Server::Configuration::AccessLogInstanceFactory>::getFactory(
-            "envoy.access_loggers.tcp_grpc");
+    factory_ = Registry::FactoryRegistry<AccessLog::AccessLogInstanceFactory>::getFactory(
+        "envoy.access_loggers.tcp_grpc");
     ASSERT_NE(nullptr, factory_);
 
     message_ = factory_->createEmptyConfigProto();
@@ -34,12 +45,6 @@ public:
 
   void run(const std::string cluster_name) {
     const auto good_cluster = "good_cluster";
-    EXPECT_CALL(context_.cluster_manager_, checkActiveStaticCluster(cluster_name))
-        .WillOnce(Invoke([good_cluster](const std::string& cluster_name) {
-          if (cluster_name != good_cluster) {
-            throw EnvoyException("fake");
-          }
-        }));
 
     auto* common_config = tcp_grpc_access_log_.mutable_common_config();
     common_config->set_log_name("foo");
@@ -48,7 +53,8 @@ public:
     TestUtility::jsonConvert(tcp_grpc_access_log_, *message_);
 
     if (cluster_name == good_cluster) {
-      EXPECT_CALL(context_.cluster_manager_.async_client_manager_, factoryForGrpcService(_, _, _))
+      EXPECT_CALL(context_.server_factory_context_.cluster_manager_.async_client_manager_,
+                  factoryForGrpcService(_, _, _))
           .WillOnce(Invoke([](const envoy::config::core::v3::GrpcService&, Stats::Scope&, bool) {
             return std::make_unique<NiceMock<Grpc::MockAsyncClientFactory>>();
           }));
@@ -64,17 +70,38 @@ public:
   }
 
   AccessLog::FilterPtr filter_;
-  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
+  NiceMock<Server::Configuration::MockFactoryContext> context_;
   envoy::extensions::access_loggers::grpc::v3::TcpGrpcAccessLogConfig tcp_grpc_access_log_;
   ProtobufTypes::MessagePtr message_;
-  Server::Configuration::AccessLogInstanceFactory* factory_{};
+  AccessLog::AccessLogInstanceFactory* factory_{};
 };
 
 // Normal OK configuration.
 TEST_F(TcpGrpcAccessLogConfigTest, Ok) { run("good_cluster"); }
 
-// Wrong configuration with invalid clusters.
-TEST_F(TcpGrpcAccessLogConfigTest, InvalidCluster) { run("invalid"); }
+TEST_F(TcpGrpcAccessLogConfigTest, CustomTagFormatterRespectsCommandParsers) {
+  auto* common_config = tcp_grpc_access_log_.mutable_common_config();
+  common_config->set_log_name("foo");
+  common_config->mutable_grpc_service()->mutable_envoy_grpc()->set_cluster_name("good_cluster");
+  common_config->set_transport_api_version(envoy::config::core::v3::ApiVersion::V3);
+  auto* custom_tag = common_config->add_custom_tags();
+  custom_tag->set_tag("test-tag");
+  custom_tag->set_value("%TEST_CUSTOM%");
+  TestUtility::jsonConvert(tcp_grpc_access_log_, *message_);
+
+  EXPECT_CALL(context_.server_factory_context_.cluster_manager_.async_client_manager_,
+              factoryForGrpcService(_, _, _))
+      .WillOnce(Invoke([](const envoy::config::core::v3::GrpcService&, Stats::Scope&, bool) {
+        return std::make_unique<NiceMock<Grpc::MockAsyncClientFactory>>();
+      }));
+
+  std::vector<Formatter::CommandParserPtr> command_parsers;
+  command_parsers.push_back(std::make_unique<TestCustomCommandParser>());
+  AccessLog::InstanceSharedPtr instance = factory_->createAccessLogInstance(
+      *message_, std::move(filter_), context_, std::move(command_parsers));
+  EXPECT_NE(nullptr, instance);
+  EXPECT_NE(nullptr, dynamic_cast<TcpGrpcAccessLog*>(instance.get()));
+}
 
 class MockGrpcAccessLoggerCache : public GrpcCommon::GrpcAccessLoggerCache {
 public:
@@ -100,7 +127,7 @@ TEST(TcpGrpcAccessLog, TlsLifetimeCheck) {
                          common_config,
                      Common::GrpcAccessLoggerType type) {
           // This is a part of the actual getOrCreateLogger code path and shouldn't crash.
-          std::make_pair(MessageUtil::hash(common_config), type);
+          std::ignore = std::make_pair(MessageUtil::hash(common_config), type);
           return nullptr;
         });
     // Set tls callback in the TcpGrpcAccessLog constructor,

@@ -1,7 +1,7 @@
+#include "envoy/access_log/access_log_config.h"
 #include "envoy/config/core/v3/grpc_service.pb.h"
 #include "envoy/extensions/access_loggers/grpc/v3/als.pb.h"
 #include "envoy/registry/registry.h"
-#include "envoy/server/access_log_config.h"
 #include "envoy/stats/scope.h"
 
 #include "source/extensions/access_loggers/grpc/http_grpc_access_log_impl.h"
@@ -23,9 +23,8 @@ namespace {
 class HttpGrpcAccessLogConfigTest : public testing::Test {
 public:
   void SetUp() override {
-    factory_ =
-        Registry::FactoryRegistry<Server::Configuration::AccessLogInstanceFactory>::getFactory(
-            "envoy.access_loggers.http_grpc");
+    factory_ = Registry::FactoryRegistry<AccessLog::AccessLogInstanceFactory>::getFactory(
+        "envoy.access_loggers.http_grpc");
     ASSERT_NE(nullptr, factory_);
 
     message_ = factory_->createEmptyConfigProto();
@@ -34,12 +33,6 @@ public:
 
   void run(const std::string cluster_name) {
     const auto good_cluster = "good_cluster";
-    EXPECT_CALL(context_.cluster_manager_, checkActiveStaticCluster(cluster_name))
-        .WillOnce(Invoke([good_cluster](const std::string& cluster_name) {
-          if (cluster_name != good_cluster) {
-            throw EnvoyException("fake");
-          }
-        }));
 
     auto* common_config = http_grpc_access_log_.mutable_common_config();
     common_config->set_log_name("foo");
@@ -48,7 +41,8 @@ public:
     TestUtility::jsonConvert(http_grpc_access_log_, *message_);
 
     if (cluster_name == good_cluster) {
-      EXPECT_CALL(context_.cluster_manager_.async_client_manager_, factoryForGrpcService(_, _, _))
+      EXPECT_CALL(context_.server_factory_context_.cluster_manager_.async_client_manager_,
+                  factoryForGrpcService(_, _, _))
           .WillOnce(Invoke([](const envoy::config::core::v3::GrpcService&, Stats::Scope&, bool) {
             return std::make_unique<NiceMock<Grpc::MockAsyncClientFactory>>();
           }));
@@ -64,17 +58,14 @@ public:
   }
 
   AccessLog::FilterPtr filter_;
-  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
+  NiceMock<Server::Configuration::MockFactoryContext> context_;
   envoy::extensions::access_loggers::grpc::v3::HttpGrpcAccessLogConfig http_grpc_access_log_;
   ProtobufTypes::MessagePtr message_;
-  Server::Configuration::AccessLogInstanceFactory* factory_{};
+  AccessLog::AccessLogInstanceFactory* factory_{};
 };
 
 // Normal OK configuration.
 TEST_F(HttpGrpcAccessLogConfigTest, Ok) { run("good_cluster"); }
-
-// Wrong configuration with invalid clusters.
-TEST_F(HttpGrpcAccessLogConfigTest, InvalidCluster) { run("invalid"); }
 
 } // namespace
 } // namespace HttpGrpc

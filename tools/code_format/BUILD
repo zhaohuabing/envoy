@@ -1,22 +1,31 @@
 load("@base_pip3//:requirements.bzl", "requirement")
-load("@rules_python//python:defs.bzl", "py_binary")
-load("//bazel:envoy_build_system.bzl", "envoy_package")
+load("@envoy_repo//:path.bzl", "PATH")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
-
-exports_files([
-    "check_format.py",
-    "header_order.py",
-    "envoy_build_fixer.py",
-])
+py_library(
+    name = "envoy_build_fixer",
+    srcs = ["envoy_build_fixer.py"],
+)
 
 py_binary(
-    name = "python_check",
-    srcs = ["python_check.py"],
+    name = "check_format",
+    srcs = ["check_format.py"],
+    args = [
+        "--path=%s" % PATH,
+        "--clang_format_path=$(location //tools/clang-format)",
+        "--buildifier_path=$(location //bazel/deps:buildifier)",
+        "--buildozer_path=$(location //bazel/deps:buildozer)",
+    ],
+    data = [
+        ":config.yaml",
+        "//bazel/deps:buildifier",
+        "//bazel/deps:buildozer",
+        "//tools/clang-format",
+    ],
     deps = [
-        "@envoy_repo",
-        requirement("envoy.code_format.python_check"),
+        requirement("pyyaml"),
+        ":envoy_build_fixer",
     ],
 )

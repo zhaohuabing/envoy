@@ -1,3 +1,4 @@
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,14 +16,17 @@
 
 #include "test/extensions/filters/common/ext_authz/mocks.h"
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/runtime/mocks.h"
-#include "test/mocks/tracing/mocks.h"
+#include "test/mocks/server/server_factory_context.h"
+#include "test/proto/helloworld.pb.h"
 #include "test/test_common/printers.h"
+#include "test/test_common/struct_matchers.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using testing::_;
+using testing::A;
+using testing::Contains;
 using testing::InSequence;
 using testing::Invoke;
 using testing::NiceMock;
@@ -34,16 +38,18 @@ namespace Extensions {
 namespace NetworkFilters {
 namespace ExtAuthz {
 
+using ExtAuthzDecisionProto = ExtAuthzDecisionObject::ExtAuthzDecisionProto;
+
 class ExtAuthzFilterTest : public testing::Test {
 public:
   void initialize(std::string yaml) {
     envoy::extensions::filters::network::ext_authz::v3::ExtAuthz proto_config{};
     TestUtility::loadFromYaml(yaml, proto_config);
-    config_ = std::make_shared<Config>(proto_config, stats_store_, bootstrap_);
+    config_ = std::make_shared<Config>(proto_config, *stats_store_.rootScope(), context_);
     client_ = new Filters::Common::ExtAuthz::MockClient();
     filter_ = std::make_unique<Filter>(config_, Filters::Common::ExtAuthz::ClientPtr{client_});
     filter_->initializeReadFilterCallbacks(filter_callbacks_);
-    addr_ = std::make_shared<Network::Address::PipeInstance>("/test/test.sock");
+    addr_ = *Network::Address::PipeInstance::create("/test/test.sock");
 
     // NOP currently.
     filter_->onAboveWriteBufferHighWatermark();
@@ -60,7 +66,7 @@ public:
 
   ~ExtAuthzFilterTest() override {
     for (const Stats::GaugeSharedPtr& gauge : stats_store_.gauges()) {
-      EXPECT_EQ(0U, gauge->value());
+      EXPECT_EQ(0U, gauge->value()) << "guage name: " << gauge->name();
     }
   }
 
@@ -69,7 +75,7 @@ public:
         ->setRemoteAddress(addr_);
     filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_
         ->setLocalAddress(addr_);
-    EXPECT_CALL(*client_, check(_, _, testing::A<Tracing::Span&>(), _))
+    EXPECT_CALL(*client_, check(_, _, A<Tracing::Span&>(), _))
         .WillOnce(
             WithArgs<0>(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks) -> void {
               request_callbacks_ = &callbacks;
@@ -89,21 +95,27 @@ public:
         1U,
         stats_store_.gauge("ext_authz.name.active", Stats::Gauge::ImportMode::Accumulate).value());
 
+    filter_callbacks_.connection_.dispatcher_.globalTimeSystem().advanceTimeWait(
+        std::chrono::milliseconds(10));
+
     Filters::Common::ExtAuthz::Response response{};
     response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
-    response.headers_to_set = Http::HeaderVector{{Http::LowerCaseString{"foo"}, "bar"}};
+    response.headers_to_set = Filters::Common::ExtAuthz::UnsafeHeaderVector{{"foo", "bar"}};
 
     auto* fields = response.dynamic_metadata.mutable_fields();
     (*fields)["foo"] = ValueUtil::stringValue("ok");
     (*fields)["bar"] = ValueUtil::numberValue(1);
+    (*fields)["ext_authz_duration"] = ValueUtil::numberValue(10);
 
     EXPECT_CALL(filter_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _))
-        .WillOnce(Invoke([&response](const std::string& ns,
-                                     const ProtobufWkt::Struct& returned_dynamic_metadata) {
-          EXPECT_EQ(ns, NetworkFilterNames::get().ExtAuthorization);
-          EXPECT_TRUE(
-              TestUtility::protoEqual(returned_dynamic_metadata, response.dynamic_metadata));
-        }));
+        .WillOnce(Invoke(
+            [&response](const std::string& ns, const Protobuf::Struct& returned_dynamic_metadata) {
+              EXPECT_EQ(ns, NetworkFilterNames::get().ExtAuthorization);
+              EXPECT_THAT(returned_dynamic_metadata.fields(),
+                          Contains(IsStructNumber("ext_authz_duration", 10)));
+              EXPECT_TRUE(
+                  TestUtility::protoEqual(returned_dynamic_metadata, response.dynamic_metadata));
+            }));
 
     EXPECT_CALL(filter_callbacks_, continueReading());
     request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
@@ -124,14 +136,13 @@ public:
 
   Stats::TestUtil::TestStore stats_store_;
   ConfigSharedPtr config_;
-  envoy::config::bootstrap::v3::Bootstrap bootstrap_;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
   Filters::Common::ExtAuthz::MockClient* client_;
   std::unique_ptr<Filter> filter_;
   NiceMock<Network::MockReadFilterCallbacks> filter_callbacks_;
   Network::Address::InstanceConstSharedPtr addr_;
   Filters::Common::ExtAuthz::RequestCallbacks* request_callbacks_{};
   const std::string default_yaml_string_ = R"EOF(
-transport_api_version: V3
 grpc_service:
   envoy_grpc:
     cluster_name: ext_authz_server
@@ -139,8 +150,37 @@ grpc_service:
 failure_mode_allow: true
 stat_prefix: name
   )EOF";
+  // Drives the filter up to the point where the authorization service has been called and
+  // request_callbacks_ is armed, without completing the call.
+  void expectCheckStarted() {
+    filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_
+        ->setRemoteAddress(addr_);
+    filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_
+        ->setLocalAddress(addr_);
+    EXPECT_CALL(*client_, check(_, _, _, _))
+        .WillOnce(
+            WithArgs<0>(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks) -> void {
+              request_callbacks_ = &callbacks;
+            })));
+
+    EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
+    Buffer::OwnedImpl data("hello");
+    EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
+  }
+
+  void expectConnectionNotClosed() {
+    EXPECT_CALL(filter_callbacks_.connection_, close(_)).Times(0);
+    EXPECT_CALL(filter_callbacks_.connection_, close(_, _)).Times(0);
+    EXPECT_CALL(filter_callbacks_.connection_.stream_info_, setResponseFlag(_)).Times(0);
+    EXPECT_CALL(filter_callbacks_.connection_.stream_info_, setResponseCodeDetails(_)).Times(0);
+  }
+
+  const ExtAuthzDecisionObject* extAuthzDecision() {
+    return filter_callbacks_.connection_.stream_info_.filterState()
+        ->getDataReadOnly<ExtAuthzDecisionObject>(NetworkFilterNames::get().ExtAuthorization);
+  }
+
   const std::string metadata_yaml_string_ = R"EOF(
-transport_api_version: V3
 grpc_service:
   envoy_grpc:
     cluster_name: ext_authz_server
@@ -154,11 +194,18 @@ filter_enabled_metadata:
     string_match:
       exact: "check"
   )EOF";
+  const std::string shadow_yaml_string_ = R"EOF(
+grpc_service:
+  envoy_grpc:
+    cluster_name: ext_authz_server
+
+shadow_mode: true
+stat_prefix: name
+  )EOF";
 };
 
 TEST_F(ExtAuthzFilterTest, BadExtAuthzConfig) {
   std::string yaml_string = R"EOF(
-transport_api_version: V3
 grpc_service: {}
 stat_prefix: name
   )EOF";
@@ -175,6 +222,32 @@ stat_prefix: name
 TEST_F(ExtAuthzFilterTest, OKWithOnData) {
   initialize(default_yaml_string_);
   expectOKWithOnData();
+}
+
+// Verifies that labels are correctly extracted from the bootstrap metadata.
+TEST_F(ExtAuthzFilterTest, BootstrapLabelsExtraction) {
+  const std::string yaml = R"EOF(
+grpc_service:
+  envoy_grpc:
+    cluster_name: ext_authz_server
+stat_prefix: name
+bootstrap_metadata_labels_key: "labels_key"
+)EOF";
+
+  Protobuf::Struct labels_struct;
+  auto& fields = *labels_struct.mutable_fields();
+  fields["label1"] = ValueUtil::stringValue("value1");
+  fields["label2"] = ValueUtil::stringValue("value2");
+
+  auto& node_metadata_fields =
+      *context_.bootstrap_.mutable_node()->mutable_metadata()->mutable_fields();
+  node_metadata_fields["labels_key"].mutable_struct_value()->CopyFrom(labels_struct);
+
+  initialize(yaml);
+
+  EXPECT_EQ(2, config_->destinationLabels().size());
+  EXPECT_EQ("value1", config_->destinationLabels().at("label1"));
+  EXPECT_EQ("value2", config_->destinationLabels().at("label2"));
 }
 
 TEST_F(ExtAuthzFilterTest, DeniedWithOnData) {
@@ -205,7 +278,12 @@ TEST_F(ExtAuthzFilterTest, DeniedWithOnData) {
       1U,
       stats_store_.gauge("ext_authz.name.active", Stats::Gauge::ImportMode::Accumulate).value());
 
-  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush, _));
+  EXPECT_CALL(filter_callbacks_.connection_.stream_info_,
+              setResponseFlag(StreamInfo::CoreResponseFlag::UnauthorizedExternalService));
+  EXPECT_CALL(
+      filter_callbacks_.connection_.stream_info_,
+      setResponseCodeDetails(Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied));
   EXPECT_CALL(*client_, cancel()).Times(0);
   request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied));
 
@@ -274,8 +352,13 @@ TEST_F(ExtAuthzFilterTest, FailClose) {
   Buffer::OwnedImpl data("hello");
   EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
 
-  EXPECT_CALL(filter_callbacks_.connection_, close(_));
+  EXPECT_CALL(filter_callbacks_.connection_, close(_, _));
   EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
+  EXPECT_CALL(filter_callbacks_.connection_.stream_info_,
+              setResponseFlag(StreamInfo::CoreResponseFlag::UnauthorizedExternalService));
+  EXPECT_CALL(
+      filter_callbacks_.connection_.stream_info_,
+      setResponseCodeDetails(Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzError));
   request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Error));
 
   EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.disabled").value());
@@ -366,22 +449,31 @@ TEST_F(ExtAuthzFilterTest, ImmediateOK) {
       addr_);
   filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
       addr_);
-  ProtobufWkt::Struct dynamic_metadata;
+  filter_callbacks_.connection_.dispatcher_.globalTimeSystem().advanceTimeWait(
+      std::chrono::milliseconds(5));
+  Protobuf::Struct dynamic_metadata;
   (*dynamic_metadata.mutable_fields())["baz"] = ValueUtil::stringValue("hello-ok");
   (*dynamic_metadata.mutable_fields())["x"] = ValueUtil::numberValue(12);
+  // Since this is a stack response, duration should be 0;
+  (*dynamic_metadata.mutable_fields())["ext_authz_duration"] = ValueUtil::numberValue(0);
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  response.dynamic_metadata = dynamic_metadata;
+
   EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
   EXPECT_CALL(*client_, check(_, _, _, _))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks) -> void {
-            Filters::Common::ExtAuthz::Response response{};
-            response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
-            response.dynamic_metadata = dynamic_metadata;
+            request_callbacks_ = &callbacks;
             callbacks.onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
           })));
+
   EXPECT_CALL(filter_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _))
       .WillOnce(Invoke([&dynamic_metadata](const std::string& ns,
-                                           const ProtobufWkt::Struct& returned_dynamic_metadata) {
+                                           const Protobuf::Struct& returned_dynamic_metadata) {
         EXPECT_EQ(ns, NetworkFilterNames::get().ExtAuthorization);
+        EXPECT_THAT(returned_dynamic_metadata.fields(),
+                    Contains(IsStructNumber("ext_authz_duration", 0)));
         EXPECT_TRUE(TestUtility::protoEqual(returned_dynamic_metadata, dynamic_metadata));
       }));
   EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
@@ -411,7 +503,7 @@ TEST_F(ExtAuthzFilterTest, ImmediateNOK) {
       addr_);
   filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
       addr_);
-  ProtobufWkt::Struct dynamic_metadata;
+  Protobuf::Struct dynamic_metadata;
   (*dynamic_metadata.mutable_fields())["baz"] = ValueUtil::stringValue("hello-nok");
   (*dynamic_metadata.mutable_fields())["x"] = ValueUtil::numberValue(15);
   EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
@@ -425,11 +517,17 @@ TEST_F(ExtAuthzFilterTest, ImmediateNOK) {
           })));
   EXPECT_CALL(filter_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _))
       .WillOnce(Invoke([&dynamic_metadata](const std::string& ns,
-                                           const ProtobufWkt::Struct& returned_dynamic_metadata) {
+                                           const Protobuf::Struct& returned_dynamic_metadata) {
         EXPECT_EQ(ns, NetworkFilterNames::get().ExtAuthorization);
+        EXPECT_FALSE(returned_dynamic_metadata.fields().contains("ext_authz_duration"));
+        EXPECT_FALSE(dynamic_metadata.fields().contains("ext_authz_duration"));
         EXPECT_TRUE(TestUtility::protoEqual(returned_dynamic_metadata, dynamic_metadata));
       }));
-
+  EXPECT_CALL(filter_callbacks_.connection_.stream_info_,
+              setResponseFlag(StreamInfo::CoreResponseFlag::UnauthorizedExternalService));
+  EXPECT_CALL(
+      filter_callbacks_.connection_.stream_info_,
+      setResponseCodeDetails(Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied));
   EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
   Buffer::OwnedImpl data("hello");
   EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
@@ -525,6 +623,503 @@ TEST_F(ExtAuthzFilterTest, EnabledWithMetadata) {
       .WillByDefault(ReturnRef(metadata));
 
   expectOKWithOnData();
+}
+
+// Verifies that specified metadata is passed along in the check request for network filter
+TEST_F(ExtAuthzFilterTest, MetadataContext) {
+  const std::string yaml = R"EOF(
+  stat_prefix: name
+  grpc_service:
+    envoy_grpc:
+      cluster_name: ext_authz
+  metadata_context_namespaces:
+  - jazz.sax
+  - rock.guitar
+  typed_metadata_context_namespaces:
+  - blues.piano
+  )EOF";
+
+  initialize(yaml);
+
+  const std::string metadata_yaml = R"EOF(
+  filter_metadata:
+    jazz.sax:
+      coltrane: john
+      parker: charlie
+    rock.guitar:
+      hendrix: jimi
+      richards: keith
+    jazz.piano:
+      monk: thelonious
+  typed_filter_metadata:
+    blues.piano:
+      '@type': type.googleapis.com/helloworld.HelloRequest
+      name: jelly roll morton
+  )EOF";
+
+  envoy::config::core::v3::Metadata metadata;
+  TestUtility::loadFromYaml(metadata_yaml, metadata);
+  ON_CALL(filter_callbacks_.connection_.stream_info_, dynamicMetadata())
+      .WillByDefault(ReturnRef(metadata));
+
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
+      addr_);
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
+      addr_);
+
+  envoy::service::auth::v3::CheckRequest check_request;
+  EXPECT_CALL(*client_, check(_, _, A<Tracing::Span&>(), _))
+      .WillOnce(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                           const envoy::service::auth::v3::CheckRequest& check_param,
+                           Tracing::Span&, const StreamInfo::StreamInfo&) -> void {
+        check_request = check_param;
+        request_callbacks_ = &callbacks;
+      }));
+
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
+
+  // Verify that the metadata specified in metadata_context_namespaces is passed
+  EXPECT_EQ("john", check_request.attributes()
+                        .metadata_context()
+                        .filter_metadata()
+                        .at("jazz.sax")
+                        .fields()
+                        .at("coltrane")
+                        .string_value());
+
+  EXPECT_EQ("jimi", check_request.attributes()
+                        .metadata_context()
+                        .filter_metadata()
+                        .at("rock.guitar")
+                        .fields()
+                        .at("hendrix")
+                        .string_value());
+
+  // Verify that metadata not in the namespace list is not passed
+  EXPECT_EQ(0, check_request.attributes().metadata_context().filter_metadata().count("jazz.piano"));
+
+  // Verify that typed metadata specified in typed_metadata_context_namespaces is passed
+  helloworld::HelloRequest hello;
+  std::ignore = check_request.attributes()
+                    .metadata_context()
+                    .typed_filter_metadata()
+                    .at("blues.piano")
+                    .UnpackTo(&hello);
+  EXPECT_EQ("jelly roll morton", hello.name());
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.ok").value());
+}
+
+// Verifies that when metadata_context_namespaces is configured but no matching metadata exists,
+// the check request is sent with empty metadata context
+TEST_F(ExtAuthzFilterTest, MetadataContextNoMatch) {
+  const std::string yaml = R"EOF(
+  stat_prefix: name
+  grpc_service:
+    envoy_grpc:
+      cluster_name: ext_authz
+  metadata_context_namespaces:
+  - jazz.sax
+  - rock.guitar
+  typed_metadata_context_namespaces:
+  - blues.piano
+  )EOF";
+
+  initialize(yaml);
+
+  // Set up metadata that doesn't match the configured namespaces
+  const std::string metadata_yaml = R"EOF(
+  filter_metadata:
+    classical.violin:
+      vivaldi: antonio
+  )EOF";
+
+  envoy::config::core::v3::Metadata metadata;
+  TestUtility::loadFromYaml(metadata_yaml, metadata);
+  ON_CALL(filter_callbacks_.connection_.stream_info_, dynamicMetadata())
+      .WillByDefault(ReturnRef(metadata));
+
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
+      addr_);
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
+      addr_);
+
+  envoy::service::auth::v3::CheckRequest check_request;
+  EXPECT_CALL(*client_, check(_, _, A<Tracing::Span&>(), _))
+      .WillOnce(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                           const envoy::service::auth::v3::CheckRequest& check_param,
+                           Tracing::Span&, const StreamInfo::StreamInfo&) -> void {
+        check_request = check_param;
+        request_callbacks_ = &callbacks;
+      }));
+
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
+
+  // Verify that no metadata is passed since no namespaces matched
+  EXPECT_EQ(0, check_request.attributes().metadata_context().filter_metadata().size());
+  EXPECT_EQ(0, check_request.attributes().metadata_context().typed_filter_metadata().size());
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.ok").value());
+}
+
+// Verifies that when no metadata_context_namespaces are configured, no metadata is passed
+TEST_F(ExtAuthzFilterTest, NoMetadataContextNamespaces) {
+  const std::string yaml = R"EOF(
+  stat_prefix: name
+  grpc_service:
+    envoy_grpc:
+      cluster_name: ext_authz
+  )EOF";
+
+  initialize(yaml);
+
+  const std::string metadata_yaml = R"EOF(
+  filter_metadata:
+    jazz.sax:
+      coltrane: john
+  )EOF";
+
+  envoy::config::core::v3::Metadata metadata;
+  TestUtility::loadFromYaml(metadata_yaml, metadata);
+  ON_CALL(filter_callbacks_.connection_.stream_info_, dynamicMetadata())
+      .WillByDefault(ReturnRef(metadata));
+
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
+      addr_);
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
+      addr_);
+
+  envoy::service::auth::v3::CheckRequest check_request;
+  EXPECT_CALL(*client_, check(_, _, A<Tracing::Span&>(), _))
+      .WillOnce(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
+                           const envoy::service::auth::v3::CheckRequest& check_param,
+                           Tracing::Span&, const StreamInfo::StreamInfo&) -> void {
+        check_request = check_param;
+        request_callbacks_ = &callbacks;
+      }));
+
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
+
+  // Verify that no metadata is passed when metadata_context_namespaces is not configured
+  EXPECT_EQ(0, check_request.attributes().metadata_context().filter_metadata().size());
+  EXPECT_EQ(0, check_request.attributes().metadata_context().typed_filter_metadata().size());
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  request_callbacks_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.ok").value());
+}
+
+// Shadow mode tests. With shadow_mode enabled the filter never closes the connection. It records
+// the authorization decision in FilterState and releases the buffered data to the filter chain.
+
+// Verifies that the decision is stored under the filter's canonical name, independent of
+// stat_prefix, so the key does not vary per filter instance.
+TEST_F(ExtAuthzFilterTest, ShadowModeFilterStateKeyIsFilterName) {
+  initialize(shadow_yaml_string_);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied));
+
+  EXPECT_NE(nullptr, filter_callbacks_.connection_.stream_info_.filterState()
+                         ->getDataReadOnly<ExtAuthzDecisionObject>(
+                             NetworkFilterNames::get().ExtAuthorization));
+}
+
+// Verifies that a denied response records the decision and leaves the connection open.
+TEST_F(ExtAuthzFilterTest, ShadowModeDeniedDoesNotCloseConnection) {
+  initialize(shadow_yaml_string_);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  auto response = makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied);
+  response->status_code = Http::Code::Forbidden;
+  request_callbacks_->onComplete(std::move(response));
+
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+  EXPECT_EQ(ExtAuthzDecisionProto::DENIED, decision->checkResult());
+  EXPECT_EQ(403U, decision->statusCode());
+
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.denied").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.cx_closed").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.failure_mode_allowed").value());
+}
+
+// Verifies that an error response is recorded and allowed through even though failure_mode_allow
+// is not set.
+TEST_F(ExtAuthzFilterTest, ShadowModeErrorDoesNotCloseConnection) {
+  initialize(shadow_yaml_string_);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Error));
+
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+  EXPECT_EQ(ExtAuthzDecisionProto::ERROR, decision->checkResult());
+  // The authorization service returned no status code, so none is recorded.
+  EXPECT_EQ(0U, decision->statusCode());
+
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.error").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.cx_closed").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.failure_mode_allowed").value());
+}
+
+// Verifies that an OK response records the decision and still emits dynamic metadata.
+TEST_F(ExtAuthzFilterTest, ShadowModeOkRecordsDecision) {
+  initialize(shadow_yaml_string_);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _));
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  auto response = makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::OK);
+  (*response->dynamic_metadata.mutable_fields())["foo"] = ValueUtil::stringValue("bar");
+  request_callbacks_->onComplete(std::move(response));
+
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+  EXPECT_EQ(ExtAuthzDecisionProto::OK, decision->checkResult());
+  // The filter authorizes TCP connections and sends no response of its own, so no status code is
+  // recorded for OK.
+  EXPECT_EQ(0U, decision->statusCode());
+
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.ok").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.cx_closed").value());
+}
+
+// Verifies that shadow mode takes precedence over failure_mode_allow, so the fail-open counter
+// stays untouched.
+TEST_F(ExtAuthzFilterTest, ShadowModeErrorWithFailureModeAllow) {
+  const std::string yaml = R"EOF(
+grpc_service:
+  envoy_grpc:
+    cluster_name: ext_authz_server
+
+failure_mode_allow: true
+shadow_mode: true
+stat_prefix: name
+  )EOF";
+  initialize(yaml);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Error));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+  EXPECT_EQ(ExtAuthzDecisionProto::ERROR, decision->checkResult());
+
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.error").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.failure_mode_allowed").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.cx_closed").value());
+}
+
+// Verifies that no TLS alert is sent on a denial in shadow mode, since the connection stays open.
+TEST_F(ExtAuthzFilterTest, ShadowModeDeniedSendsNoTlsAlert) {
+  const std::string yaml = R"EOF(
+grpc_service:
+  envoy_grpc:
+    cluster_name: ext_authz_server
+
+send_tls_alert_on_denial: true
+shadow_mode: true
+stat_prefix: name
+  )EOF";
+  initialize(yaml);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied));
+
+  ASSERT_NE(nullptr, extAuthzDecision());
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.denied").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.cx_closed").value());
+}
+
+// Verifies that an on stack denied response records the decision without calling continueReading,
+// and that the filter chain resumes on the next onData().
+TEST_F(ExtAuthzFilterTest, ShadowModeImmediateDenied) {
+  initialize(shadow_yaml_string_);
+
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
+      addr_);
+  filter_callbacks_.connection_.stream_info_.downstream_connection_info_provider_->setLocalAddress(
+      addr_);
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
+  EXPECT_CALL(*client_, check(_, _, _, _))
+      .WillOnce(
+          WithArgs<0>(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks) -> void {
+            callbacks.onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied));
+          })));
+
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+  EXPECT_EQ(ExtAuthzDecisionProto::DENIED, decision->checkResult());
+
+  EXPECT_CALL(*client_, cancel()).Times(0);
+  filter_callbacks_.connection_.raiseEvent(Network::ConnectionEvent::RemoteClose);
+
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.denied").value());
+  EXPECT_EQ(0U, stats_store_.counter("ext_authz.name.cx_closed").value());
+}
+
+// Verifies that a filter disabled by metadata records no decision, since no check was made.
+TEST_F(ExtAuthzFilterTest, ShadowModeDisabledFilterRecordsNoDecision) {
+  const std::string yaml = R"EOF(
+grpc_service:
+  envoy_grpc:
+    cluster_name: ext_authz_server
+
+shadow_mode: true
+stat_prefix: name
+filter_enabled_metadata:
+  filter: "abc.xyz"
+  path:
+  - key: "k1"
+  value:
+    string_match:
+      exact: "check"
+  )EOF";
+  initialize(yaml);
+
+  const std::string metadata_yaml = R"EOF(
+  filter_metadata:
+    abc.xyz:
+      k1: skip
+  )EOF";
+  envoy::config::core::v3::Metadata metadata;
+  TestUtility::loadFromYaml(metadata_yaml, metadata);
+  ON_CALL(filter_callbacks_.connection_.stream_info_, dynamicMetadata())
+      .WillByDefault(ReturnRef(metadata));
+
+  EXPECT_CALL(*client_, check(_, _, _, _)).Times(0);
+
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
+  Buffer::OwnedImpl data("hello");
+  EXPECT_EQ(Network::FilterStatus::Continue, filter_->onData(data, false));
+
+  EXPECT_EQ(nullptr, extAuthzDecision());
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.disabled").value());
+}
+
+// Verifies that with shadow_mode unset the filter closes the connection as before and records no
+// decision.
+TEST_F(ExtAuthzFilterTest, ShadowModeUnsetPreservesEnforcement) {
+  initialize(default_yaml_string_);
+
+  expectCheckStarted();
+
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush, _));
+  EXPECT_CALL(filter_callbacks_.connection_.stream_info_,
+              setResponseFlag(StreamInfo::CoreResponseFlag::UnauthorizedExternalService));
+  EXPECT_CALL(
+      filter_callbacks_.connection_.stream_info_,
+      setResponseCodeDetails(Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied));
+  EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
+
+  request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied));
+
+  EXPECT_EQ(nullptr, extAuthzDecision());
+  EXPECT_EQ(1U, stats_store_.counter("ext_authz.name.cx_closed").value());
+}
+
+// Verifies the FilterState serializations that access log formatters and CEL expressions read.
+TEST_F(ExtAuthzFilterTest, ShadowModeDecisionSerialization) {
+  initialize(shadow_yaml_string_);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  auto response = makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::Denied);
+  response->status_code = Http::Code::Unauthorized;
+  request_callbacks_->onComplete(std::move(response));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+
+  const auto json = decision->serializeAsString();
+  ASSERT_TRUE(json.has_value());
+  ExtAuthzDecisionProto from_json;
+  TestUtility::loadFromJson(json.value(), from_json);
+  EXPECT_EQ(ExtAuthzDecisionProto::DENIED, from_json.check_result());
+  EXPECT_EQ(401U, from_json.status_code());
+
+  const ProtobufTypes::MessagePtr proto = decision->serializeAsProto();
+  ASSERT_NE(nullptr, proto);
+  EXPECT_TRUE(TestUtility::protoEqual(from_json, *proto));
+
+  EXPECT_TRUE(decision->hasFieldSupport());
+  EXPECT_EQ("DENIED", absl::get<absl::string_view>(decision->getField("check_result")));
+  EXPECT_EQ(401, absl::get<int64_t>(decision->getField("status_code")));
+  EXPECT_TRUE(absl::holds_alternative<absl::monostate>(decision->getField("unknown")));
+}
+
+// Verifies that an OK decision exposes no status code through either serialization.
+TEST_F(ExtAuthzFilterTest, ShadowModeOkSerializationOmitsStatusCode) {
+  initialize(shadow_yaml_string_);
+
+  expectCheckStarted();
+  expectConnectionNotClosed();
+  EXPECT_CALL(filter_callbacks_, continueReading());
+
+  request_callbacks_->onComplete(makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus::OK));
+
+  const ExtAuthzDecisionObject* decision = extAuthzDecision();
+  ASSERT_NE(nullptr, decision);
+
+  const auto json = decision->serializeAsString();
+  ASSERT_TRUE(json.has_value());
+  ExtAuthzDecisionProto from_json;
+  TestUtility::loadFromJson(json.value(), from_json);
+  EXPECT_EQ(ExtAuthzDecisionProto::OK, from_json.check_result());
+  EXPECT_EQ(0U, from_json.status_code());
+
+  EXPECT_EQ("OK", absl::get<absl::string_view>(decision->getField("check_result")));
+  EXPECT_TRUE(absl::holds_alternative<absl::monostate>(decision->getField("status_code")));
 }
 
 } // namespace ExtAuthz

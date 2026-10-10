@@ -8,8 +8,7 @@
 #include "envoy/thread_local/thread_local.h"
 
 #include "source/common/common/utility.h"
-
-#include "date_provider.h"
+#include "source/common/http/date_provider.h"
 
 namespace Envoy {
 namespace Http {
@@ -22,13 +21,12 @@ public:
   explicit DateProviderImplBase(TimeSource& time_source) : time_source_(time_source) {}
 
 protected:
-  static DateFormatter date_formatter_;
   TimeSource& time_source_;
 };
 
 /**
- * A caching thread local provider. This implementation updates the date string every 500ms and
- * caches on each thread.
+ * A caching thread local provider. Each thread updates its date string every 500ms using its own
+ * dispatcher, so refresh callbacks cannot accumulate on workers that have not started.
  */
 class TlsCachingDateProviderImpl : public DateProviderImplBase, public Singleton::Instance {
 public:
@@ -39,15 +37,16 @@ public:
 
 private:
   struct ThreadLocalCachedDate : public ThreadLocal::ThreadLocalObject {
-    ThreadLocalCachedDate(const std::string& date_string) : date_string_(date_string) {}
+    explicit ThreadLocalCachedDate(Event::Dispatcher& dispatcher);
 
-    const std::string date_string_;
+    void onRefreshDate();
+
+    TimeSource& time_source_;
+    std::string date_string_;
+    Event::TimerPtr refresh_timer_;
   };
 
-  void onRefreshDate();
-
-  ThreadLocal::SlotPtr tls_;
-  Event::TimerPtr refresh_timer_;
+  ThreadLocal::SlotSharedPtr tls_;
 };
 
 /**

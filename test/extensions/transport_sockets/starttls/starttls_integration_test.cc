@@ -4,6 +4,7 @@
 #include "envoy/server/filter_config.h"
 
 #include "source/common/network/connection_impl.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/extensions/filters/network/common/factory_base.h"
 #include "source/extensions/transport_sockets/raw_buffer/config.h"
 
@@ -17,6 +18,7 @@
 #include "gtest/gtest.h"
 
 namespace Envoy {
+using testing::NiceMock;
 
 // Simple filter for test purposes. This filter will be injected into the filter chain during
 // tests. The filter reacts only to few keywords. If received payload does not contain
@@ -70,7 +72,7 @@ Network::FilterStatus StartTlsSwitchFilter::onCommand(Buffer::Instance& buf, boo
   if (message == "switch") {
     buf.drain(buf.length());
     buf.add("usetls");
-    read_callbacks_->connection().addBytesSentCallback([=](uint64_t bytes) -> bool {
+    read_callbacks_->connection().addBytesSentCallback([=, this](uint64_t bytes) -> bool {
       // Wait until 6 bytes long "usetls" has been sent.
       if (bytes >= 6) {
         read_callbacks_->connection().startSecureTransport();
@@ -136,7 +138,7 @@ public:
                        Network::TransportSocketPtr&& transport_socket,
                        const Network::ConnectionSocket::OptionsSharedPtr& options)
       : ClientConnectionImpl(dispatcher, remote_address, source_address,
-                             std::move(transport_socket), options) {}
+                             std::move(transport_socket), options, nullptr) {}
 
   void setTransportSocket(Network::TransportSocketPtr&& transport_socket) {
     transport_socket_ = std::move(transport_socket);
@@ -160,8 +162,8 @@ public:
 
   // Contexts needed by raw buffer and tls transport sockets.
   std::unique_ptr<Ssl::ContextManager> tls_context_manager_;
-  Network::TransportSocketFactoryPtr tls_context_;
-  Network::TransportSocketFactoryPtr cleartext_context_;
+  Network::UpstreamTransportSocketFactoryPtr tls_context_;
+  Network::UpstreamTransportSocketFactoryPtr cleartext_context_;
 
   MockWatermarkBuffer* client_write_buffer_{nullptr};
   ConnectionStatusCallbacks connect_callbacks_;
@@ -179,22 +181,25 @@ void StartTlsIntegrationTest::initialize() {
   EXPECT_CALL(*mock_buffer_factory_, createBuffer_(_, _, _))
       // Connection constructor will first create write buffer.
       // Test tracks how many bytes are sent.
-      .WillOnce(Invoke([&](std::function<void()> below_low, std::function<void()> above_high,
-                           std::function<void()> above_overflow) -> Buffer::Instance* {
-        client_write_buffer_ =
-            new NiceMock<MockWatermarkBuffer>(below_low, above_high, above_overflow);
-        ON_CALL(*client_write_buffer_, move(_))
-            .WillByDefault(Invoke(client_write_buffer_, &MockWatermarkBuffer::baseMove));
-        ON_CALL(*client_write_buffer_, drain(_))
-            .WillByDefault(Invoke(client_write_buffer_, &MockWatermarkBuffer::trackDrains));
-        return client_write_buffer_;
-      }))
+      .WillOnce(
+          Invoke([&](absl::AnyInvocable<void()> below_low, absl::AnyInvocable<void()> above_high,
+                     absl::AnyInvocable<void()> above_overflow) -> Buffer::Instance* {
+            client_write_buffer_ = new NiceMock<MockWatermarkBuffer>(
+                std::move(below_low), std::move(above_high), std::move(above_overflow));
+            ON_CALL(*client_write_buffer_, move(_))
+                .WillByDefault(Invoke(client_write_buffer_, &MockWatermarkBuffer::baseMove));
+            ON_CALL(*client_write_buffer_, drain(_))
+                .WillByDefault(Invoke(client_write_buffer_, &MockWatermarkBuffer::trackDrains));
+            return client_write_buffer_;
+          }))
       // Connection constructor will also create read buffer, but the test does
       // not track received bytes.
-      .WillOnce(Invoke([&](std::function<void()> below_low, std::function<void()> above_high,
-                           std::function<void()> above_overflow) -> Buffer::Instance* {
-        return new Buffer::WatermarkBuffer(below_low, above_high, above_overflow);
-      }));
+      .WillOnce(
+          Invoke([&](absl::AnyInvocable<void()> below_low, absl::AnyInvocable<void()> above_high,
+                     absl::AnyInvocable<void()> above_overflow) -> Buffer::Instance* {
+            return new Buffer::WatermarkBuffer(std::move(below_low), std::move(above_high),
+                                               std::move(above_overflow));
+          }));
   config_helper_.renameListener("tcp_proxy");
   addStartTlsSwitchFilter(config_helper_);
 
@@ -203,13 +208,14 @@ void StartTlsIntegrationTest::initialize() {
 
   auto factory =
       std::make_unique<Extensions::TransportSockets::RawBuffer::UpstreamRawBufferSocketFactory>();
-  cleartext_context_ = Network::TransportSocketFactoryPtr{
-      factory->createTransportSocketFactory(*config, factory_context_)};
+  cleartext_context_ = Network::UpstreamTransportSocketFactoryPtr{
+      factory->createTransportSocketFactory(*config, factory_context_).value()};
 
   // Setup factories and contexts for tls transport socket.
-  tls_context_manager_ =
-      std::make_unique<Extensions::TransportSockets::Tls::ContextManagerImpl>(timeSystem());
-  tls_context_ = Ssl::createClientSslTransportSocketFactory({}, *tls_context_manager_, *api_);
+  tls_context_manager_ = std::make_unique<Extensions::TransportSockets::Tls::ContextManagerImpl>(
+      server_factory_context_);
+  tls_context_ = Ssl::createClientSslTransportSocketFactory({}, *tls_context_manager_, *api_,
+                                                            &server_factory_context_.serverScope());
   payload_reader_ = std::make_shared<WaitForPayloadReader>(*dispatcher_);
 
   BaseIntegrationTest::initialize();
@@ -220,7 +226,8 @@ void StartTlsIntegrationTest::initialize() {
       *dispatcher_, address, Network::Address::InstanceConstSharedPtr(),
       cleartext_context_->createTransportSocket(
           std::make_shared<Network::TransportSocketOptionsImpl>(
-              absl::string_view(""), std::vector<std::string>(), std::vector<std::string>())),
+              absl::string_view(""), std::vector<std::string>(), std::vector<std::string>()),
+          nullptr),
       nullptr);
 
   conn_->enableHalfClose(true);
@@ -258,7 +265,6 @@ TEST_P(StartTlsIntegrationTest, SwitchToTlsFromClient) {
 
   FakeRawConnectionPtr fake_upstream_connection;
   ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
-  ASSERT_THAT(test_server_->server().listenerManager().numConnections(), 1);
 
   Buffer::OwnedImpl buffer;
   buffer.add("hello");
@@ -273,7 +279,7 @@ TEST_P(StartTlsIntegrationTest, SwitchToTlsFromClient) {
   // StartTlsSwitchFilter will switch transport socket on the
   // receiver side upon receiving "switch" message and send
   // back the message "usetls".
-  payload_reader_->set_data_to_wait_for("usetls");
+  payload_reader_->setDataToWaitFor("usetls");
   buffer.add("switch");
   conn_->write(buffer, false);
 
@@ -281,10 +287,10 @@ TEST_P(StartTlsIntegrationTest, SwitchToTlsFromClient) {
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 
   // Without closing the connection, switch to tls.
-  conn_->setTransportSocket(
-      tls_context_->createTransportSocket(std::make_shared<Network::TransportSocketOptionsImpl>(
-          absl::string_view(""), std::vector<std::string>(),
-          std::vector<std::string>{"envoyalpn"})));
+  conn_->setTransportSocket(tls_context_->createTransportSocket(
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          absl::string_view(""), std::vector<std::string>(), std::vector<std::string>{"envoyalpn"}),
+      nullptr));
   connect_callbacks_.reset();
   while (!connect_callbacks_.connected() && !connect_callbacks_.closed()) {
     dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
@@ -326,7 +332,6 @@ TEST_P(StartTlsIntegrationTest, SwitchToTlsFromUpstream) {
 
   FakeRawConnectionPtr fake_upstream_connection;
   ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
-  ASSERT_THAT(test_server_->server().listenerManager().numConnections(), 1);
 
   Buffer::OwnedImpl buffer;
   buffer.add("hello");
@@ -345,14 +350,14 @@ TEST_P(StartTlsIntegrationTest, SwitchToTlsFromUpstream) {
   ASSERT_TRUE(fake_upstream_connection->write(data, false));
 
   // Wait for confirmation
-  payload_reader_->set_data_to_wait_for("usetls");
+  payload_reader_->setDataToWaitFor("usetls");
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 
   // Without closing the connection, switch to tls.
-  conn_->setTransportSocket(
-      tls_context_->createTransportSocket(std::make_shared<Network::TransportSocketOptionsImpl>(
-          absl::string_view(""), std::vector<std::string>(),
-          std::vector<std::string>{"envoyalpn"})));
+  conn_->setTransportSocket(tls_context_->createTransportSocket(
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          absl::string_view(""), std::vector<std::string>(), std::vector<std::string>{"envoyalpn"}),
+      nullptr));
   connect_callbacks_.reset();
   while (!connect_callbacks_.connected() && !connect_callbacks_.closed()) {
     dispatcher_->run(Event::Dispatcher::RunType::NonBlock);

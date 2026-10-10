@@ -49,7 +49,7 @@ public:
 private:
   void onTimerTick();
 
-  Buffer::OwnedImpl buffer_{};
+  Buffer::OwnedImpl buffer_;
   bool end_stream_{};
 
   const Event::TimerPtr timer_;
@@ -254,7 +254,7 @@ public:
   explicit DispenserFilterConfigFactory(const std::string& name) : name_(name) {}
 
   // NamedNetworkFilterConfigFactory
-  Network::FilterFactoryCb
+  absl::StatusOr<Network::FilterFactoryCb>
   createFilterFactoryFromProto(const Protobuf::Message&,
                                Server::Configuration::FactoryContext&) override {
     return [](Network::FilterManager& filter_manager) -> void {
@@ -265,7 +265,7 @@ public:
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom per-filter empty config proto
     // This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { return name_; }
@@ -289,12 +289,12 @@ const char inject_data_inside_callback_filter[] = "inject-data-inside-filter-cal
 const char no_inject_data[] = "no-inject-data";
 
 // List of auxiliary filters to test against
-const std::vector<std::string> auxiliary_filters() {
+const std::vector<std::string> auxiliaryFilters() {
   return {inject_data_outside_callback_filter, inject_data_inside_callback_filter, no_inject_data};
 }
 
 // Used to pretty print test parameters
-const std::regex invalid_param_name_regex() { return std::regex{"[^a-zA-Z0-9_]"}; }
+const std::regex invalidParamNameRegex() { return std::regex{"[^a-zA-Z0-9_]"}; }
 
 /**
  * Integration test with one of auxiliary filters (listed above)
@@ -402,7 +402,7 @@ public:
         "{}_{}",
         TestUtility::ipTestParamsToString(testing::TestParamInfo<Network::Address::IpVersion>(
             std::get<0>(params.param), params.index)),
-        std::regex_replace(std::get<1>(params.param), invalid_param_name_regex(), "_"));
+        std::regex_replace(std::get<1>(params.param), invalidParamNameRegex(), "_"));
   }
 
   explicit InjectDataToFilterChainIntegrationTest(const std::string& config)
@@ -420,7 +420,10 @@ protected:
         tick_interval_ms: 1
         max_chunk_length: 5
     )EOF"
-                                                                        : "";
+                                                                        : R"EOF(
+      typed_config:
+        "@type": type.googleapis.com/google.protobuf.Struct
+    )EOF";
   }
 };
 
@@ -434,6 +437,8 @@ public:
     filter_chains:
       filters:
       - name: envoy.filters.network.echo
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo
       )EOF");
   }
 
@@ -444,7 +449,7 @@ public:
 INSTANTIATE_TEST_SUITE_P(
     Params, InjectDataWithEchoFilterIntegrationTest,
     testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
-                     testing::ValuesIn(auxiliary_filters())),
+                     testing::ValuesIn(auxiliaryFilters())),
     InjectDataToFilterChainIntegrationTest::testParamsToString);
 
 TEST_P(InjectDataWithEchoFilterIntegrationTest, UsageOfInjectDataMethodsShouldBeUnnoticeable) {
@@ -490,7 +495,7 @@ public:
 INSTANTIATE_TEST_SUITE_P(
     Params, InjectDataWithTcpProxyFilterIntegrationTest,
     testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
-                     testing::ValuesIn(auxiliary_filters())),
+                     testing::ValuesIn(auxiliaryFilters())),
     InjectDataToFilterChainIntegrationTest::testParamsToString);
 
 TEST_P(InjectDataWithTcpProxyFilterIntegrationTest, UsageOfInjectDataMethodsShouldBeUnnoticeable) {
@@ -553,8 +558,8 @@ TEST_P(FilterChainAccessLogTest, FilterChainName) {
     access_log_config.set_path(log_file);
     access_log_config.mutable_log_format()->mutable_text_format_source()->set_inline_string(
         "%RESPONSE_FLAGS% %FILTER_CHAIN_NAME%");
-    access_log->mutable_typed_config()->PackFrom(access_log_config);
-    config_blob->PackFrom(tcp_proxy_config);
+    std::ignore = access_log->mutable_typed_config()->PackFrom(access_log_config);
+    std::ignore = config_blob->PackFrom(tcp_proxy_config);
   });
   enableHalfClose(true);
   initialize();
@@ -595,7 +600,7 @@ public:
         TestUtility::ipTestParamsToString(testing::TestParamInfo<Network::Address::IpVersion>(
             std::get<0>(params.param), params.index)),
         (std::get<1>(params.param) == Http::CodecType::HTTP2 ? "Http2" : "Http"),
-        std::regex_replace(std::get<2>(params.param), invalid_param_name_regex(), "_"));
+        std::regex_replace(std::get<2>(params.param), invalidParamNameRegex(), "_"));
   }
 
   InjectDataWithHttpConnectionManagerIntegrationTest()
@@ -617,7 +622,10 @@ protected:
         tick_interval_ms: 1
         max_chunk_length: 10
     )EOF"
-                                                                        : "";
+                                                                        : R"EOF(
+      typed_config:
+        "@type": type.googleapis.com/google.protobuf.Struct
+    )EOF";
   }
 };
 
@@ -625,7 +633,7 @@ INSTANTIATE_TEST_SUITE_P(
     Params, InjectDataWithHttpConnectionManagerIntegrationTest,
     testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                      testing::Values(Http::CodecType::HTTP1, Http::CodecType::HTTP2),
-                     testing::ValuesIn(auxiliary_filters())),
+                     testing::ValuesIn(auxiliaryFilters())),
     InjectDataWithHttpConnectionManagerIntegrationTest::testParamsToString);
 
 TEST_P(InjectDataWithHttpConnectionManagerIntegrationTest,
@@ -650,6 +658,83 @@ TEST_P(InjectDataWithHttpConnectionManagerIntegrationTest,
   ASSERT_TRUE(response->complete());
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_EQ("greetings", response->body());
+}
+
+class AccessLogHandlerTestFilter : public Network::ReadFilter, public AccessLog::Instance {
+public:
+  AccessLogHandlerTestFilter(Stats::Scope& scope) : scope_(scope) {}
+
+  // Network::ReadFilter
+  Network::FilterStatus onData(Buffer::Instance&, bool) override {
+    return Network::FilterStatus::Continue;
+  }
+  Network::FilterStatus onNewConnection() override { return Network::FilterStatus::Continue; }
+  void initializeReadFilterCallbacks(Network::ReadFilterCallbacks&) override {}
+
+  // AccessLog::Instance
+  void log(const AccessLog::LogContext&, const StreamInfo::StreamInfo&) override {
+    scope_.counterFromString("test_access_log_filter.log_called").inc();
+  }
+
+  Stats::Scope& scope_;
+};
+
+class AccessLogHandlerTestFilterFactory
+    : public Server::Configuration::NamedNetworkFilterConfigFactory {
+public:
+  absl::StatusOr<Network::FilterFactoryCb>
+  createFilterFactoryFromProto(const Protobuf::Message&,
+                               Server::Configuration::FactoryContext& context) override {
+    Stats::Scope& scope = context.scope();
+    return [&scope](Network::FilterManager& filter_manager) {
+      auto filter = std::make_shared<AccessLogHandlerTestFilter>(scope);
+      filter_manager.addReadFilter(filter);
+      filter_manager.addAccessLogHandler(filter);
+    };
+  }
+
+  ProtobufTypes::MessagePtr createEmptyConfigProto() override {
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
+  }
+
+  std::string name() const override { return "envoy.test.access_log_handler_filter"; }
+};
+
+class NetworkFilterAccessLogIntegrationTest : public BaseIntegrationTest, public testing::Test {
+public:
+  NetworkFilterAccessLogIntegrationTest()
+      : BaseIntegrationTest(Network::Address::IpVersion::v4, ConfigHelper::tcpProxyConfig()) {}
+};
+
+TEST_F(NetworkFilterAccessLogIntegrationTest, AccessLogHandlerCalled) {
+  AccessLogHandlerTestFilterFactory factory;
+  Registry::InjectFactory<Server::Configuration::NamedNetworkFilterConfigFactory> register_factory(
+      factory);
+
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* filter_chain =
+        bootstrap.mutable_static_resources()->mutable_listeners(0)->mutable_filter_chains(0);
+    auto* filter = filter_chain->add_filters();
+    filter->set_name("envoy.test.access_log_handler_filter");
+    std::ignore = filter->mutable_typed_config()->PackFrom(Envoy::Protobuf::Struct());
+    // Move to front
+    for (int i = filter_chain->filters_size() - 1; i > 0; --i) {
+      filter_chain->mutable_filters()->SwapElements(i, i - 1);
+    }
+  });
+
+  initialize();
+  auto tcp_client = makeTcpConnection(lookupPort("listener_0"));
+  ASSERT_TRUE(tcp_client->write("hello"));
+
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+  ASSERT_TRUE(fake_upstream_connection->waitForData(5));
+
+  tcp_client->close();
+  ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
+
+  test_server_->waitForCounter("test_access_log_filter.log_called", testing::Ge(1));
 }
 
 } // namespace

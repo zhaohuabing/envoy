@@ -18,7 +18,7 @@ namespace Http {
 class PrefixValue {
 public:
   const char* prefix() {
-    absl::WriterMutexLock lock(&m_);
+    absl::WriterMutexLock lock(m_);
     read_ = true;
     return prefix_.c_str();
   }
@@ -26,7 +26,7 @@ public:
   // The char* prefix is used directly, so must be available for the interval where prefix() may be
   // called.
   void setPrefix(const char* prefix) {
-    absl::WriterMutexLock lock(&m_);
+    absl::WriterMutexLock lock(m_);
     // The check for unchanged string is purely for integration tests - this
     // should not happen in production.
     RELEASE_ASSERT(!read_ || prefix_ == std::string(prefix),
@@ -52,6 +52,7 @@ class CustomHeaderValues {
 public:
   const LowerCaseString Accept{"accept"};
   const LowerCaseString AcceptEncoding{"accept-encoding"};
+  const LowerCaseString AccessControlRequestHeaders{"access-control-request-headers"};
   const LowerCaseString AccessControlRequestMethod{"access-control-request-method"};
   const LowerCaseString AccessControlAllowOrigin{"access-control-allow-origin"};
   const LowerCaseString AccessControlAllowHeaders{"access-control-allow-headers"};
@@ -59,16 +60,27 @@ public:
   const LowerCaseString AccessControlExposeHeaders{"access-control-expose-headers"};
   const LowerCaseString AccessControlMaxAge{"access-control-max-age"};
   const LowerCaseString AccessControlAllowCredentials{"access-control-allow-credentials"};
+  const LowerCaseString AccessControlRequestPrviateNetwork{
+      "access-control-request-private-network"};
+  const LowerCaseString AccessControlAllowPrviateNetwork{"access-control-allow-private-network"};
   const LowerCaseString Age{"age"};
   const LowerCaseString AltSvc{"alt-svc"};
   const LowerCaseString Authentication{"authentication"};
   const LowerCaseString Authorization{"authorization"};
   const LowerCaseString CacheControl{"cache-control"};
+  const LowerCaseString CacheStatus{"cache-status"};
   const LowerCaseString CdnLoop{"cdn-loop"};
   const LowerCaseString ContentEncoding{"content-encoding"};
+  const LowerCaseString ConnectAcceptEncoding{"connect-accept-encoding"};
+  const LowerCaseString ConnectContentEncoding{"connect-content-encoding"};
+  const LowerCaseString ConnectProtocolVersion{"connect-protocol-version"};
+  const LowerCaseString ConnectTimeoutMs{"connect-timeout-ms"};
   const LowerCaseString Etag{"etag"};
   const LowerCaseString Expires{"expires"};
   const LowerCaseString GrpcAcceptEncoding{"grpc-accept-encoding"};
+  const LowerCaseString GrpcEncoding{"grpc-encoding"};
+  const LowerCaseString GrpcMessageType{"grpc-message-type"};
+  const LowerCaseString GrpcTimeout{"grpc-timeout"};
   const LowerCaseString IfMatch{"if-match"};
   const LowerCaseString IfNoneMatch{"if-none-match"};
   const LowerCaseString IfModifiedSince{"if-modified-since"};
@@ -101,6 +113,7 @@ public:
   struct {
     const std::string Brotli{"br"};
     const std::string Gzip{"gzip"};
+    const std::string Zstd{"zstd"};
   } ContentEncodingValues;
 
   struct {
@@ -129,9 +142,14 @@ public:
 
   const LowerCaseString ProxyAuthenticate{"proxy-authenticate"};
   const LowerCaseString ProxyAuthorization{"proxy-authorization"};
+  // Registered by RFC 10008 Section 3. The value is a Structured Fields list of media ranges, not
+  // a plain comma-separated list, so it must be parsed as a Structured Field.
+  const LowerCaseString AcceptQuery{"accept-query"};
+  const LowerCaseString CapsuleProtocol{"capsule-protocol"};
   const LowerCaseString ClientTraceId{"x-client-trace-id"};
   const LowerCaseString Connection{"connection"};
   const LowerCaseString ContentLength{"content-length"};
+  const LowerCaseString ContentLocation{"content-location"};
   const LowerCaseString ContentRange{"content-range"};
   const LowerCaseString ContentType{"content-type"};
   const LowerCaseString Cookie{"cookie"};
@@ -149,18 +167,24 @@ public:
       absl::StrCat(prefix(), "-hedge-on-per-try-timeout")};
   const LowerCaseString EnvoyImmediateHealthCheckFail{
       absl::StrCat(prefix(), "-immediate-health-check-fail")};
+  const LowerCaseString EnvoyIsTimeoutRetry{absl::StrCat(prefix(), "-is-timeout-retry")};
   const LowerCaseString EnvoyOriginalUrl{absl::StrCat(prefix(), "-original-url")};
   const LowerCaseString EnvoyInternalRequest{absl::StrCat(prefix(), "-internal")};
   // TODO(mattklein123): EnvoyIpTags should be a custom header registered with the IP tagging
   // filter. We need to figure out if we can remove this header from the set of headers that
   // participate in prefix overrides.
   const LowerCaseString EnvoyIpTags{absl::StrCat(prefix(), "-ip-tags")};
+  const LowerCaseString EnvoyLocalOverloaded{absl::StrCat(prefix(), "-local-overloaded")};
   const LowerCaseString EnvoyMaxRetries{absl::StrCat(prefix(), "-max-retries")};
   const LowerCaseString EnvoyNotForwarded{absl::StrCat(prefix(), "-not-forwarded")};
   const LowerCaseString EnvoyOriginalDstHost{absl::StrCat(prefix(), "-original-dst-host")};
   const LowerCaseString EnvoyOriginalMethod{absl::StrCat(prefix(), "-original-method")};
   const LowerCaseString EnvoyOriginalPath{absl::StrCat(prefix(), "-original-path")};
+  const LowerCaseString EnvoyOriginalHost{absl::StrCat(prefix(), "-original-host")};
   const LowerCaseString EnvoyOverloaded{absl::StrCat(prefix(), "-overloaded")};
+  const LowerCaseString EnvoyDropOverload{absl::StrCat(prefix(), "-drop-overload")};
+  const LowerCaseString EnvoyUnconditionalDropOverload{
+      absl::StrCat(prefix(), "-unconditional-drop-overload")};
   const LowerCaseString EnvoyRateLimited{absl::StrCat(prefix(), "-ratelimited")};
   const LowerCaseString EnvoyRetryOn{absl::StrCat(prefix(), "-retry-on")};
   const LowerCaseString EnvoyRetryGrpcOn{absl::StrCat(prefix(), "-retry-grpc-on")};
@@ -186,10 +210,12 @@ public:
   const LowerCaseString EnvoyUpstreamStreamDurationMs{
       absl::StrCat(prefix(), "-upstream-stream-duration-ms")};
   const LowerCaseString EnvoyDecoratorOperation{absl::StrCat(prefix(), "-decorator-operation")};
+  const LowerCaseString EnvoyCompressionStatus{absl::StrCat(prefix(), "-compression-status")};
   const LowerCaseString Expect{"expect"};
   const LowerCaseString ForwardedClientCert{"x-forwarded-client-cert"};
   const LowerCaseString ForwardedFor{"x-forwarded-for"};
   const LowerCaseString ForwardedHost{"x-forwarded-host"};
+  const LowerCaseString ForwardedPort{"x-forwarded-port"};
   const LowerCaseString ForwardedProto{"x-forwarded-proto"};
   const LowerCaseString GrpcMessage{"grpc-message"};
   const LowerCaseString GrpcStatus{"grpc-status"};
@@ -204,6 +230,7 @@ public:
   const LowerCaseString Path{":path"};
   const LowerCaseString Protocol{":protocol"};
   const LowerCaseString ProxyConnection{"proxy-connection"};
+  const LowerCaseString ProxyStatus{"proxy-status"};
   const LowerCaseString Range{"range"};
   const LowerCaseString RequestId{"x-request-id"};
   const LowerCaseString Scheme{":scheme"};
@@ -217,7 +244,7 @@ public:
   const LowerCaseString Via{"via"};
   const LowerCaseString WWWAuthenticate{"www-authenticate"};
   const LowerCaseString XContentTypeOptions{"x-content-type-options"};
-  const LowerCaseString XSquashDebug{"x-squash-debug"};
+  const LowerCaseString EarlyData{"early-data"};
 
   struct {
     const std::string Close{"close"};
@@ -229,6 +256,7 @@ public:
   struct {
     const std::string H2c{"h2c"};
     const std::string WebSocket{"websocket"};
+    const std::string ConnectUdp{"connect-udp"};
   } UpgradeValues;
 
   struct {
@@ -236,6 +264,8 @@ public:
     const std::string TextEventStream{"text/event-stream"};
     const std::string TextUtf8{"text/plain; charset=UTF-8"}; // TODO(jmarantz): fold this into Text
     const std::string Html{"text/html; charset=UTF-8"};
+    const std::string Connect{"application/connect"};
+    const std::string ConnectProto{"application/connect+proto"};
     const std::string Grpc{"application/grpc"};
     const std::string GrpcWeb{"application/grpc-web"};
     const std::string GrpcWebProto{"application/grpc-web+proto"};
@@ -244,6 +274,7 @@ public:
     const std::string Json{"application/json"};
     const std::string Protobuf{"application/x-protobuf"};
     const std::string FormUrlEncoded{"application/x-www-form-urlencoded"};
+    const std::string Thrift{"application/x-thrift"};
   } ContentTypeValues;
 
   struct {
@@ -260,6 +291,14 @@ public:
 
   struct {
     const std::string True{"true"};
+  } EnvoyDropOverloadValues;
+
+  struct {
+    const std::string True{"true"};
+  } EnvoyUnconditionalDropOverloadValues;
+
+  struct {
+    const std::string True{"true"};
   } EnvoyRateLimitedValues;
 
   struct {
@@ -272,6 +311,8 @@ public:
     const std::string RetriableStatusCodes{"retriable-status-codes"};
     const std::string RetriableHeaders{"retriable-headers"};
     const std::string Reset{"reset"};
+    const std::string ResetBeforeRequest{"reset-before-request"};
+    const std::string Http3PostConnectFailure{"http3-post-connect-failure"};
   } EnvoyRetryOnValues;
 
   struct {
@@ -295,12 +336,16 @@ public:
     const std::string Patch{"PATCH"};
     const std::string Post{"POST"};
     const std::string Put{"PUT"};
+    // Registered by RFC 10008.
+    const std::string Query{"QUERY"};
     const std::string Trace{"TRACE"};
   } MethodValues;
 
   struct {
     // per https://tools.ietf.org/html/draft-kinnear-httpbis-http2-transport-02
     const std::string Bytestream{"bytestream"};
+    // per https://datatracker.ietf.org/doc/draft-ietf-webtrans-overview/
+    const std::string WebTransport{"webtransport"};
   } ProtocolValues;
 
   struct {
@@ -315,10 +360,12 @@ public:
     const std::string Deflate{"deflate"};
     const std::string Gzip{"gzip"};
     const std::string Identity{"identity"};
+    const std::string Zstd{"zstd"};
   } TransferEncodingValues;
 
   struct {
     const std::string EnvoyHealthChecker{"Envoy/HC"};
+    const std::string GoBrowser{"Go-browser"};
   } UserAgentValues;
 
   struct {
@@ -335,6 +382,17 @@ public:
     const std::string Http2String{"HTTP/2"};
     const std::string Http3String{"HTTP/3"};
   } ProtocolStrings;
+
+  struct {
+    const std::string ContentLengthTooSmall{"ContentLengthTooSmall"};
+    const std::string ContentTypeNotAllowed{"ContentTypeNotAllowed"};
+    const std::string EtagNotAllowed{"EtagNotAllowed"};
+    const std::string StatusCodeNotAllowed{"StatusCodeNotAllowed"};
+    const std::string Compressed{"Compressed"};
+    const std::string OriginalLengthPrefix{"OriginalLength="};
+    const std::string Separator{";"};
+    const std::string ValueSeparator{","};
+  } EnvoyCompressionStatusValues;
 };
 
 using Headers = ConstSingleton<HeaderValues>;

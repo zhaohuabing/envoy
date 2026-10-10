@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
+
 #include "envoy/event/dispatcher.h"
 #include "envoy/server/overload/overload_manager.h"
 #include "envoy/stats/scope.h"
@@ -20,9 +23,11 @@ public:
 private:
   void shrinkHeap();
 
-  bool active_;
+  bool active_{false};
   Envoy::Stats::Counter* shrink_counter_;
   Envoy::Event::TimerPtr timer_;
+  std::chrono::milliseconds timer_interval_;
+  uint64_t max_unfreed_memory_bytes_{};
 };
 
 } // namespace Memory

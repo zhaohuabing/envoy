@@ -1,15 +1,11 @@
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_binary",
+    "envoy_cc_library",
     "envoy_cc_test",
     "envoy_contrib_package",
 )
-load(
-    "//contrib:all_contrib_extensions.bzl",
-    "ARM64_SKIP_CONTRIB_TARGETS",
-    "PPC_SKIP_CONTRIB_TARGETS",
-    "envoy_all_contrib_extensions",
-)
+load("//contrib:all_contrib_extensions.bzl", "SELECTED_CONTRIB_EXTENSIONS")
 
 licenses(["notice"])  # Apache 2
 
@@ -20,28 +16,28 @@ alias(
     actual = ":envoy-static",
 )
 
+envoy_cc_library(
+    name = "contrib_version_suffix_lib",
+    srcs = ["version_suffix.cc"],
+    alwayslink = 1,
+)
+
 envoy_cc_binary(
     name = "envoy-static",
+    rbe_pool = "linux_x64_small",
     stamped = True,
-    deps = ["//source/exe:envoy_main_entry_lib"] + envoy_all_contrib_extensions(),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":contrib_version_suffix_lib",
+        "//source/exe:envoy_main_entry_lib",
+    ] + SELECTED_CONTRIB_EXTENSIONS,
 )
 
 envoy_cc_test(
-    name = "example_configs_test",
-    size = "large",
-    data = [
-        "//examples:contrib_configs",
-        "//test/config_test:example_configs_test_setup.sh",
-    ],
-    env = {
-        "EXAMPLE_CONFIGS_TAR_PATH": "envoy/examples/example_configs.tar",
-        "DISABLE_TEST_MERGE": "true",
-    },
+    name = "contrib_version_test",
+    srcs = ["contrib_version_test.cc"],
     deps = [
-        "//test/config_test:example_configs_test_lib",
-    ] + select({
-        "//bazel:linux_aarch64": envoy_all_contrib_extensions(ARM64_SKIP_CONTRIB_TARGETS),
-        "//bazel:linux_ppc": envoy_all_contrib_extensions(PPC_SKIP_CONTRIB_TARGETS),
-        "//conditions:default": envoy_all_contrib_extensions(),
-    }),
+        ":contrib_version_suffix_lib",
+        "//source/common/version:version_lib",
+    ],
 )

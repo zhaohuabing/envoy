@@ -7,18 +7,18 @@ namespace Envoy {
 namespace Stats {
 
 bool CustomStatNamespacesImpl::registered(const absl::string_view name) const {
-  ASSERT(Thread::MainThread::isMainOrTestThread());
-  return namespaces_.find(name) != namespaces_.end();
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
+  return namespaces_.contains(name);
 }
 
 void CustomStatNamespacesImpl::registerStatNamespace(const absl::string_view name) {
-  ASSERT(Thread::MainThread::isMainOrTestThread());
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
   namespaces_.insert(std::string(name));
 };
 
-absl::optional<absl::string_view>
+std::optional<absl::string_view>
 CustomStatNamespacesImpl::stripRegisteredPrefix(const absl::string_view stat_name) const {
-  ASSERT(Thread::MainThread::isMainOrTestThread());
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
   if (!namespaces_.empty()) {
     const auto pos = stat_name.find_first_of('.');
     if (pos != std::string::npos && registered(stat_name.substr(0, pos))) {
@@ -26,7 +26,7 @@ CustomStatNamespacesImpl::stripRegisteredPrefix(const absl::string_view stat_nam
       return stat_name.substr(pos + 1);
     }
   }
-  return absl::nullopt;
+  return std::nullopt;
 };
 
 } // namespace Stats

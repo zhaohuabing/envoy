@@ -16,7 +16,7 @@ virtual host name, manual path rewrite, manual host rewrite, path redirect, and
 header field matches. Extensions for other test cases can be added. Details about installing the tool
 and sample tool input/output can be found at :ref:`installation <install_tools_route_table_check_tool>`.
 
-The route table check tool config is composed of an array of json test objects. Each test object is composed of
+The route table check tool config is composed of an array of JSON test objects. Each test object is composed of
 three parts.
 
 Test name
@@ -31,51 +31,107 @@ Validate
   The validate fields specify the expected values and test cases to check. At least one test
   case is required.
 
-A simple tool configuration json has one test case and is written as follows. The test
-expects a cluster name match of "instant-server".::
+Basic example
+-------------
 
-   tests
-   - test_name: Cluster_name_test,
-     input:
-       authority: api.lyft.com,
-       path: /api/locations
-     validate:
-       cluster_name: instant-server
+This test case asserts that GET requests to ``api.lyft.com/api/locations`` are routed to the cluster ``instant-server``.
 
 .. code-block:: yaml
 
-  tests
-  - test_name: ...,
+  tests:
+  - test_name: cluster_name_test
     input:
-      authority: ...,
-      path: ...,
-      method: ...,
-      internal: ...,
-      random_value: ...,
-      ssl: ...,
-      runtime: ...,
+      authority: api.lyft.com
+      path: /api/locations
+      method: GET
+    validate:
+      cluster_name: instant-server
+
+Dynamic metadata example
+------------------------
+
+This test case demonstrates how to test routes that use dynamic metadata matchers. The test sets dynamic metadata
+and verifies that the route with the matching dynamic metadata condition is selected.
+
+.. code-block:: yaml
+
+  tests:
+  - test_name: dynamic_metadata_test
+    input:
+      authority: api.lyft.com
+      path: /example
+      method: GET
+      dynamic_metadata:
+        - metadata_namespace: example.meta
+          value:
+            foo: bar
+    validate:
+      cluster_name: cluster2
+      virtual_host_name: default
+
+The corresponding route configuration would need to include a dynamic metadata matcher:
+
+.. code-block:: yaml
+
+  virtual_hosts:
+  - name: default
+    domains:
+    - 'api.lyft.com'
+    routes:
+    - route:
+        cluster: cluster2
+      match:
+        path: /example
+        dynamic_metadata:
+          - filter: example.meta
+            path:
+             - key: foo
+            value:
+              string_match:
+                exact: bar
+
+Available test parameters
+-------------------------
+
+.. code-block:: yaml
+
+  tests:
+  - test_name: ...
+    input:
+      authority: ...
+      path: ...
+      method: ...
+      internal: ...
+      random_value: ...
+      ssl: ...
+      runtime: ...
       additional_request_headers:
-        - key: ...,
+        - key: ...
           value: ...
       additional_response_headers:
-        - key: ...,
+        - key: ...
           value: ...
+      dynamic_metadata:
+        - metadata_namespace: ...
+          value: ...
+          typed_value: ...
+          allow_overwrite: ...
     validate:
-      cluster_name: ...,
-      virtual_cluster_name: ...,
-      virtual_host_name: ...,
-      host_rewrite: ...,
-      path_rewrite: ...,
-      path_redirect: ...,
+      cluster_name: ...
+      virtual_cluster_name: ...
+      virtual_host_name: ...
+      host_rewrite: ...
+      path_rewrite: ...
+      path_redirect: ...
       request_header_matches:
-        - name: ...,
+        - name: ...
           string_match:
             exact: ...
       response_header_matches:
-        - name: ...,
+        - name: ...
           string_match:
             exact: ...
-        - name: ...,
+        - name: ...
           presence_match: ...
 
 test_name
@@ -92,8 +148,7 @@ input
     *(required, string)* The url path. An example path value is "/foo".
 
   method
-    *(required, string)* The request method. If not specified, the default method is GET. The options
-    are GET, PUT, or POST.
+    *(required, string)* The request method.
 
   internal
     *(optional, boolean)* A flag that determines whether to set x-envoy-internal to "true".
@@ -110,7 +165,7 @@ input
   ssl
     *(optional, boolean)* A flag that determines whether to set x-forwarded-proto to https or http.
     By setting x-forwarded-proto to a given protocol, the tool is able to simulate the behavior of
-    a client issuing a request via http or https. By default ssl is false which corresponds to
+    a client issuing a request via HTTP or HTTPS. By default ssl is false which corresponds to
     x-forwarded-proto set to http.
 
   runtime
@@ -129,6 +184,23 @@ input
 
     value
       *(required, string)* The value of the header field to add.
+
+  dynamic_metadata
+    *(optional, array)* Dynamic metadata to be added to the request as input for route determination.
+    This allows testing routes that use :ref:`dynamic metadata matchers <envoy_v3_api_field_config.route.v3.RouteMatch.dynamic_metadata>`.
+    Each metadata entry follows the :ref:`set_metadata filter schema <envoy_v3_api_msg_extensions.filters.http.set_metadata.v3.Metadata>`.
+
+    metadata_namespace
+      *(required, string)* The namespace for the metadata (e.g., "example.meta").
+
+    value
+      *(optional, object)* The metadata value as a JSON object (e.g., {"foo": "bar"}).
+
+    typed_value
+      *(optional, object)* The typed metadata value (alternative to value).
+
+    allow_overwrite
+      *(optional, boolean)* Whether to allow overwriting existing metadata. Defaults to false.
 
 validate
   *(required, object)* The validate object specifies the returned route parameters to match. At least one
@@ -152,6 +224,9 @@ validate
 
   path_redirect
     *(optional, string)* Match the returned redirect path.
+
+  code_redirect
+    *(optional, integer)* Match the redirect response code.
 
   request_header_fields, response_header_fields
     *(optional, array, deprecated)*  Match the listed header fields. Example header fields include the "path", "cookie",

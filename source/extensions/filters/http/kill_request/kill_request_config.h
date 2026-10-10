@@ -14,16 +14,19 @@ namespace KillRequest {
  * Config registration for KillRequestFilter. @see NamedHttpFilterConfigFactory.
  */
 class KillRequestFilterFactory
-    : public Common::FactoryBase<envoy::extensions::filters::http::kill_request::v3::KillRequest> {
+    : public Common::UnifiedFactoryBase<
+          envoy::extensions::filters::http::kill_request::v3::KillRequest> {
 public:
-  KillRequestFilterFactory() : FactoryBase("envoy.filters.http.kill_request") {}
+  KillRequestFilterFactory() : UnifiedFactoryBase("envoy.filters.http.kill_request") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::kill_request::v3::KillRequest& proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::kill_request::v3::KillRequest& proto_config,
       Server::Configuration::ServerFactoryContext& context,
       ProtobufMessage::ValidationVisitor& validator) override;

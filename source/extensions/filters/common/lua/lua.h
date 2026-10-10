@@ -11,6 +11,7 @@
 #include "source/common/common/c_smart_ptr.h"
 #include "source/common/common/logger.h"
 
+#include "absl/status/status.h"
 #include "lua.hpp"
 
 namespace Envoy {
@@ -85,7 +86,7 @@ inline absl::string_view getStringViewFromLuaString(lua_State* state, int index)
   // string, since Lua provides automatic conversion between string and number values at run time
   // (https://www.lua.org/manual/5.1/manual.html#2.2.1).
   const char* input = luaL_checklstring(state, index, &input_size);
-  return absl::string_view(input, input_size);
+  return {input, input_size};
 }
 
 /**
@@ -114,6 +115,11 @@ template <typename T> inline T* allocateLuaUserData(lua_State* state) {
   return alignAndCast<T>(mem);
 }
 
+class LuaLoggable : public Logger::Loggable<Logger::Id::lua> {
+public:
+  void scriptLog(spdlog::level::level_enum level, absl::string_view message);
+};
+
 /**
  * This is the base class for all C++ objects that we expose out to Lua. The goal is to hide as
  * much ugliness as possible. In general, to use this, do the following:
@@ -128,9 +134,10 @@ template <typename T> inline T* allocateLuaUserData(lua_State* state) {
  * owned by Lua*. Lua can GC it at any time. If you want to make sure that does not happen, you
  * must hold a ref to it in C++, generally via LuaRef or LuaDeathRef.
  */
-template <class T> class BaseLuaObject : protected Logger::Loggable<Logger::Id::lua> {
+template <class T> class BaseLuaObject : public LuaLoggable {
 public:
-  using ExportedFunctions = std::vector<std::pair<const char*, lua_CFunction>>;
+  using ExportedFunction = std::pair<const char*, lua_CFunction>;
+  using ExportedFunctions = std::vector<ExportedFunction>;
 
   virtual ~BaseLuaObject() = default;
 
@@ -155,12 +162,27 @@ public:
    * @param state supplies the state to register with.
    */
   static void registerType(lua_State* state) {
+    constexpr std::array log_functions{
+        ExportedFunction{"logTrace", static_luaLogTrace},
+        ExportedFunction{"logDebug", static_luaLogDebug},
+        ExportedFunction{"logInfo", static_luaLogInfo},
+        ExportedFunction{"logWarn", static_luaLogWarn},
+        ExportedFunction{"logErr", static_luaLogErr},
+        ExportedFunction{"logCritical", static_luaLogCritical},
+    };
+
     std::vector<luaL_Reg> to_register;
+    // Reserve slots to avoid reallocation, otherwise clang-tidy will complain about it.
+    to_register.reserve(log_functions.size() + T::exportedFunctions().size() + 2);
+
+    for (auto& function : log_functions) {
+      to_register.push_back({function.first, function.second});
+    }
 
     // Fetch all of the functions to be exported to Lua so that we can register them in the
     // metatable.
     ExportedFunctions functions = T::exportedFunctions();
-    for (auto function : functions) {
+    for (auto& function : functions) {
       to_register.push_back({function.first, function.second});
     }
 
@@ -236,8 +258,55 @@ protected:
   virtual void onMarkLive() {}
 
 private:
+  /**
+   * Log a message to the Envoy log.
+   * @param 1 (string): The log message.
+   */
+  DECLARE_LUA_FUNCTION(T, luaLogTrace);
+  DECLARE_LUA_FUNCTION(T, luaLogDebug);
+  DECLARE_LUA_FUNCTION(T, luaLogInfo);
+  DECLARE_LUA_FUNCTION(T, luaLogWarn);
+  DECLARE_LUA_FUNCTION(T, luaLogErr);
+  DECLARE_LUA_FUNCTION(T, luaLogCritical);
+
   bool dead_{};
 };
+
+template <class T> int BaseLuaObject<T>::luaLogTrace(lua_State* state) {
+  absl::string_view message = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
+  scriptLog(spdlog::level::trace, message);
+  return 0;
+}
+
+template <class T> int BaseLuaObject<T>::luaLogDebug(lua_State* state) {
+  absl::string_view message = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
+  scriptLog(spdlog::level::debug, message);
+  return 0;
+}
+
+template <class T> int BaseLuaObject<T>::luaLogInfo(lua_State* state) {
+  absl::string_view message = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
+  scriptLog(spdlog::level::info, message);
+  return 0;
+}
+
+template <class T> int BaseLuaObject<T>::luaLogWarn(lua_State* state) {
+  absl::string_view message = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
+  scriptLog(spdlog::level::warn, message);
+  return 0;
+}
+
+template <class T> int BaseLuaObject<T>::luaLogErr(lua_State* state) {
+  absl::string_view message = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
+  scriptLog(spdlog::level::err, message);
+  return 0;
+}
+
+template <class T> int BaseLuaObject<T>::luaLogCritical(lua_State* state) {
+  absl::string_view message = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
+  scriptLog(spdlog::level::critical, message);
+  return 0;
+}
 
 /**
  * This is basically a Lua smart pointer. The idea is that given a Lua object, if we want to
@@ -261,6 +330,15 @@ public:
    */
   LuaRef(const std::pair<T*, lua_State*>& object, bool leave_on_stack) {
     reset(object, leave_on_stack);
+  }
+
+  LuaRef(const LuaRef&) = delete;
+
+  LuaRef(LuaRef&& that) noexcept {
+    object_ = that.object_;
+    ref_ = that.ref_;
+    that.object_ = std::pair<T*, lua_State*>{};
+    that.ref_ = LUA_NOREF;
   }
 
   ~LuaRef() { unref(); }
@@ -318,6 +396,9 @@ template <typename T> class LuaDeathRef : public LuaRef<T> {
 public:
   using LuaRef<T>::LuaRef;
 
+  LuaDeathRef(const LuaDeathRef&) = delete;
+  LuaDeathRef(LuaDeathRef&&) noexcept = default;
+
   ~LuaDeathRef() { markDead(); }
 
   void markDead() {
@@ -343,6 +424,10 @@ public:
   }
 };
 
+// Callback invoked when a coroutine yields. It returns a status so an unexpected yield can be
+// reported without throwing.
+using YieldCallback = std::function<absl::Status()>;
+
 /**
  * This is a wrapper for a Lua coroutine. Lua intermixes coroutine and "thread." Lua does not have
  * real threads, only cooperatively scheduled coroutines.
@@ -361,17 +446,21 @@ public:
    *        ThreadLocalState::registerGlobal().
    * @param num_args supplies the number of arguments to start the coroutine with. They should be
    *        on the stack already.
-   * @param yield_callback supplies a callback that will be invoked if the coroutine yields.
+   * @param yield_callback supplies a callback that will be invoked if the coroutine yields. It
+   *        returns a status so an unexpected yield can be reported without throwing.
+   * @return the status of the coroutine execution; not OK on a Lua error or a yield_callback error.
    */
-  void start(int function_ref, int num_args, const std::function<void()>& yield_callback);
+  absl::Status start(int function_ref, int num_args, const YieldCallback& yield_callback);
 
   /**
    * Resume a previously yielded coroutine.
    * @param num_args supplies the number of arguments to resume the coroutine with. They should be
    *        on the stack already.
-   * @param yield_callback supplies a callback that will be invoked if the coroutine yields.
+   * @param yield_callback supplies a callback that will be invoked if the coroutine yields. It
+   *        returns a status so an unexpected yield can be reported without throwing.
+   * @return the status of the coroutine execution; not OK on a Lua error or a yield_callback error.
    */
-  void resume(int num_args, const std::function<void()>& yield_callback);
+  absl::Status resume(int num_args, const YieldCallback& yield_callback);
 
 private:
   LuaRef<lua_State> coroutine_state_;
@@ -383,13 +472,31 @@ using Initializer = std::function<void(lua_State*)>;
 using InitializerList = std::vector<Initializer>;
 
 /**
+ * Additional module search patterns for a Lua state, prepended to the interpreter's built-in
+ * defaults so that a script can require() modules from locations the interpreter does not search
+ * on its own. Each member holds patterns already joined in Lua's own ';'-separated syntax, or is
+ * empty to leave that search path untouched.
+ */
+struct PackagePaths {
+  // Prepended to `package.path`, for modules that are Lua source.
+  std::string path;
+  // Prepended to `package.cpath`, for modules that are loadable C libraries.
+  std::string cpath;
+};
+
+/**
  * This class wraps a Lua state that can be used safely across threads. The model is that every
  * worker gets its own independent state. There is no truly global state that a script can access.
  * This is something that might be provided in the future via an API (not via Lua itself).
  */
 class ThreadLocalState : Logger::Loggable<Logger::Id::lua> {
 public:
-  ThreadLocalState(const std::string& code, ThreadLocal::SlotAllocator& tls);
+  // creation_status is set (and construction stops early) if the supplied code cannot be parsed.
+  // package_paths is applied to every state this object creates, including the one the code is
+  // parsed on, so that a require() at the top level of the code resolves the same way there as it
+  // will on a worker.
+  ThreadLocalState(const std::string& code, const PackagePaths& package_paths,
+                   ThreadLocal::SlotAllocator& tls, absl::Status& creation_status);
 
   /**
    * @return CoroutinePtr a new coroutine.
@@ -436,7 +543,7 @@ public:
 
 private:
   struct LuaThreadLocal : public ThreadLocal::ThreadLocalObject {
-    LuaThreadLocal(const std::string& code);
+    LuaThreadLocal(const std::string& code, const PackagePaths& package_paths);
 
     CSmartPtr<lua_State, lua_close> state_;
     std::vector<int> global_slots_;
@@ -449,14 +556,6 @@ private:
 };
 
 using ThreadLocalStatePtr = std::unique_ptr<ThreadLocalState>;
-
-/**
- * An exception specific to Lua errors.
- */
-class LuaException : public EnvoyException {
-public:
-  using EnvoyException::EnvoyException;
-};
 } // namespace Lua
 } // namespace Common
 } // namespace Filters

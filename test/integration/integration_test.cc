@@ -3,9 +3,12 @@
 #include <string>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/route/v3/route_components.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+#include "envoy/registry/registry.h"
 
+#include "source/common/common/cpu_affinity.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/headers.h"
 #include "source/common/network/socket_option_factory.h"
@@ -26,12 +29,17 @@
 #include "gtest/gtest.h"
 
 using Envoy::Http::Headers;
-using Envoy::Http::HeaderValueOf;
 using Envoy::Http::HttpStatusIs;
+using testing::Combine;
+using testing::ContainsRegex;
 using testing::EndsWith;
+using testing::Eq;
+using testing::Ge;
 using testing::HasSubstr;
 using testing::Not;
 using testing::StartsWith;
+using testing::Values;
+using testing::ValuesIn;
 
 namespace Envoy {
 namespace {
@@ -52,11 +60,14 @@ void setAllowHttp10WithDefaultHost(
   hcm.mutable_http_protocol_options()->set_default_host_for_http_10("default.com");
 }
 
+std::string testParamToString(const testing::TestParamInfo<Network::Address::IpVersion>& params) {
+  return TestUtility::ipVersionToString(params.param);
+}
+
 } // namespace
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, IntegrationTest,
-                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
-                         TestUtility::ipTestParamsToString);
+                         ValuesIn(TestEnvironment::getIpVersionsForTest()), testParamToString);
 
 // Verify that we gracefully handle an invalid pre-bind socket option when using reuse_port.
 TEST_P(IntegrationTest, BadPrebindSocketOptionWithReusePort) {
@@ -76,7 +87,7 @@ TEST_P(IntegrationTest, BadPrebindSocketOptionWithReusePort) {
     socket_option->set_int_value(10000); // Invalid value.
   });
   initialize();
-  test_server_->waitForCounterGe("listener_manager.listener_create_failure", 1);
+  test_server_->waitForCounter("listener_manager.listener_create_failure", Ge(1));
 }
 
 // Verify that we gracefully handle an invalid post-bind socket option when using reuse_port.
@@ -97,7 +108,7 @@ TEST_P(IntegrationTest, BadPostbindSocketOptionWithReusePort) {
     socket_option->set_int_value(10000); // Invalid value.
   });
   initialize();
-  test_server_->waitForCounterGe("listener_manager.listener_create_failure", 1);
+  test_server_->waitForCounter("listener_manager.listener_create_failure", Ge(1));
 }
 
 // Verify that we gracefully handle an invalid post-listen socket option.
@@ -113,11 +124,12 @@ TEST_P(IntegrationTest, BadPostListenSocketOption) {
     socket_option->set_int_value(10000); // Invalid value.
   });
   initialize();
-  test_server_->waitForCounterGe("listener_manager.listener_create_failure", 1);
+  test_server_->waitForCounter("listener_manager.listener_create_failure", Ge(1));
 }
 
 // Make sure we have correctly specified per-worker performance stats.
 TEST_P(IntegrationTest, PerWorkerStatsAndBalancing) {
+  DISABLE_IF_ADMIN_DISABLED; // Uses admin stats
   concurrency_ = 2;
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     auto* listener = bootstrap.mutable_static_resources()->mutable_listeners(0);
@@ -127,16 +139,20 @@ TEST_P(IntegrationTest, PerWorkerStatsAndBalancing) {
 
   // Per-worker listener stats.
   auto check_listener_stats = [this](uint64_t cx_active, uint64_t cx_total) {
-    if (GetParam() == Network::Address::IpVersion::v4) {
-      test_server_->waitForGaugeEq("listener.127.0.0.1_0.worker_0.downstream_cx_active", cx_active);
-      test_server_->waitForGaugeEq("listener.127.0.0.1_0.worker_1.downstream_cx_active", cx_active);
-      test_server_->waitForCounterEq("listener.127.0.0.1_0.worker_0.downstream_cx_total", cx_total);
-      test_server_->waitForCounterEq("listener.127.0.0.1_0.worker_1.downstream_cx_total", cx_total);
+    if (version_ == Network::Address::IpVersion::v4) {
+      test_server_->waitForGauge("listener.127.0.0.1_0.worker_0.downstream_cx_active",
+                                 Eq(cx_active));
+      test_server_->waitForGauge("listener.127.0.0.1_0.worker_1.downstream_cx_active",
+                                 Eq(cx_active));
+      test_server_->waitForCounter("listener.127.0.0.1_0.worker_0.downstream_cx_total",
+                                   Eq(cx_total));
+      test_server_->waitForCounter("listener.127.0.0.1_0.worker_1.downstream_cx_total",
+                                   Eq(cx_total));
     } else {
-      test_server_->waitForGaugeEq("listener.[__1]_0.worker_0.downstream_cx_active", cx_active);
-      test_server_->waitForGaugeEq("listener.[__1]_0.worker_1.downstream_cx_active", cx_active);
-      test_server_->waitForCounterEq("listener.[__1]_0.worker_0.downstream_cx_total", cx_total);
-      test_server_->waitForCounterEq("listener.[__1]_0.worker_1.downstream_cx_total", cx_total);
+      test_server_->waitForGauge("listener.[__1]_0.worker_0.downstream_cx_active", Eq(cx_active));
+      test_server_->waitForGauge("listener.[__1]_0.worker_1.downstream_cx_active", Eq(cx_active));
+      test_server_->waitForCounter("listener.[__1]_0.worker_0.downstream_cx_total", Eq(cx_total));
+      test_server_->waitForCounter("listener.[__1]_0.worker_1.downstream_cx_total", Eq(cx_total));
     }
   };
   check_listener_stats(0, 0);
@@ -158,13 +174,136 @@ TEST_P(IntegrationTest, PerWorkerStatsAndBalancing) {
   check_listener_stats(0, 1);
 }
 
+// Verify that Envoy starts and serves traffic with worker CPU affinity enabled. On Linux this pins
+// each worker thread to a CPU, on other platforms it is a no-op.
+TEST_P(IntegrationTest, WorkerCpuAffinity) {
+  concurrency_ = 2;
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    bootstrap.set_enable_worker_cpu_affinity(true);
+  });
+  initialize();
+
+  // Worker pinning happens during startup, so the gauge reflects the per-worker CPU assignment
+  // derived from the same process affinity mask observed here.
+  const uint64_t expected_pinned_workers = Thread::workerCpuAssignment(concurrency_).size();
+  test_server_->waitForGauge("listener_manager.workers_pinned", Eq(expected_pinned_workers));
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+  codec_client_->close();
+}
+
+// Verify that a listener configured with the CPU locality connection balancer and worker CPU
+// affinity starts and serves traffic. On kernels that support reuse port BPF steering this
+// exercises the BPF fast path, otherwise the kernel distributes connections with its default
+// reuse port hashing.
+TEST_P(IntegrationTest, CpuLocalityConnectionBalancer) {
+  concurrency_ = 2;
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    bootstrap.set_enable_worker_cpu_affinity(true);
+    auto* listener = bootstrap.mutable_static_resources()->mutable_listeners(0);
+    listener->mutable_connection_balance_config()->mutable_cpu_locality_balance();
+  });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+  codec_client_->close();
+}
+
+class TestConnectionBalanceFactory : public Network::ConnectionBalanceFactory {
+public:
+  ProtobufTypes::MessagePtr createEmptyConfigProto() override {
+    // Using Struct instead of a custom empty config proto. This is only allowed in tests.
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
+  }
+  Network::ConnectionBalancerSharedPtr
+  createConnectionBalancerFromProto(const Protobuf::Message&,
+                                    Server::Configuration::FactoryContext&) override {
+    return std::make_shared<Network::ExactConnectionBalancerImpl>();
+  }
+  std::string name() const override { return "envoy.network.connection_balance.test"; }
+};
+
+// Test extend balance.
+TEST_P(IntegrationTest, ConnectionBalanceFactory) {
+  DISABLE_IF_ADMIN_DISABLED; // Uses admin stats
+  concurrency_ = 2;
+
+  TestConnectionBalanceFactory factory;
+  Registry::InjectFactory<Envoy::Network::ConnectionBalanceFactory> registered(factory);
+
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    TestConnectionBalanceFactory test_connection_balancer;
+    Registry::InjectFactory<Envoy::Network::ConnectionBalanceFactory> inject_factory(
+        test_connection_balancer);
+
+    auto* listener = bootstrap.mutable_static_resources()->mutable_listeners(0);
+
+    auto* connection_balance_config = listener->mutable_connection_balance_config();
+    auto* extend_balance_config = connection_balance_config->mutable_extend_balance();
+    extend_balance_config->set_name("envoy.network.connection_balance.test");
+    extend_balance_config->mutable_typed_config()->set_type_url(
+        "type.googleapis.com/google.protobuf.Struct");
+  });
+
+  initialize();
+
+  auto check_listener_stats = [this](uint64_t cx_active, uint64_t cx_total) {
+    if (version_ == Network::Address::IpVersion::v4) {
+      test_server_->waitForGauge("listener.127.0.0.1_0.worker_0.downstream_cx_active",
+                                 Eq(cx_active));
+      test_server_->waitForGauge("listener.127.0.0.1_0.worker_1.downstream_cx_active",
+                                 Eq(cx_active));
+      test_server_->waitForCounter("listener.127.0.0.1_0.worker_0.downstream_cx_total",
+                                   Eq(cx_total));
+      test_server_->waitForCounter("listener.127.0.0.1_0.worker_1.downstream_cx_total",
+                                   Eq(cx_total));
+    } else {
+      test_server_->waitForGauge("listener.[__1]_0.worker_0.downstream_cx_active", Eq(cx_active));
+      test_server_->waitForGauge("listener.[__1]_0.worker_1.downstream_cx_active", Eq(cx_active));
+      test_server_->waitForCounter("listener.[__1]_0.worker_0.downstream_cx_total", Eq(cx_total));
+      test_server_->waitForCounter("listener.[__1]_0.worker_1.downstream_cx_total", Eq(cx_total));
+    }
+  };
+  check_listener_stats(0, 0);
+
+  // Main thread admin listener stats.
+  test_server_->waitForCounterExists("listener.admin.main_thread.downstream_cx_total");
+
+  // Per-thread watchdog stats.
+  test_server_->waitForCounterExists("server.main_thread.watchdog_miss");
+  test_server_->waitForCounterExists("server.worker_0.watchdog_miss");
+  test_server_->waitForCounterExists("server.worker_1.watchdog_miss");
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  IntegrationCodecClientPtr codec_client2 = makeHttpConnection(lookupPort("http"));
+  check_listener_stats(1, 1);
+
+  codec_client_->close();
+  codec_client2->close();
+  check_listener_stats(0, 1);
+}
+
+// On OSX this is flaky as we can end up with connection imbalance.
+#if !defined(__APPLE__)
 // Make sure all workers pick up connections
 TEST_P(IntegrationTest, AllWorkersAreHandlingLoad) {
   concurrency_ = 2;
   initialize();
 
   std::string worker0_stat_name, worker1_stat_name;
-  if (GetParam() == Network::Address::IpVersion::v4) {
+  if (version_ == Network::Address::IpVersion::v4) {
     worker0_stat_name = "listener.127.0.0.1_0.worker_0.downstream_cx_total";
     worker1_stat_name = "listener.127.0.0.1_0.worker_1.downstream_cx_total";
   } else {
@@ -172,8 +311,8 @@ TEST_P(IntegrationTest, AllWorkersAreHandlingLoad) {
     worker1_stat_name = "listener.[__1]_0.worker_1.downstream_cx_total";
   }
 
-  test_server_->waitForCounterEq(worker0_stat_name, 0);
-  test_server_->waitForCounterEq(worker1_stat_name, 0);
+  test_server_->waitForCounter(worker0_stat_name, Eq(0));
+  test_server_->waitForCounter(worker1_stat_name, Eq(0));
 
   // We set the counters for the two workers to see how many connections each handles.
   uint64_t w0_ctr = 0;
@@ -204,6 +343,7 @@ TEST_P(IntegrationTest, AllWorkersAreHandlingLoad) {
   EXPECT_TRUE(w0_ctr > 1);
   EXPECT_TRUE(w1_ctr > 1);
 }
+#endif
 
 TEST_P(IntegrationTest, RouterDirectResponseWithBody) {
   const std::string body = "Response body";
@@ -218,16 +358,19 @@ TEST_P(IntegrationTest, RouterDirectResponseWithBody) {
         auto* header_value_option = route_config->mutable_response_headers_to_add()->Add();
         header_value_option->mutable_header()->set_key("x-additional-header");
         header_value_option->mutable_header()->set_value("example-value");
-        header_value_option->mutable_append()->set_value(false);
+        header_value_option->set_append_action(
+            envoy::config::core::v3::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
         header_value_option = route_config->mutable_response_headers_to_add()->Add();
         header_value_option->mutable_header()->set_key("content-type");
         header_value_option->mutable_header()->set_value("text/html");
-        header_value_option->mutable_append()->set_value(false);
+        header_value_option->set_append_action(
+            envoy::config::core::v3::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
         // Add a wrong content-length.
         header_value_option = route_config->mutable_response_headers_to_add()->Add();
         header_value_option->mutable_header()->set_key("content-length");
         header_value_option->mutable_header()->set_value("2000");
-        header_value_option->mutable_append()->set_value(false);
+        header_value_option->set_append_action(
+            envoy::config::core::v3::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
         auto* virtual_host = route_config->add_virtual_hosts();
         virtual_host->set_name(domain);
         virtual_host->add_domains(domain);
@@ -266,16 +409,19 @@ TEST_P(IntegrationTest, RouterDirectResponseEmptyBody) {
         auto* header_value_option = route_config->mutable_response_headers_to_add()->Add();
         header_value_option->mutable_header()->set_key("x-additional-header");
         header_value_option->mutable_header()->set_value("example-value");
-        header_value_option->mutable_append()->set_value(false);
+        header_value_option->set_append_action(
+            envoy::config::core::v3::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
         header_value_option = route_config->mutable_response_headers_to_add()->Add();
         header_value_option->mutable_header()->set_key("content-type");
         header_value_option->mutable_header()->set_value("text/html");
-        header_value_option->mutable_append()->set_value(false);
+        header_value_option->set_append_action(
+            envoy::config::core::v3::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
         // Add a wrong content-length.
         header_value_option = route_config->mutable_response_headers_to_add()->Add();
         header_value_option->mutable_header()->set_key("content-length");
         header_value_option->mutable_header()->set_value("2000");
-        header_value_option->mutable_append()->set_value(false);
+        header_value_option->set_append_action(
+            envoy::config::core::v3::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
         auto* virtual_host = route_config->add_virtual_hosts();
         virtual_host->set_name(domain);
         virtual_host->add_domains(domain);
@@ -303,18 +449,24 @@ TEST_P(IntegrationTest, RouterDirectResponseEmptyBody) {
   EXPECT_THAT(log, HasSubstr(route_name));
 }
 
-TEST_P(IntegrationTest, ConnectionClose) {
+TEST_P(IntegrationTest, ConnectionCloseHeader) {
   autonomous_upstream_ = true;
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) { hcm.mutable_delayed_close_timeout()->set_seconds(10); });
+
   initialize();
   codec_client_ = makeHttpConnection(lookupPort("http"));
 
   auto response = codec_client_->makeHeaderOnlyRequest(Http::TestRequestHeaderMapImpl{
       {":method", "GET"}, {":path", "/"}, {":authority", "host"}, {"connection", "close"}});
   ASSERT_TRUE(response->waitForEndStream());
-  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  ASSERT_TRUE(codec_client_->waitForDisconnect(std::chrono::milliseconds(1000)));
 
   EXPECT_TRUE(response->complete());
   EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+  EXPECT_THAT(response->headers(), ContainsHeader(Headers::get().Connection, "close"));
+  EXPECT_EQ(codec_client_->lastConnectionEvent(), Network::ConnectionEvent::RemoteClose);
 }
 
 TEST_P(IntegrationTest, RouterRequestAndResponseWithBodyNoBuffer) {
@@ -359,6 +511,28 @@ TEST_P(IntegrationTest, RouterRequestAndResponseLargeHeaderNoBuffer) {
 
 TEST_P(IntegrationTest, RouterHeaderOnlyRequestAndResponseNoBuffer) {
   testRouterHeaderOnlyRequestAndResponse();
+}
+
+TEST_P(IntegrationTest, CleanupWithIncompleteUpstreamRequest) {
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto encoder_decoder =
+      codec_client_->startRequest(Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                                                 {":path", "/"},
+                                                                 {":scheme", "http"},
+                                                                 {":authority", "host"},
+                                                                 {"content-length", "10"}});
+  Http::RequestEncoder& encoder = encoder_decoder.first;
+
+  Buffer::OwnedImpl partial_body("a");
+  codec_client_->sendData(encoder, partial_body, false);
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForData(*dispatcher_, 1));
+
+  // Cleanup must not interpret the resulting EOF as part of the incomplete HTTP/1 request.
+  cleanupUpstreamAndDownstream();
 }
 
 TEST_P(IntegrationTest, RouterUpstreamDisconnectBeforeRequestcomplete) {
@@ -407,16 +581,16 @@ TEST_P(IntegrationTest, RouterUpstreamResponseBeforeRequestComplete) {
   testRouterUpstreamResponseBeforeRequestComplete();
 }
 
-TEST_P(IntegrationTest, EnvoyProxyingEarly100ContinueWithEncoderFilter) {
+TEST_P(IntegrationTest, EnvoyProxyingEarly1xxWithEncoderFilter) {
   testEnvoyProxying1xx(true, true);
 }
 
-TEST_P(IntegrationTest, EnvoyProxyingLate100ContinueWithEncoderFilter) {
+TEST_P(IntegrationTest, EnvoyProxyingLate1xxWithEncoderFilter) {
   testEnvoyProxying1xx(false, true);
 }
 
 // Regression test for https://github.com/envoyproxy/envoy/issues/10923.
-TEST_P(IntegrationTest, EnvoyProxying100ContinueWithDecodeDataPause) {
+TEST_P(IntegrationTest, EnvoyProxying1xxWithDecodeDataPause) {
   config_helper_.prependFilter(R"EOF(
   name: stop-iteration-and-continue-filter
   typed_config:
@@ -425,11 +599,85 @@ TEST_P(IntegrationTest, EnvoyProxying100ContinueWithDecodeDataPause) {
   testEnvoyProxying1xx(true);
 }
 
+TEST_P(IntegrationTest, RouterRetryOnResetBeforeRequestAfterHeaders) {
+  testRouterRetryOnResetBeforeRequestAfterHeaders();
+}
+
+TEST_P(IntegrationTest, RouterRetryOnResetBeforeRequestBeforeHeaders) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* static_resources = bootstrap.mutable_static_resources();
+    auto* cluster = static_resources->mutable_clusters(0);
+    // Ensure we only have one connection upstream, one request active at a time.
+    ConfigHelper::HttpProtocolOptions protocol_options;
+    protocol_options.mutable_common_http_protocol_options()
+        ->mutable_max_requests_per_connection()
+        ->set_value(1);
+    protocol_options.mutable_use_downstream_protocol_config();
+    auto* circuit_breakers = cluster->mutable_circuit_breakers();
+    circuit_breakers->add_thresholds()->mutable_max_connections()->set_value(1);
+    ConfigHelper::setProtocolOptions(*bootstrap.mutable_static_resources()->mutable_clusters(0),
+                                     protocol_options);
+  });
+  config_helper_.prependFilter(R"EOF(
+    name: buffer-continue-filter
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.BufferContinueFilterConfig
+  )EOF",
+                               false);
+  testRouterRetryOnResetBeforeRequestBeforeHeaders();
+}
+
+// Test the x-envoy-is-timeout-retry header is set to false for retries that are not
+// initiated by timeouts.
+TEST_P(IntegrationTest, RouterIsTimeoutRetryHeader) {
+  auto host = config_helper_.createVirtualHost("example.com", "/test_retry");
+  host.set_include_is_timeout_retry_header(true);
+  config_helper_.addVirtualHost(host);
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/test_retry"},
+                                     {":scheme", "http"},
+                                     {":authority", "example.com"},
+                                     {"x-forwarded-for", "10.0.0.1"},
+                                     {"x-envoy-retry-on", "5xx"}},
+      1024);
+  waitForNextUpstreamRequest();
+  // Send a non-timeout failure response.
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "503"}}, false);
+
+  if (fake_upstreams_[0]->httpType() == Http::CodecType::HTTP1) {
+    ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  } else {
+    ASSERT_TRUE(upstream_request_->waitForReset());
+  }
+  // 5XX responses are retried.
+  waitForNextUpstreamRequest();
+
+  // The request did not fail due to a timeout, therefore we expect the x-envoy-is-timeout-retry
+  // header to be false.
+  EXPECT_EQ(upstream_request_->headers().getEnvoyIsTimeoutRetryValue(), "false");
+
+  // Return 200 to the retry.
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(512, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_EQ(1024U, upstream_request_->bodyLength());
+
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ(512U, response->body().size());
+}
+
 // Verifies that we can construct a match tree with a filter, and that we are able to skip
 // filter invocation through the match tree.
 TEST_P(IntegrationTest, MatchingHttpFilterConstruction) {
   concurrency_ = 2;
-  config_helper_.addRuntimeOverride("envoy.reloadable_features.experimental_matching_api", "true");
 
   config_helper_.prependFilter(R"EOF(
 name: matcher
@@ -458,12 +706,12 @@ typed_config:
 
   initialize();
 
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-
   {
+    codec_client_ = makeHttpConnection(lookupPort("http"));
     auto response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
     ASSERT_TRUE(response->waitForEndStream());
     EXPECT_THAT(response->headers(), HttpStatusIs("403"));
+    codec_client_->close();
   }
 
   {
@@ -496,7 +744,6 @@ typed_config:
 // that we are able to skip filter invocation through the match tree.
 TEST_P(IntegrationTest, MatchingHttpFilterConstructionNewProto) {
   concurrency_ = 2;
-  config_helper_.addRuntimeOverride("envoy.reloadable_features.experimental_matching_api", "true");
 
   config_helper_.prependFilter(R"EOF(
 name: matcher
@@ -525,12 +772,12 @@ typed_config:
 
   initialize();
 
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-
   {
+    codec_client_ = makeHttpConnection(lookupPort("http"));
     auto response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
     ASSERT_TRUE(response->waitForEndStream());
     EXPECT_THAT(response->headers(), HttpStatusIs("403"));
+    codec_client_->close();
   }
 
   {
@@ -561,8 +808,6 @@ typed_config:
 
 // Verifies routing via the match tree API.
 TEST_P(IntegrationTest, MatchTreeRouting) {
-  config_helper_.addRuntimeOverride("envoy.reloadable_features.experimental_matching_api", "true");
-
   const std::string vhost_yaml = R"EOF(
     name: vhost
     domains: ["matcher.com"]
@@ -576,6 +821,53 @@ TEST_P(IntegrationTest, MatchTreeRouting) {
         exact_match_map:
           map:
             "route":
+              action:
+                name: route
+                typed_config:
+                  "@type": type.googleapis.com/envoy.config.route.v3.Route
+                  match:
+                    prefix: /
+                  route:
+                    cluster: cluster_0
+  )EOF";
+
+  envoy::config::route::v3::VirtualHost virtual_host;
+  TestUtility::loadFromYaml(vhost_yaml, virtual_host);
+
+  config_helper_.addVirtualHost(virtual_host);
+  autonomous_upstream_ = true;
+
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "GET"},
+                                         {":path", "/whatever"},
+                                         {":scheme", "http"},
+                                         {"match-header", "route"},
+                                         {":authority", "matcher.com"}};
+  auto response = codec_client_->makeHeaderOnlyRequest(headers);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+
+  codec_client_->close();
+}
+
+// Verifies routing via the match tree API with prefix matching.
+TEST_P(IntegrationTest, PrefixMatchTreeRouting) {
+  const std::string vhost_yaml = R"EOF(
+    name: vhost
+    domains: ["matcher.com"]
+    matcher:
+      matcher_tree:
+        input:
+          name: request-headers
+          typed_config:
+            "@type": type.googleapis.com/envoy.type.matcher.v3.HttpRequestHeaderMatchInput
+            header_name: match-header
+        prefix_match_map:
+          map:
+            "r":
               action:
                 name: route
                 typed_config:
@@ -638,8 +930,8 @@ TEST_P(IntegrationTest, UpstreamDisconnectWithTwoRequests) {
   auto response2 = codec_client2->makeRequestWithBody(default_request_headers_, 512);
 
   // Validate one request active, the other pending.
-  test_server_->waitForGaugeEq("cluster.cluster_0.upstream_rq_active", 1);
-  test_server_->waitForGaugeEq("cluster.cluster_0.upstream_rq_pending_active", 1);
+  test_server_->waitForGauge("cluster.cluster_0.upstream_rq_active", Eq(1));
+  test_server_->waitForGauge("cluster.cluster_0.upstream_rq_pending_active", Eq(1));
 
   // Response 1.
   upstream_request_->encodeHeaders(default_response_headers_, false);
@@ -650,8 +942,8 @@ TEST_P(IntegrationTest, UpstreamDisconnectWithTwoRequests) {
   EXPECT_TRUE(upstream_request_->complete());
   EXPECT_TRUE(response->complete());
   EXPECT_EQ("200", response->headers().getStatusValue());
-  test_server_->waitForCounterGe("cluster.cluster_0.upstream_cx_total", 1);
-  test_server_->waitForCounterGe("cluster.cluster_0.upstream_rq_200", 1);
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_total", Ge(1));
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_200", Ge(1));
 
   // Response 2.
   ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
@@ -665,11 +957,16 @@ TEST_P(IntegrationTest, UpstreamDisconnectWithTwoRequests) {
   EXPECT_TRUE(upstream_request_->complete());
   EXPECT_TRUE(response2->complete());
   EXPECT_EQ("200", response2->headers().getStatusValue());
-  test_server_->waitForCounterGe("cluster.cluster_0.upstream_cx_total", 2);
-  test_server_->waitForCounterGe("cluster.cluster_0.upstream_rq_200", 2);
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_total", Ge(2));
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_200", Ge(2));
 }
 
 TEST_P(IntegrationTest, TestSmuggling) {
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
+  config_helper_.disableDelayClose();
   initialize();
 
   // Make sure the http parser rejects having content-length and transfer-encoding: chunked
@@ -729,6 +1026,55 @@ TEST_P(IntegrationTest, TestSmuggling) {
   }
 }
 
+TEST_P(IntegrationTest, TestInvalidChunkedEncoding) {
+  autonomous_upstream_ = true;
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.strict_chunk_parsing", "true");
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
+  config_helper_.disableDelayClose();
+  initialize();
+  std::string response;
+  const std::string request = "GET / HTTP/1.1\r\nHost: host\r\ntransfer-encoding: chunked\r\n\r\n"
+                              "1\r\nAAAAAA\r\n0\r\n\r\nXXXXXX";
+  sendRawHttpAndWaitForResponse(lookupPort("http"), request.c_str(), &response, false);
+  EXPECT_THAT(response, StartsWith("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+TEST_P(IntegrationTest, TestInvalidChunkedEncodingDefault) {
+  autonomous_upstream_ = true;
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
+  config_helper_.disableDelayClose();
+  initialize();
+  std::string response;
+  const std::string request =
+      "GET / HTTP/1.1\r\nHost: host\r\nConnection: close\r\ntransfer-encoding: chunked\r\n\r\n"
+      "1\r\nAAAAAA\r\n0\r\n\r\nXXXXXX";
+  sendRawHttpAndWaitForResponse(lookupPort("http"), request.c_str(), &response, false);
+  EXPECT_THAT(response, StartsWith("HTTP/1.1 200 OK\r\n"));
+}
+
+TEST_P(IntegrationTest, TestInvalidTransferEncoding) {
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
+  config_helper_.disableDelayClose();
+  initialize();
+
+  // Verify that sending `Transfer-Encoding: chunked` as a second header is detected and triggers
+  // the "bad Transfer-Encoding" check.
+  std::string response;
+  const std::string request = "GET / HTTP/1.1\r\nHost: host\r\ntransfer-encoding: "
+                              "identity\r\ntransfer-encoding: chunked \r\n\r\n";
+  sendRawHttpAndWaitForResponse(lookupPort("http"), request.c_str(), &response, false);
+  EXPECT_THAT(response, StartsWith("HTTP/1.1 501 Not Implemented\r\n"));
+}
+
 TEST_P(IntegrationTest, TestPipelinedResponses) {
   initialize();
   auto tcp_client = makeTcpConnection(lookupPort("http"));
@@ -762,6 +1108,10 @@ TEST_P(IntegrationTest, TestPipelinedResponses) {
 }
 
 TEST_P(IntegrationTest, TestServerAllowChunkedLength) {
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
   config_helper_.addConfigModifier(
       [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
               hcm) -> void {
@@ -796,6 +1146,10 @@ TEST_P(IntegrationTest, TestServerAllowChunkedLength) {
 }
 
 TEST_P(IntegrationTest, TestClientAllowChunkedLength) {
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     RELEASE_ASSERT(bootstrap.mutable_static_resources()->clusters_size() == 1, "");
     if (fake_upstreams_[0]->httpType() == Http::CodecType::HTTP1) {
@@ -840,7 +1194,7 @@ TEST_P(IntegrationTest, TestClientAllowChunkedLength) {
 TEST_P(IntegrationTest, BadFirstline) {
   initialize();
   std::string response;
-  sendRawHttpAndWaitForResponse(lookupPort("http"), "hello", &response);
+  sendRawHttpAndWaitForResponse(lookupPort("http"), "hello\r\n", &response);
   EXPECT_THAT(response, StartsWith("HTTP/1.1 400 Bad Request\r\n"));
 }
 
@@ -855,6 +1209,24 @@ TEST_P(IntegrationTest, MissingDelimiter) {
   EXPECT_THAT(log, HasSubstr("http1.codec_error"));
   EXPECT_THAT(log, HasSubstr("DPE"));
   EXPECT_THAT(log, Not(HasSubstr("DC")));
+}
+
+TEST_P(IntegrationTest, ConnectionTermination) {
+  useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%");
+  initialize();
+  std::string response;
+  auto tcp_client = makeTcpConnection(lookupPort("http"));
+  ASSERT_TRUE(tcp_client->write("GET / HTTP/1.1\r\nHost: host\r\n\r\n"));
+
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+  std::string data;
+  ASSERT_TRUE(fake_upstream_connection->waitForData(
+      FakeRawConnection::waitForInexactMatch("\r\n\r\n"), &data));
+  tcp_client->close();
+  std::string log = waitForAccessLog(access_log_name_);
+  EXPECT_THAT(log, HasSubstr("DC"));
+  EXPECT_THAT(log, HasSubstr("downstream_remote_disconnect"));
 }
 
 TEST_P(IntegrationTest, InvalidCharacterInFirstline) {
@@ -875,6 +1247,7 @@ TEST_P(IntegrationTest, InvalidVersion) {
 
 // Expect that malformed trailers to break the connection
 TEST_P(IntegrationTest, BadTrailer) {
+  config_helper_.addConfigModifier(setEnableDownstreamTrailersHttp1());
   initialize();
   std::string response;
   sendRawHttpAndWaitForResponse(lookupPort("http"),
@@ -940,21 +1313,6 @@ TEST_P(IntegrationTest, Http09Enabled) {
   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("HTTP/1.0"));
 }
 
-TEST_P(IntegrationTest, Http09WithKeepalive) {
-  useAccessLog();
-  autonomous_upstream_ = true;
-  config_helper_.addConfigModifier(&setAllowHttp10WithDefaultHost);
-  initialize();
-  reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())
-      ->setResponseHeaders(std::make_unique<Http::TestResponseHeaderMapImpl>(
-          Http::TestResponseHeaderMapImpl({{":status", "200"}, {"content-length", "0"}})));
-  std::string response;
-  sendRawHttpAndWaitForResponse(lookupPort("http"), "GET /\r\nConnection: keep-alive\r\n\r\n",
-                                &response, true);
-  EXPECT_THAT(response, StartsWith("HTTP/1.0 200 OK\r\n"));
-  EXPECT_THAT(response, HasSubstr("connection: keep-alive\r\n"));
-}
-
 // Turn HTTP/1.0 support on and verify the request is proxied and the default host is sent upstream.
 TEST_P(IntegrationTest, Http10Enabled) {
   autonomous_upstream_ = true;
@@ -975,6 +1333,38 @@ TEST_P(IntegrationTest, Http10Enabled) {
   EXPECT_THAT(response, StartsWith("HTTP/1.0 200 OK\r\n"));
   EXPECT_THAT(response, HasSubstr("connection: close"));
   EXPECT_THAT(response, Not(HasSubstr("transfer-encoding: chunked\r\n")));
+}
+
+TEST_P(IntegrationTest, SendFullyQualifiedUrl) {
+  config_helper_.addConfigModifier(setEnableUpstreamTrailersHttp1());
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    RELEASE_ASSERT(bootstrap.mutable_static_resources()->clusters_size() == 1, "");
+    ConfigHelper::HttpProtocolOptions protocol_options;
+    protocol_options.mutable_explicit_http_config()
+        ->mutable_http_protocol_options()
+        ->set_send_fully_qualified_url(true);
+    ConfigHelper::setProtocolOptions(*bootstrap.mutable_static_resources()->mutable_clusters(0),
+                                     protocol_options);
+  });
+  initialize();
+
+  auto tcp_client = makeTcpConnection(lookupPort("http"));
+  ASSERT_TRUE(tcp_client->write("GET / HTTP/1.1\r\nHost: host\r\n\r\n"));
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+  std::string data;
+  ASSERT_TRUE(fake_upstream_connection->waitForData(
+      FakeRawConnection::waitForInexactMatch("\r\n\r\n"), &data));
+  EXPECT_TRUE(absl::StrContains(data, "http://host/"));
+
+  ASSERT_TRUE(
+      fake_upstream_connection->write("HTTP/1.1 200 OK\r\nTransfer-encoding: chunked\r\n\r\n"));
+  tcp_client->waitForData("\r\n\r\n", false);
+  std::string response = tcp_client->data();
+
+  ASSERT_TRUE(fake_upstream_connection->close());
+  ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
+  tcp_client->close();
 }
 
 TEST_P(IntegrationTest, TestInlineHeaders) {
@@ -1059,13 +1449,13 @@ TEST_P(IntegrationTest, Pipeline) {
       });
   // First response should be success.
   while (response.find("200") == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
   EXPECT_THAT(response, StartsWith("HTTP/1.1 200 OK\r\n"));
 
   // Second response should be 400 (no host)
   while (response.find("400") == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
   EXPECT_THAT(response, HasSubstr("HTTP/1.1 400 Bad Request\r\n"));
   connection->close();
@@ -1108,14 +1498,14 @@ TEST_P(IntegrationTest, PipelineWithTrailers) {
   // First response should be success.
   size_t pos;
   while ((pos = response.find("200")) == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
   EXPECT_THAT(response, StartsWith("HTTP/1.1 200 OK\r\n"));
   while (response.find("200", pos + 1) == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
   while (response.find("400") == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
 
   EXPECT_THAT(response, HasSubstr("HTTP/1.1 400 Bad Request\r\n"));
@@ -1141,18 +1531,19 @@ TEST_P(IntegrationTest, PipelineInline) {
       });
 
   while (response.find("400") == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
   EXPECT_THAT(response, StartsWith("HTTP/1.1 400 Bad Request\r\n"));
 
   while (response.find("426") == std::string::npos) {
-    connection->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_TRUE(connection->run(Event::Dispatcher::RunType::NonBlock));
   }
   EXPECT_THAT(response, HasSubstr("HTTP/1.1 426 Upgrade Required\r\n"));
   connection->close();
 }
 
 TEST_P(IntegrationTest, NoHost) {
+  disable_client_header_validation_ = true;
   initialize();
   codec_client_ = makeHttpConnection(lookupPort("http"));
 
@@ -1239,9 +1630,9 @@ TEST_P(IntegrationTest, AbsolutePathUsingHttpsAllowedInternally) {
 
 // Make that both IPv4 and IPv6 hosts match when using relative and absolute URLs.
 TEST_P(IntegrationTest, TestHostWithAddress) {
-  useAccessLog("%REQ(Host)%\n");
+  useAccessLog("%REQ(Host)%");
   std::string address_string;
-  if (GetParam() == Network::Address::IpVersion::v4) {
+  if (version_ == Network::Address::IpVersion::v4) {
     address_string = TestUtility::getIpv4Loopback();
   } else {
     address_string = "[::1]";
@@ -1284,6 +1675,20 @@ TEST_P(IntegrationTest, AbsolutePathWithPort) {
   EXPECT_THAT(response, StartsWith("HTTP/1.1 301"));
 }
 
+TEST_P(IntegrationTest, AbsolutePathWithMixedScheme) {
+  // Configure www.namewithport.com:1234 to send a redirect, and ensure the redirect is
+  // encountered via absolute URL with a port.
+  auto host = config_helper_.createVirtualHost("www.namewithport.com:1234", "/");
+  host.set_require_tls(envoy::config::route::v3::VirtualHost::ALL);
+  config_helper_.addVirtualHost(host);
+  initialize();
+  std::string response;
+  sendRawHttpAndWaitForResponse(
+      lookupPort("http"), "GET hTtp://www.namewithport.com:1234 HTTP/1.1\r\nHost: host\r\n\r\n",
+      &response, true);
+  EXPECT_THAT(response, StartsWith("HTTP/1.1 301"));
+}
+
 TEST_P(IntegrationTest, AbsolutePathWithoutPort) {
   // Add a restrictive default match, to avoid the request hitting the * / catchall.
   config_helper_.setDefaultHostAndRoute("foo.com", "/found");
@@ -1302,6 +1707,7 @@ TEST_P(IntegrationTest, AbsolutePathWithoutPort) {
 
 // Ensure that connect behaves the same with allow_absolute_url enabled and without
 TEST_P(IntegrationTest, Connect) {
+  setListenersBoundTimeout(3 * TestUtility::DefaultTimeout);
   const std::string& request = "CONNECT www.somewhere.com:80 HTTP/1.1\r\n\r\n";
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     // Clone the whole listener.
@@ -1343,8 +1749,8 @@ TEST_P(IntegrationTest, TestHead) {
   EXPECT_THAT(response->headers(), HttpStatusIs("200"));
   EXPECT_EQ(response->headers().ContentLength(), nullptr);
   EXPECT_THAT(response->headers(),
-              HeaderValueOf(Headers::get().TransferEncoding,
-                            Http::Headers::get().TransferEncodingValues.Chunked));
+              ContainsHeader(Headers::get().TransferEncoding,
+                             Http::Headers::get().TransferEncodingValues.Chunked));
   EXPECT_EQ(0, response->body().size());
 
   // Preserve explicit content length.
@@ -1353,7 +1759,7 @@ TEST_P(IntegrationTest, TestHead) {
   response = sendRequestAndWaitForResponse(head_request, 0, content_length_response, 0);
   ASSERT_TRUE(response->complete());
   EXPECT_THAT(response->headers(), HttpStatusIs("200"));
-  EXPECT_THAT(response->headers(), HeaderValueOf(Headers::get().ContentLength, "12"));
+  EXPECT_THAT(response->headers(), ContainsHeader(Headers::get().ContentLength, "12"));
   EXPECT_EQ(response->headers().TransferEncoding(), nullptr);
   EXPECT_EQ(0, response->body().size());
 }
@@ -1389,13 +1795,13 @@ TEST_P(IntegrationTest, TestHeadWithExplicitTE) {
 
 TEST_P(IntegrationTest, TestBind) {
   std::string address_string;
-  if (GetParam() == Network::Address::IpVersion::v4) {
+  if (version_ == Network::Address::IpVersion::v4) {
     address_string = TestUtility::getIpv4Loopback();
   } else {
     address_string = "::1";
   }
   config_helper_.setSourceAddress(address_string);
-  useAccessLog("%UPSTREAM_LOCAL_ADDRESS%\n");
+  useAccessLog("%UPSTREAM_LOCAL_ADDRESS%");
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
@@ -1424,6 +1830,7 @@ TEST_P(IntegrationTest, TestBind) {
 
 TEST_P(IntegrationTest, TestFailedBind) {
   config_helper_.setSourceAddress("8.8.8.8");
+  config_helper_.addConfigModifier(configureProxyStatus());
 
   initialize();
   codec_client_ = makeHttpConnection(lookupPort("http"));
@@ -1439,6 +1846,10 @@ TEST_P(IntegrationTest, TestFailedBind) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_TRUE(response->complete());
   EXPECT_THAT(response->headers(), HttpStatusIs("503"));
+  EXPECT_THAT(
+      response->headers().getProxyStatusValue(),
+      ContainsRegex(
+          R"(envoy; error=connection_refused; details="upstream_reset_before_response_started\{.*\}; UF")"));
   EXPECT_LT(0, test_server_->counter("cluster.cluster_0.bind_errors")->value());
 }
 
@@ -1461,20 +1872,20 @@ TEST_P(IntegrationTest, ViaAppendHeaderOnly) {
                                      {"via", "foo"},
                                      {"connection", "close"}});
   waitForNextUpstreamRequest();
-  EXPECT_THAT(upstream_request_->headers(), HeaderValueOf(Headers::get().Via, "foo, bar"));
+  EXPECT_THAT(upstream_request_->headers(), ContainsHeader(Headers::get().Via, "foo, bar"));
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
   ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(codec_client_->waitForDisconnect());
   EXPECT_TRUE(response->complete());
   EXPECT_THAT(response->headers(), HttpStatusIs("200"));
-  EXPECT_THAT(response->headers(), HeaderValueOf(Headers::get().Via, "bar"));
+  EXPECT_THAT(response->headers(), ContainsHeader(Headers::get().Via, "bar"));
 }
 
 // Validate that 100-continue works as expected with via header addition on both request and
 // response path.
-TEST_P(IntegrationTest, ViaAppendWith100Continue) {
+TEST_P(IntegrationTest, ViaAppendWith1xx) {
   config_helper_.addConfigModifier(setVia("foo"));
-  testEnvoyHandling100Continue(false, "foo");
+  testEnvoyHandling1xx(false, "foo");
 }
 
 // Test delayed close semantics for downstream HTTP/1.1 connections. When an early response is
@@ -1486,8 +1897,11 @@ TEST_P(IntegrationTest, TestDelayedConnectionTeardownOnGracefulClose) {
              hcm) { hcm.mutable_delayed_close_timeout()->set_seconds(1); });
   // This test will trigger an early 413 Payload Too Large response due to buffer limits being
   // exceeded. The following filter is needed since the router filter will never trigger a 413.
-  config_helper_.prependFilter("{ name: encoder-decoder-buffer-filter, typed_config: { \"@type\": "
-                               "type.googleapis.com/google.protobuf.Empty } }");
+  config_helper_.prependFilter(R"EOF(
+    name: encoder-decoder-buffer-filter
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.EncoderDecoderBufferFilterConfig
+  )EOF");
   config_helper_.setBufferLimits(1024, 1024);
   initialize();
 
@@ -1519,8 +1933,11 @@ TEST_P(IntegrationTest, TestDelayedConnectionTeardownOnGracefulClose) {
 // Test configuration of the delayed close timeout on downstream HTTP/1.1 connections. A value of 0
 // disables delayed close processing.
 TEST_P(IntegrationTest, TestDelayedConnectionTeardownConfig) {
-  config_helper_.prependFilter("{ name: encoder-decoder-buffer-filter, typed_config: { \"@type\": "
-                               "type.googleapis.com/google.protobuf.Empty } }");
+  config_helper_.prependFilter(R"EOF(
+    name: encoder-decoder-buffer-filter
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.EncoderDecoderBufferFilterConfig
+  )EOF");
   config_helper_.setBufferLimits(1024, 1024);
   config_helper_.addConfigModifier(
       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
@@ -1553,8 +1970,11 @@ TEST_P(IntegrationTest, TestDelayedConnectionTeardownConfig) {
 
 // Test that if the route cache is cleared, it doesn't cause problems.
 TEST_P(IntegrationTest, TestClearingRouteCacheFilter) {
-  config_helper_.prependFilter("{ name: clear-route-cache, typed_config: { \"@type\": "
-                               "type.googleapis.com/google.protobuf.Empty } }");
+  config_helper_.prependFilter(R"EOF(
+    name: clear-route-cache
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.ClearRouteCacheFilterConfig
+  )EOF");
   initialize();
   codec_client_ = makeHttpConnection(lookupPort("http"));
   sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0);
@@ -1579,20 +1999,23 @@ TEST_P(IntegrationTest, NoConnectionPoolsFree) {
   auto response = codec_client_->makeRequestWithBody(default_request_headers_, 1024);
 
   // Validate none active.
-  test_server_->waitForGaugeEq("cluster.cluster_0.upstream_rq_active", 0);
-  test_server_->waitForGaugeEq("cluster.cluster_0.upstream_rq_pending_active", 0);
+  test_server_->waitForGauge("cluster.cluster_0.upstream_rq_active", Eq(0));
+  test_server_->waitForGauge("cluster.cluster_0.upstream_rq_pending_active", Eq(0));
 
   ASSERT_TRUE(response->waitForEndStream());
 
   EXPECT_EQ("503", response->headers().getStatusValue());
-  test_server_->waitForCounterGe("cluster.cluster_0.upstream_rq_503", 1);
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_503", Ge(1));
 
   EXPECT_EQ(test_server_->counter("cluster.cluster_0.upstream_cx_pool_overflow")->value(), 1);
 }
 
 TEST_P(IntegrationTest, ProcessObjectHealthy) {
-  config_helper_.prependFilter("{ name: process-context-filter, typed_config: { \"@type\": "
-                               "type.googleapis.com/google.protobuf.Empty } }");
+  config_helper_.prependFilter(R"EOF(
+    name: process-context-filter
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.ProcessContextFilterConfig
+  )EOF");
 
   ProcessObjectForFilter healthy_object(true);
   process_object_ = healthy_object;
@@ -1612,8 +2035,11 @@ TEST_P(IntegrationTest, ProcessObjectHealthy) {
 }
 
 TEST_P(IntegrationTest, ProcessObjectUnealthy) {
-  config_helper_.prependFilter("{ name: process-context-filter, typed_config: { \"@type\": "
-                               "type.googleapis.com/google.protobuf.Empty } }");
+  config_helper_.prependFilter(R"EOF(
+    name: process-context-filter
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.ProcessContextFilterConfig
+  )EOF");
 
   ProcessObjectForFilter unhealthy_object(false);
   process_object_ = unhealthy_object;
@@ -1645,13 +2071,12 @@ TEST_P(IntegrationTest, TrailersDroppedDownstream) {
 }
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, UpstreamEndpointIntegrationTest,
-                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
-                         TestUtility::ipTestParamsToString);
+                         ValuesIn(TestEnvironment::getIpVersionsForTest()), testParamToString);
 
 TEST_P(UpstreamEndpointIntegrationTest, TestUpstreamEndpointAddress) {
   initialize();
   EXPECT_STREQ(fake_upstreams_[0]->localAddress()->ip()->addressAsString().c_str(),
-               Network::Test::getLoopbackAddressString(GetParam()).c_str());
+               Network::Test::getLoopbackAddressString(version_).c_str());
 }
 
 // Send continuous pipelined requests while not reading responses, to check
@@ -1747,6 +2172,7 @@ TEST_P(IntegrationTest, TestFloodUpstreamErrors) {
 
 // Make sure flood protection doesn't kick in with many requests sent serially.
 TEST_P(IntegrationTest, TestManyBadRequests) {
+  disable_client_header_validation_ = true;
   config_helper_.addConfigModifier(
       [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
               hcm) -> void {
@@ -1824,6 +2250,45 @@ TEST_P(IntegrationTest, TestUpgradeHeaderInResponseWithTrailers) {
   EXPECT_NE(response->trailers(), nullptr);
 }
 
+// With the default configuration, an upgrade request is rejected.
+TEST_P(IntegrationTest, TestUpgradeRequestRejected) {
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},  {":authority", "envoyproxy.io"}, {":path", "/test/long/url"},
+      {":scheme", "http"}, {"connection", "Upgrade"},       {"upgrade", "TLS/1.3"}};
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ(response->headers().getStatusValue(), "403");
+}
+
+// With the default configuration, an upgrade request is rejected.
+TEST_P(IntegrationTest, TestUpgradeRequestStripped) {
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        auto* matcher = hcm.mutable_http_protocol_options()->add_ignore_http_11_upgrade();
+        matcher->set_prefix("TLS/");
+      });
+
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"},  {":authority", "envoyproxy.io"}, {":path", "/test/long/url"},
+      {":scheme", "http"}, {"connection", "Upgrade"},       {"upgrade", "TLS/1.3"}};
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+  EXPECT_EQ(nullptr, upstream_request_->headers().Upgrade());
+  EXPECT_EQ(nullptr, upstream_request_->headers().Connection());
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ(response->headers().getStatusValue(), "200");
+}
+
 TEST_P(IntegrationTest, ConnectWithNoBody) {
   config_helper_.addConfigModifier(
       [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
@@ -1891,6 +2356,31 @@ TEST_P(IntegrationTest, ConnectWithChunkedBody) {
   ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
 }
 
+TEST_P(IntegrationTest, ConnectWithTEChunked) {
+#ifdef ENVOY_ENABLE_UHV
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                    "true");
+#endif
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void { ConfigHelper::setConnectConfig(hcm, false, false); });
+  initialize();
+
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("http"));
+  ASSERT_TRUE(tcp_client->write(
+      "CONNECT host.com:80 HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\npayload", false));
+
+  tcp_client->waitForData("\r\n\r\n", false);
+#ifdef ENVOY_ENABLE_UHV
+  EXPECT_TRUE(absl::StartsWith(tcp_client->data(), "HTTP/1.1 400 Bad Request\r\n"))
+      << tcp_client->data();
+#else
+  EXPECT_TRUE(absl::StartsWith(tcp_client->data(), "HTTP/1.1 501 Not Implemented\r\n"))
+      << tcp_client->data();
+#endif
+  tcp_client->close();
+}
+
 // Verifies that a 204 response returns without a body
 TEST_P(IntegrationTest, Response204WithBody) {
   initialize();
@@ -1916,6 +2406,7 @@ TEST_P(IntegrationTest, Response204WithBody) {
 }
 
 TEST_P(IntegrationTest, QuitQuitQuit) {
+  DISABLE_IF_ADMIN_DISABLED; // Uses admin interface.
   initialize();
   test_server_->useAdminInterfaceToQuit(true);
 }
@@ -1924,6 +2415,7 @@ TEST_P(IntegrationTest, QuitQuitQuit) {
 // stream_error_on_invalid_http_message=false: test that HTTP/1.1 connection is left open on invalid
 // HTTP message (missing :host header)
 TEST_P(IntegrationTest, ConnectionIsLeftOpenIfHCMStreamErrorIsFalseAndOverrideIsTrue) {
+  disable_client_header_validation_ = true;
   config_helper_.addConfigModifier(
       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
              hcm) -> void {
@@ -1948,6 +2440,7 @@ TEST_P(IntegrationTest, ConnectionIsLeftOpenIfHCMStreamErrorIsFalseAndOverrideIs
 // stream_error_on_invalid_http_message=true: test that HTTP/1.1 connection is left open on invalid
 // HTTP message (missing :host header)
 TEST_P(IntegrationTest, ConnectionIsLeftOpenIfHCMStreamErrorIsTrueAndOverrideNotSet) {
+  disable_client_header_validation_ = true;
   config_helper_.addConfigModifier(
       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
              hcm) -> void { hcm.mutable_stream_error_on_invalid_http_message()->set_value(true); });
@@ -1967,6 +2460,7 @@ TEST_P(IntegrationTest, ConnectionIsLeftOpenIfHCMStreamErrorIsTrueAndOverrideNot
 // stream_error_on_invalid_http_message=false: test that HTTP/1.1 connection is terminated on
 // invalid HTTP message (missing :host header)
 TEST_P(IntegrationTest, ConnectionIsTerminatedIfHCMStreamErrorIsFalseAndOverrideNotSet) {
+  disable_client_header_validation_ = true;
   config_helper_.addConfigModifier(
       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
              hcm) -> void {
@@ -2046,6 +2540,98 @@ TEST_P(IntegrationTest, Preconnect) {
   }
 }
 
+// Configures cluster 0 with per-upstream preconnect and a matcher that only accepts hosts with
+// test.preconnect.eligible == true.
+static void addPreconnectEligibilityMatcher(envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+  auto* preconnect =
+      bootstrap.mutable_static_resources()->mutable_clusters(0)->mutable_preconnect_policy();
+  preconnect->mutable_per_upstream_preconnect_ratio()->set_value(2.0);
+  auto* matcher = preconnect->mutable_preconnect_enabled_metadata();
+  matcher->set_filter("test.preconnect");
+  matcher->add_path()->set_key("eligible");
+  matcher->mutable_value()->set_bool_match(true);
+}
+
+// An ineligible host (no matching metadata) is served on demand only; the preconnect is skipped.
+TEST_P(IntegrationTest, PreconnectSkipsIneligibleHost) {
+  config_helper_.addConfigModifier(&addPreconnectEligibilityMatcher);
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  ASSERT_TRUE(response->waitForEndStream());
+
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_preconnect_skipped", testing::Ge(1));
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.upstream_cx_total")->value());
+
+  codec_client_->close();
+}
+
+// A host stamped with matching metadata is eligible; the preconnect proceeds and nothing is
+// skipped.
+TEST_P(IntegrationTest, PreconnectAllowsEligibleHost) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    addPreconnectEligibilityMatcher(bootstrap);
+    auto* lb_endpoint = bootstrap.mutable_static_resources()
+                            ->mutable_clusters(0)
+                            ->mutable_load_assignment()
+                            ->mutable_endpoints(0)
+                            ->mutable_lb_endpoints(0);
+    Protobuf::Struct metadata;
+    (*metadata.mutable_fields())["eligible"].set_bool_value(true);
+    (*lb_endpoint->mutable_metadata()->mutable_filter_metadata())["test.preconnect"] = metadata;
+  });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+
+  FakeHttpConnectionPtr preconnect_connection;
+  waitForNextUpstreamConnection(std::vector<uint64_t>({0}), TestUtility::DefaultTimeout,
+                                preconnect_connection);
+
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  ASSERT_TRUE(response->waitForEndStream());
+
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_preconnect_skipped")->value());
+  // One on-demand connection plus one preconnect.
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_total", testing::Eq(2));
+
+  ASSERT_TRUE(preconnect_connection->close());
+  ASSERT_TRUE(preconnect_connection->waitForDisconnect());
+  codec_client_->close();
+}
+
+// Without a preconnect ratio no connection is ever anticipated, so no skips are recorded.
+TEST_P(IntegrationTest, PreconnectSkipNotCountedWithoutRatio) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* matcher = bootstrap.mutable_static_resources()
+                        ->mutable_clusters(0)
+                        ->mutable_preconnect_policy()
+                        ->mutable_preconnect_enabled_metadata();
+    matcher->set_filter("test.preconnect");
+    matcher->add_path()->set_key("eligible");
+    matcher->mutable_value()->set_bool_match(true);
+  });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  ASSERT_TRUE(response->waitForEndStream());
+
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.upstream_cx_total")->value());
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_preconnect_skipped")->value());
+
+  codec_client_->close();
+}
+
 TEST_P(IntegrationTest, RandomPreconnect) {
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     bootstrap.mutable_static_resources()
@@ -2113,7 +2699,7 @@ public:
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     // Using Struct instead of a custom empty config proto. This is only allowed in tests.
-    return ProtobufTypes::MessagePtr{new Envoy::ProtobufWkt::Struct()};
+    return ProtobufTypes::MessagePtr{new Envoy::Protobuf::Struct()};
   }
 
   std::string name() const override { return "test_retry_options_predicate_factory"; }
@@ -2199,10 +2785,13 @@ TEST_P(IntegrationTest, RetryOptionsPredicate) {
 // successfully overrides the cached route, and subsequently, the request's upstream cluster
 // selection.
 TEST_P(IntegrationTest, SetRouteToDelegatingRouteWithClusterOverride) {
-  useAccessLog("%UPSTREAM_CLUSTER%\n");
+  useAccessLog("%UPSTREAM_CLUSTER%");
 
   config_helper_.prependFilter(R"EOF(
     name: set-route-filter
+    typed_config:
+      "@type": type.googleapis.com/test.integration.filters.SetRouteFilterConfig
+      cluster_override: cluster_override
     )EOF");
 
   setUpstreamCount(2);
@@ -2232,7 +2821,7 @@ TEST_P(IntegrationTest, SetRouteToDelegatingRouteWithClusterOverride) {
   initialize();
 
   const std::string ip_port_pair =
-      absl::StrCat(Network::Test::getLoopbackAddressUrlString(GetParam()), ":",
+      absl::StrCat(Network::Test::getLoopbackAddressUrlString(version_), ":",
                    fake_upstreams_[1]->localAddress()->ip()->port());
 
   Http::TestRequestHeaderMapImpl request_headers{
@@ -2257,12 +2846,182 @@ TEST_P(IntegrationTest, SetRouteToDelegatingRouteWithClusterOverride) {
   EXPECT_EQ("200", response->headers().getStatusValue());
 
   // Even though headers specify cluster_0, set_route_filter modifies cached route cluster of
-  // current request to cluster_override
-  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_total")->value());
-  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_rq_total")->value());
+  // current request to cluster_override.
+  EXPECT_EQ(test_server_->counter("cluster.cluster_0.upstream_cx_total")->value(), 0);
+  EXPECT_EQ(test_server_->counter("cluster.cluster_0.upstream_rq_total")->value(), 0);
+
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_override.upstream_cx_total")->value());
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_override.upstream_rq_200")->value());
   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("cluster_override"));
+}
+
+ConfigHelper::HttpModifierFunction setAppendXForwardedPort(bool append_x_forwarded_port,
+                                                           bool use_remote_address = false,
+                                                           uint32_t xff_num_trusted_hops = 0) {
+  return
+      [append_x_forwarded_port, use_remote_address, xff_num_trusted_hops](
+          envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) {
+        hcm.mutable_use_remote_address()->set_value(use_remote_address);
+        hcm.set_xff_num_trusted_hops(xff_num_trusted_hops);
+        hcm.set_append_x_forwarded_port(append_x_forwarded_port);
+      };
+}
+
+// Verify when append_x_forwarded_port is turned on, the x-forwarded-port header should be appended.
+TEST_P(IntegrationTest, AppendXForwardedPort) {
+  config_helper_.addConfigModifier(setAppendXForwardedPort(true));
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/test/long/url"},
+                                     {":authority", "host"},
+                                     {"connection", "close"}});
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers(), Not(ContainsHeader(Headers::get().ForwardedPort, "")));
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+}
+
+// Verify when append_x_forwarded_port is not turned on, the x-forwarded-port header should not be
+// appended.
+TEST_P(IntegrationTest, DoNotAppendXForwardedPort) {
+  config_helper_.addConfigModifier(setAppendXForwardedPort(false));
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/test/long/url"},
+                                     {":authority", "host"},
+                                     {"connection", "close"}});
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers().ForwardedPort(), nullptr);
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+}
+
+// Verify when the x-forwarded-port header has been set, the x-forwarded-port header should not be
+// appended.
+TEST_P(IntegrationTest, IgnoreAppendingXForwardedPortIfHasBeenSet) {
+  config_helper_.addConfigModifier(setAppendXForwardedPort(true));
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/test/long/url"},
+                                     {":authority", "host"},
+                                     {"connection", "close"},
+                                     {"x-forwarded-port", "8080"}});
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers(), ContainsHeader(Headers::get().ForwardedPort, "8080"));
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+}
+
+// Verify when append_x_forwarded_port is turned on, the x-forwarded-port header from trusted hop
+// will be preserved.
+TEST_P(IntegrationTest, PreserveXForwardedPortFromTrustedHop) {
+  config_helper_.addConfigModifier(setAppendXForwardedPort(true, true, 1));
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/test/long/url"},
+                                     {":authority", "host"},
+                                     {"connection", "close"},
+                                     {"x-forwarded-port", "80"}});
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers(), ContainsHeader(Headers::get().ForwardedPort, "80"));
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+}
+
+// Verify when append_x_forwarded_port is turned on, the x-forwarded-port header from untrusted hop
+// will be overwritten.
+TEST_P(IntegrationTest, OverwriteXForwardedPortFromUntrustedHop) {
+  config_helper_.addConfigModifier(setAppendXForwardedPort(true, true, 0));
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/test/long/url"},
+                                     {":authority", "host"},
+                                     {"connection", "close"},
+                                     {"x-forwarded-port", "80"}});
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers(),
+              Not(ContainsHeader(Headers::get().ForwardedPort, "80")));
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+}
+
+// Verify when append_x_forwarded_port is not turned on, the x-forwarded-port header from untrusted
+// hop will not be overwritten.
+TEST_P(IntegrationTest, DoNotOverwriteXForwardedPortFromUntrustedHop) {
+  config_helper_.addConfigModifier(setAppendXForwardedPort(false, true, 0));
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/test/long/url"},
+                                     {":authority", "host"},
+                                     {"connection", "close"},
+                                     {"x-forwarded-port", "80"}});
+  waitForNextUpstreamRequest();
+  EXPECT_THAT(upstream_request_->headers(), ContainsHeader(Headers::get().ForwardedPort, "80"));
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(codec_client_->waitForDisconnect());
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), HttpStatusIs("200"));
+}
+
+TEST_P(IntegrationTest, TestDuplicatedContentLengthSameValue) {
+  config_helper_.disableDelayClose();
+  initialize();
+
+  std::string response;
+  const std::string full_request = "POST / HTTP/1.1\r\n"
+                                   "Host: host\r\n"
+                                   "content-length: 20\r\n"
+                                   "content-length: 20\r\n\r\n";
+  sendRawHttpAndWaitForResponse(lookupPort("http"), full_request.c_str(), &response, false);
+  EXPECT_THAT(response, StartsWith("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+TEST_P(IntegrationTest, TestDuplicatedContentLengthDifferentValue) {
+  config_helper_.disableDelayClose();
+  initialize();
+
+  std::string response;
+  const std::string full_request = "POST / HTTP/1.1\r\n"
+                                   "Host: host\r\n"
+                                   "content-length: 20\r\n"
+                                   "content-length: 53\r\n\r\n";
+  sendRawHttpAndWaitForResponse(lookupPort("http"), full_request.c_str(), &response, false);
+  EXPECT_THAT(response, StartsWith("HTTP/1.1 400 Bad Request\r\n"));
 }
 
 } // namespace Envoy

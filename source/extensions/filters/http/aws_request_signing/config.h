@@ -1,8 +1,8 @@
 #pragma once
 
 #include "envoy/extensions/filters/http/aws_request_signing/v3/aws_request_signing.pb.h"
-#include "envoy/extensions/filters/http/aws_request_signing/v3/aws_request_signing.pb.validate.h"
 
+#include "source/extensions/common/aws/signer.h"
 #include "source/extensions/filters/http/common/factory_base.h"
 
 namespace Envoy {
@@ -10,21 +10,42 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AwsRequestSigningFilter {
 
+using AwsRequestSigningProtoConfig =
+    envoy::extensions::filters::http::aws_request_signing::v3::AwsRequestSigning;
+
+using AwsRequestSigningProtoPerRouteConfig =
+    envoy::extensions::filters::http::aws_request_signing::v3::AwsRequestSigningPerRoute;
+
 /**
  * Config registration for the AWS request signing filter.
  */
 class AwsRequestSigningFilterFactory
-    : public Common::FactoryBase<
-          envoy::extensions::filters::http::aws_request_signing::v3::AwsRequestSigning> {
+    : public Common::UnifiedFactoryBase<AwsRequestSigningProtoConfig,
+                                        AwsRequestSigningProtoPerRouteConfig> {
 public:
-  AwsRequestSigningFilterFactory() : FactoryBase("envoy.filters.http.aws_request_signing") {}
+  AwsRequestSigningFilterFactory() : UnifiedFactoryBase("envoy.filters.http.aws_request_signing") {}
+
+  absl::StatusOr<Http::FilterFactoryCb> createFilterFactoryFromProtoHelper(
+      const AwsRequestSigningProtoConfig& proto_config, const std::string& stats_prefix,
+      Server::Configuration::ServerFactoryContext& server_context, Stats::Scope& scope) const;
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::http::aws_request_signing::v3::AwsRequestSigning&
-          proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+  absl::StatusOr<Envoy::Extensions::Common::Aws::SignerPtr>
+  createSigner(const AwsRequestSigningProtoConfig& config,
+               Server::Configuration::ServerFactoryContext& server_context) const;
+
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
+      const AwsRequestSigningProtoConfig& proto_config,
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
+
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(const AwsRequestSigningProtoPerRouteConfig& per_route_config,
+                                       Server::Configuration::ServerFactoryContext& context,
+                                       ProtobufMessage::ValidationVisitor&) override;
 };
+
+using UpstreamAwsRequestSigningFilterFactory = AwsRequestSigningFilterFactory;
 
 } // namespace AwsRequestSigningFilter
 } // namespace HttpFilters

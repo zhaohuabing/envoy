@@ -11,18 +11,20 @@ namespace ProxyProtocol {
 
 DEFINE_PROTO_FUZZER(
     const test::extensions::filters::listener::proxy_protocol::ProxyProtocolTestCase& input) {
+  Stats::IsolatedStoreImpl store;
+  ConfigSharedPtr cfg;
   try {
     TestUtility::validate(input);
+    // Config constructor can throw as it validates proto config.
+    cfg = std::make_shared<Config>(*store.rootScope(), input.config());
   } catch (const ProtoValidationException& e) {
     ENVOY_LOG_MISC(debug, "ProtoValidationException: {}", e.what());
     return;
   }
 
-  Stats::IsolatedStoreImpl store;
-  ConfigSharedPtr cfg = std::make_shared<Config>(store, input.config());
   auto filter = std::make_unique<Filter>(std::move(cfg));
 
-  ListenerFilterFuzzer fuzzer;
+  ListenerFilterWithDataFuzzer fuzzer;
   fuzzer.fuzz(std::move(filter), input.fuzzed());
 }
 

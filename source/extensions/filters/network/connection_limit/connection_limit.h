@@ -45,7 +45,7 @@ public:
   void incrementConnection();
   void decrementConnection();
   bool enabled() { return enabled_.enabled(); }
-  absl::optional<std::chrono::milliseconds> delay() { return delay_; }
+  std::optional<std::chrono::milliseconds> delay() { return delay_; }
   ConnectionLimitStats& stats() { return stats_; }
 
 private:
@@ -54,7 +54,7 @@ private:
   ConnectionLimitStats stats_;
   const uint64_t max_connections_;
   std::atomic<uint64_t> connections_;
-  absl::optional<std::chrono::milliseconds> delay_;
+  std::optional<std::chrono::milliseconds> delay_;
   mutable Thread::ThreadSynchronizer synchronizer_; // Used for testing only.
 
   friend class ConnectionLimitTestBase;
@@ -69,7 +69,7 @@ class Filter : public Network::ReadFilter,
                public Network::ConnectionCallbacks,
                Logger::Loggable<Logger::Id::filter> {
 public:
-  Filter(const ConfigSharedPtr& config) : config_(config), is_rejected_(false) {}
+  Filter(const ConfigSharedPtr& config) : config_(config) {}
 
   // Network::ReadFilter
   Network::FilterStatus onData(Buffer::Instance&, bool) override;
@@ -90,7 +90,7 @@ private:
   const ConfigSharedPtr config_;
   Network::ReadFilterCallbacks* read_callbacks_{};
   Event::TimerPtr delay_timer_ = nullptr;
-  bool is_rejected_;
+  bool is_rejected_{false};
 };
 
 } // namespace ConnectionLimitFilter

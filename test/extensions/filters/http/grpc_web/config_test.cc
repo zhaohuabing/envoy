@@ -17,21 +17,23 @@ TEST(GrpcWebFilterConfigTest, GrpcWebFilter) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   GrpcWebFilterConfig factory;
   envoy::extensions::filters::http::grpc_web::v3::GrpcWeb config;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context);
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
 }
 
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(GrpcWebFilterConfigTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.grpc_web";
-
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedHttpFilterConfigFactory>::getFactory(
-          deprecated_name));
+TEST(GrpcWebFilterConfigTest, GrpcWebFilterWithServerContext) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  GrpcWebFilterConfig factory;
+  envoy::extensions::filters::http::grpc_web::v3::GrpcWeb config;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(config, context, extra_context).value();
+  Http::MockFilterChainFactoryCallbacks filter_callback;
+  EXPECT_CALL(filter_callback, addStreamFilter(_));
+  cb(filter_callback);
 }
 
 } // namespace

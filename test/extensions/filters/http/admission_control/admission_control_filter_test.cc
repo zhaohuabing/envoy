@@ -19,6 +19,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+using testing::Eq;
 using testing::NiceMock;
 using testing::Return;
 
@@ -37,6 +38,7 @@ public:
   MOCK_METHOD(void, recordSuccess, ());
   MOCK_METHOD(void, recordFailure, ());
   MOCK_METHOD(uint32_t, averageRps, (), (const));
+  MOCK_METHOD(std::chrono::seconds, samplingWindow, (), (const));
 };
 
 class MockResponseEvaluator : public ResponseEvaluator {
@@ -67,8 +69,8 @@ public:
   std::shared_ptr<AdmissionControlFilterConfig> makeConfig(const std::string& yaml) {
     AdmissionControlProto proto;
     TestUtility::loadFromYamlAndValidate(yaml, proto);
-    auto tls =
-        ThreadLocal::TypedSlot<ThreadLocalControllerImpl>::makeUnique(context_.threadLocal());
+    auto tls = ThreadLocal::TypedSlot<ThreadLocalControllerImpl>::makeUnique(
+        context_.server_factory_context_.threadLocal());
     evaluator_ = std::make_shared<MockResponseEvaluator>();
 
     return std::make_shared<TestConfig>(proto, runtime_, random_, scope_, std::move(tls),
@@ -127,7 +129,8 @@ protected:
   std::string stats_prefix_;
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Server::Configuration::MockFactoryContext> context_;
-  Stats::IsolatedStoreImpl scope_;
+  Stats::IsolatedStoreImpl store_;
+  Stats::Scope& scope_{*store_.rootScope()};
   Event::SimulatedTimeSystem time_system_;
   NiceMock<Random::MockRandomGenerator> random_;
   std::shared_ptr<AdmissionControlFilter> filter_;
@@ -208,7 +211,7 @@ TEST_F(AdmissionControlTest, HttpFailureBehavior) {
   setupFilter(config);
 
   // We expect rejection counter to increment upon failure.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 0)));
   EXPECT_CALL(*evaluator_, isHttpSuccess(500)).WillRepeatedly(Return(false));
@@ -219,7 +222,7 @@ TEST_F(AdmissionControlTest, HttpFailureBehavior) {
             filter_->decodeHeaders(request_headers, true));
   sampleHttpRequest("500");
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 1, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(1), time_system_));
 }
 
 // Validate simple HTTP success case.
@@ -228,7 +231,7 @@ TEST_F(AdmissionControlTest, HttpSuccessBehavior) {
   setupFilter(config);
 
   // We expect rejection counter to NOT increment upon success.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 100)));
   EXPECT_CALL(*evaluator_, isHttpSuccess(200)).WillRepeatedly(Return(true));
@@ -238,7 +241,7 @@ TEST_F(AdmissionControlTest, HttpSuccessBehavior) {
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
   sampleHttpRequest("200");
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 }
 
 // Validate simple gRPC failure case.
@@ -246,7 +249,7 @@ TEST_F(AdmissionControlTest, GrpcFailureBehavior) {
   auto config = makeConfig(default_yaml_);
   setupFilter(config);
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 0)));
   EXPECT_CALL(*evaluator_, isGrpcSuccess(7)).WillRepeatedly(Return(false));
@@ -258,7 +261,7 @@ TEST_F(AdmissionControlTest, GrpcFailureBehavior) {
   sampleGrpcRequest(Grpc::Status::WellKnownGrpcStatus::PermissionDenied);
 
   // We expect rejection counter to increment upon failure.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 1, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(1), time_system_));
 }
 
 // Validate simple gRPC success case with status in the trailer.
@@ -266,7 +269,7 @@ TEST_F(AdmissionControlTest, GrpcSuccessBehaviorTrailer) {
   auto config = makeConfig(default_yaml_);
   setupFilter(config);
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 100)));
   EXPECT_CALL(*evaluator_, isGrpcSuccess(0)).WillRepeatedly(Return(true));
@@ -277,7 +280,7 @@ TEST_F(AdmissionControlTest, GrpcSuccessBehaviorTrailer) {
   sampleGrpcRequestTrailer(Grpc::Status::WellKnownGrpcStatus::Ok);
 
   // We expect rejection counter to NOT increment upon success.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 }
 
 // Validate simple gRPC failure case with status in the trailer.
@@ -285,7 +288,7 @@ TEST_F(AdmissionControlTest, GrpcFailureBehaviorTrailer) {
   auto config = makeConfig(default_yaml_);
   setupFilter(config);
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 0)));
   EXPECT_CALL(*evaluator_, isGrpcSuccess(7)).WillRepeatedly(Return(false));
@@ -297,7 +300,7 @@ TEST_F(AdmissionControlTest, GrpcFailureBehaviorTrailer) {
   sampleGrpcRequestTrailer(Grpc::Status::WellKnownGrpcStatus::PermissionDenied);
 
   // We expect rejection counter to increment upon failure.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 1, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(1), time_system_));
 }
 
 // Validate simple gRPC success case.
@@ -305,7 +308,7 @@ TEST_F(AdmissionControlTest, GrpcSuccessBehavior) {
   auto config = makeConfig(default_yaml_);
   setupFilter(config);
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 100)));
   EXPECT_CALL(*evaluator_, isGrpcSuccess(0)).WillRepeatedly(Return(true));
@@ -316,7 +319,7 @@ TEST_F(AdmissionControlTest, GrpcSuccessBehavior) {
   sampleGrpcRequest(Grpc::Status::WellKnownGrpcStatus::Ok);
 
   // We expect rejection counter to NOT increment upon success.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 }
 
 // Validate rejection probabilities.
@@ -420,7 +423,7 @@ success_criteria:
   EXPECT_CALL(controller_, averageRps()).WillRepeatedly(Return(100));
 
   // We expect rejection counter to increment upon failure.
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 0, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(0), time_system_));
 
   EXPECT_CALL(controller_, requestCounts()).WillRepeatedly(Return(RequestData(100, 0)));
   EXPECT_CALL(*evaluator_, isHttpSuccess(500)).WillRepeatedly(Return(false));
@@ -430,7 +433,7 @@ success_criteria:
             filter_->decodeHeaders(request_headers, true));
   sampleHttpRequest("500");
 
-  TestUtility::waitForCounterEq(scope_, "test_prefix.rq_rejected", 1, time_system_);
+  EXPECT_TRUE(TestUtility::waitForCounter(store_, "test_prefix.rq_rejected", Eq(1), time_system_));
 }
 
 // Validate max rejection probability.

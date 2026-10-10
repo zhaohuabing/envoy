@@ -13,10 +13,31 @@ namespace Config {
 
 MockSubscriptionFactory::MockSubscriptionFactory() {
   ON_CALL(*this, subscriptionFromConfigSource(_, _, _, _, _, _))
+      .WillByDefault(Invoke([this](const envoy::config::core::v3::ConfigSource&, absl::string_view,
+                                   Stats::Scope&, SubscriptionCallbacks& callbacks,
+                                   OpaqueResourceDecoderSharedPtr,
+                                   const SubscriptionOptions&) -> SubscriptionPtr {
+        auto ret = std::make_unique<NiceMock<MockSubscription>>();
+        subscription_ = ret.get();
+        callbacks_ = &callbacks;
+        return ret;
+      }));
+  ON_CALL(*this, subscriptionOverAdsGrpcMux(_, _, _, _, _, _, _))
+      .WillByDefault(Invoke([this](GrpcMuxSharedPtr&, const envoy::config::core::v3::ConfigSource&,
+                                   absl::string_view, Stats::Scope&,
+                                   SubscriptionCallbacks& callbacks, OpaqueResourceDecoderSharedPtr,
+                                   const SubscriptionOptions&) -> SubscriptionPtr {
+        auto ret = std::make_unique<NiceMock<MockSubscription>>();
+        subscription_ = ret.get();
+        callbacks_ = &callbacks;
+        return ret;
+      }));
+  ON_CALL(*this, collectionSubscriptionFromUrl(_, _, _, _, _, _))
       .WillByDefault(
-          Invoke([this](const envoy::config::core::v3::ConfigSource&, absl::string_view,
-                        Stats::Scope&, SubscriptionCallbacks& callbacks, OpaqueResourceDecoder&,
-                        const SubscriptionOptions&) -> SubscriptionPtr {
+          Invoke([this](const xds::core::v3::ResourceLocator&,
+                        const envoy::config::core::v3::ConfigSource&, absl::string_view,
+                        Stats::Scope&, Envoy::Config::SubscriptionCallbacks& callbacks,
+                        Envoy::Config::OpaqueResourceDecoderSharedPtr) -> SubscriptionPtr {
             auto ret = std::make_unique<NiceMock<MockSubscription>>();
             subscription_ = ret.get();
             callbacks_ = &callbacks;
@@ -60,6 +81,12 @@ MockContextProvider::MockContextProvider() {
 }
 
 MockContextProvider::~MockContextProvider() = default;
+
+MockXdsConfigTracker::MockXdsConfigTracker() = default;
+MockXdsConfigTracker::~MockXdsConfigTracker() = default;
+
+MockXdsResourcesDelegate::MockXdsResourcesDelegate() = default;
+MockXdsResourcesDelegate::~MockXdsResourcesDelegate() = default;
 
 } // namespace Config
 } // namespace Envoy

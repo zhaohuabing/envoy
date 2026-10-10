@@ -7,25 +7,25 @@
 
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/singleton/manager_impl.h"
+#include "source/common/tls/context_manager_impl.h"
 #include "source/common/upstream/health_discovery_service.h"
 #include "source/common/upstream/transport_socket_match_impl.h"
+#include "source/extensions/health_checkers/common/health_checker_base_impl.h"
 #include "source/extensions/transport_sockets/raw_buffer/config.h"
-#include "source/extensions/transport_sockets/tls/context_manager_impl.h"
 
-#include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/grpc/mocks.h"
-#include "test/mocks/local_info/mocks.h"
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/server/admin.h"
-#include "test/mocks/server/instance.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/cluster_info_factory.h"
 #include "test/mocks/upstream/cluster_manager.h"
 #include "test/mocks/upstream/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/status_utility.h"
+#include "test/test_common/struct_matchers.h"
 #include "test/test_common/utility.h"
 
 #include "absl/strings/str_format.h"
@@ -34,11 +34,11 @@
 
 using testing::_;
 using testing::AtLeast;
+using testing::Contains;
 using testing::InSequence;
 using testing::Invoke;
 using testing::NiceMock;
 using testing::Return;
-using testing::ReturnNew;
 using testing::ReturnRef;
 
 namespace Envoy {
@@ -51,9 +51,17 @@ public:
   void processPrivateMessage(
       HdsDelegate& hd,
       std::unique_ptr<envoy::service::health::v3::HealthCheckSpecifier>&& message) {
-    hd.processMessage(std::move(message));
+    ASSERT_OK(hd.processMessage(std::move(message)));
   };
   HdsDelegateStats getStats(HdsDelegate& hd) { return hd.stats_; };
+  static void swapFactory(HdsDelegate& hd, std::unique_ptr<ClusterInfoFactory>&& factory) {
+    hd.info_factory_ = std::move(factory);
+  }
+  envoy::config::cluster::v3::Cluster
+  createClusterConfig(HdsDelegate& hd,
+                      const envoy::service::health::v3::ClusterHealthCheck& cluster_health_check) {
+    return hd.createClusterConfig(cluster_health_check);
+  }
 };
 
 class HdsTest : public testing::Test {
@@ -61,8 +69,8 @@ protected:
   HdsTest()
       : retry_timer_(new Event::MockTimer()), server_response_timer_(new Event::MockTimer()),
         async_client_(new Grpc::MockAsyncClient()),
-        api_(Api::createApiForTest(stats_store_, random_)),
-        ssl_context_manager_(api_->timeSource()) {
+        api_(Api::createApiForTest(stats_store_, random_)), ssl_context_manager_(server_context_) {
+    ON_CALL(server_context_, api()).WillByDefault(ReturnRef(*api_));
     node_.set_id("hds-node");
   }
 
@@ -78,13 +86,14 @@ protected:
   // Creates an HdsDelegate
   void createHdsDelegate() {
     InSequence s;
-    EXPECT_CALL(dispatcher_, createTimer_(_)).WillOnce(Invoke([this](Event::TimerCb timer_cb) {
-      retry_timer_cb_ = timer_cb;
-      return retry_timer_;
-    }));
+    EXPECT_CALL(server_context_.dispatcher_, createTimer_(_))
+        .WillOnce(Invoke([this](Event::TimerCb timer_cb) {
+          retry_timer_cb_ = timer_cb;
+          return retry_timer_;
+        }));
     // First call will set up the response timer for assertions, all other future calls
     // just return a new timer that we won't keep track of.
-    EXPECT_CALL(dispatcher_, createTimer_(_))
+    EXPECT_CALL(server_context_.dispatcher_, createTimer_(_))
         .Times(AtLeast(1))
         .WillOnce(Invoke([this](Event::TimerCb timer_cb) {
           server_response_timer_cb_ = timer_cb;
@@ -92,15 +101,17 @@ protected:
         }))
         .WillRepeatedly(testing::ReturnNew<NiceMock<Event::MockTimer>>());
 
-    hds_delegate_ = std::make_unique<HdsDelegate>(
-        stats_store_, Grpc::RawAsyncClientPtr(async_client_), dispatcher_, runtime_, stats_store_,
-        ssl_context_manager_, test_factory_, log_manager_, cm_, local_info_, admin_,
-        singleton_manager_, tls_, validation_visitor_, *api_, options_);
+    hds_delegate_ = std::make_unique<HdsDelegate>(server_context_, *stats_store_.rootScope(),
+                                                  Grpc::RawAsyncClientPtr(async_client_),
+                                                  stats_store_, ssl_context_manager_);
+    test_factory_ = new MockClusterInfoFactory();
+    HdsDelegateFriend::swapFactory(*hds_delegate_,
+                                   std::unique_ptr<ClusterInfoFactory>(test_factory_));
   }
 
   void expectCreateClientConnection() {
     // Create a new mock connection for each call to createClientConnection.
-    EXPECT_CALL(dispatcher_, createClientConnection_(_, _, _, _))
+    EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
         .WillRepeatedly(Invoke(
             [](Network::Address::InstanceConstSharedPtr, Network::Address::InstanceConstSharedPtr,
                Network::TransportSocketPtr&, const Network::ConnectionSocket::OptionsSharedPtr&) {
@@ -117,7 +128,7 @@ protected:
 
   // Creates a HealthCheckSpecifier message that contains one endpoint and one
   // healthcheck
-  envoy::service::health::v3::HealthCheckSpecifier* createSimpleMessage() {
+  envoy::service::health::v3::HealthCheckSpecifier* createSimpleMessage(bool http = true) {
     envoy::service::health::v3::HealthCheckSpecifier* msg =
         new envoy::service::health::v3::HealthCheckSpecifier;
     msg->mutable_interval()->set_seconds(1);
@@ -129,10 +140,11 @@ protected:
     health_check->mutable_health_checks(0)->mutable_unhealthy_threshold()->set_value(2);
     health_check->mutable_health_checks(0)->mutable_healthy_threshold()->set_value(2);
     health_check->mutable_health_checks(0)->mutable_grpc_health_check();
-    health_check->mutable_health_checks(0)->mutable_http_health_check()->set_codec_client_type(
-        envoy::type::v3::HTTP1);
-    health_check->mutable_health_checks(0)->mutable_http_health_check()->set_path("/healthcheck");
-
+    if (http) {
+      health_check->mutable_health_checks(0)->mutable_http_health_check()->set_codec_client_type(
+          envoy::type::v3::HTTP1);
+      health_check->mutable_health_checks(0)->mutable_http_health_check()->set_path("/healthcheck");
+    }
     auto* locality_endpoints = health_check->add_locality_endpoints();
     // add locality information to this endpoint set of one endpoint.
     auto* locality = locality_endpoints->mutable_locality();
@@ -152,7 +164,8 @@ protected:
   // Creates a HealthCheckSpecifier message that contains several clusters, endpoints, localities,
   // with only one health check type.
   std::unique_ptr<envoy::service::health::v3::HealthCheckSpecifier>
-  createComplexSpecifier(uint32_t n_clusters, uint32_t n_localities, uint32_t n_endpoints) {
+  createComplexSpecifier(uint32_t n_clusters, uint32_t n_localities, uint32_t n_endpoints,
+                         bool disable_hc = false) {
     // Final specifier to return.
     std::unique_ptr<envoy::service::health::v3::HealthCheckSpecifier> msg =
         std::make_unique<envoy::service::health::v3::HealthCheckSpecifier>();
@@ -187,11 +200,13 @@ protected:
 
         // add some endpoints to the locality group with iterative naming for verification.
         for (uint32_t endpoint_num = 0; endpoint_num < n_endpoints; endpoint_num++) {
-          auto* socket_address =
-              locality_endpoints->add_endpoints()->mutable_address()->mutable_socket_address();
+          auto* endpoint = locality_endpoints->add_endpoints();
+
+          auto* socket_address = endpoint->mutable_address()->mutable_socket_address();
           socket_address->set_address(
               absl::StrCat("127.", cluster_num, ".", loc_num, ".", endpoint_num));
           socket_address->set_port_value(1234);
+          endpoint->mutable_health_check_config()->set_disable_active_health_check(disable_hc);
         }
       }
     }
@@ -211,6 +226,8 @@ transport_socket_matches:
     %s: "true"
   transport_socket:
     name: "envoy.transport_sockets.raw_buffer"
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
 )EOF",
         match);
     cluster_health_check->MergeFrom(
@@ -227,11 +244,11 @@ transport_socket_match_criteria:
         TestUtility::parseYaml<envoy::config::core::v3::HealthCheck>(criteria_yaml));
   }
 
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context_;
   Event::SimulatedTimeSystem time_system_;
   envoy::config::core::v3::Node node_;
-  Event::MockDispatcher dispatcher_;
   Stats::IsolatedStoreImpl stats_store_;
-  MockClusterInfoFactory test_factory_;
+  MockClusterInfoFactory* test_factory_;
 
   std::unique_ptr<Upstream::HdsDelegate> hds_delegate_;
   HdsDelegateFriend hds_delegate_friend_;
@@ -246,18 +263,9 @@ transport_socket_match_criteria:
   std::unique_ptr<envoy::service::health::v3::HealthCheckSpecifier> message;
   Grpc::MockAsyncStream async_stream_;
   Grpc::MockAsyncClient* async_client_;
-  Runtime::MockLoader runtime_;
-  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
   Api::ApiPtr api_;
   Extensions::TransportSockets::Tls::ContextManagerImpl ssl_context_manager_;
   NiceMock<Random::MockRandomGenerator> random_;
-  NiceMock<Envoy::AccessLog::MockAccessLogManager> log_manager_;
-  NiceMock<Upstream::MockClusterManager> cm_;
-  NiceMock<LocalInfo::MockLocalInfo> local_info_;
-  NiceMock<Server::MockAdmin> admin_;
-  Singleton::ManagerImpl singleton_manager_{Thread::threadFactoryForTest()};
-  NiceMock<ThreadLocal::MockInstance> tls_;
-  Server::MockOptions options_;
 };
 
 // Test that HdsDelegate builds and sends initial message correctly
@@ -269,7 +277,7 @@ TEST_F(HdsTest, HealthCheckRequest) {
   request.mutable_health_check_request()->mutable_capability()->add_health_check_protocols(
       envoy::service::health::v3::Capability::TCP);
 
-  EXPECT_CALL(local_info_, node()).WillOnce(ReturnRef(node_));
+  EXPECT_CALL(server_context_.local_info_, node()).WillOnce(ReturnRef(node_));
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
   EXPECT_CALL(async_stream_, sendMessageRaw_(Grpc::ProtoBufferEq(request), false));
   createHdsDelegate();
@@ -292,14 +300,16 @@ TEST_F(HdsTest, TestProcessMessageEndpoints) {
     auto* health_check = message->add_cluster_health_checks();
     health_check->set_cluster_name("anna" + std::to_string(i));
     for (int j = 0; j < 3; j++) {
-      auto* address = health_check->add_locality_endpoints()->add_endpoints()->mutable_address();
+      auto* locality_endpoints = health_check->add_locality_endpoints();
+      locality_endpoints->mutable_locality()->set_zone(std::to_string(j));
+      auto* address = locality_endpoints->add_endpoints()->mutable_address();
       address->mutable_socket_address()->set_address("127.0.0." + std::to_string(i));
       address->mutable_socket_address()->set_port_value(1234 + j);
     }
   }
 
   // Process message
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).Times(2).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).Times(2).WillRepeatedly(Return(cluster_info_));
   hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
 
   // Check Correctness
@@ -323,12 +333,13 @@ TEST_F(HdsTest, TestHdsCluster) {
 
   auto* health_check = message->add_cluster_health_checks();
   health_check->set_cluster_name("test_cluster");
+  health_check->mutable_upstream_bind_config()->mutable_source_address()->set_address("1.1.1.1");
   auto* address = health_check->add_locality_endpoints()->add_endpoints()->mutable_address();
   address->mutable_socket_address()->set_address("127.0.0.2");
   address->mutable_socket_address()->set_port_value(1234);
 
   // Process message
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
   hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
 
   EXPECT_EQ(hds_delegate_->hdsClusters()[0]->initializePhase(),
@@ -372,7 +383,7 @@ TEST_F(HdsTest, TestProcessMessageHealthChecks) {
   }
 
   // Process message
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
 
   hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
 
@@ -419,12 +430,13 @@ TEST_F(HdsTest, TestProcessMessageMissingFieldsWithFallback) {
   message.reset(createSimpleMessage());
 
   Network::MockClientConnection* connection = new NiceMock<Network::MockClientConnection>();
-  EXPECT_CALL(dispatcher_, createClientConnection_(_, _, _, _)).WillRepeatedly(Return(connection));
+  EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
+      .WillRepeatedly(Return(connection));
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(2);
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
   EXPECT_CALL(*connection, setBufferLimits(_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_));
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
   connection->raiseEvent(Network::ConnectionEvent::Connected);
@@ -466,6 +478,38 @@ TEST_F(HdsTest, TestProcessMessageMissingFieldsWithFallback) {
   EXPECT_EQ(hds_delegate_friend_.getStats(*hds_delegate_).requests_.value(), 2);
 }
 
+// Test if processMessage exits gracefully if the update fails
+TEST_F(HdsTest, TestProcessMessageInvalidFieldsWithFallback) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Create Message
+  message.reset(createSimpleMessage());
+
+  Network::MockClientConnection* connection = new NiceMock<Network::MockClientConnection>();
+  EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
+      .WillRepeatedly(Return(connection));
+  EXPECT_CALL(*server_response_timer_, enableTimer(_, _));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*connection, setBufferLimits(_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_));
+  // Process message
+  hds_delegate_->onReceiveMessage(std::move(message));
+  connection->raiseEvent(Network::ConnectionEvent::Connected);
+
+  // Create a invalid message: grpc health checks require an H2 cluster
+  message.reset(createSimpleMessage(false));
+
+  // Pass invalid message through. Should increment stat_ errors upon
+  // getting a bad message.
+  hds_delegate_->onReceiveMessage(std::move(message));
+
+  // Check Correctness by verifying one request and one error has been generated in stat_
+  EXPECT_EQ(hds_delegate_friend_.getStats(*hds_delegate_).errors_.value(), 1);
+  EXPECT_EQ(hds_delegate_friend_.getStats(*hds_delegate_).requests_.value(), 2);
+}
+
 // Test if sendResponse() retains the structure of all endpoints ingested in the specifier
 // from onReceiveMessage(). This verifies that all endpoints are grouped by the correct
 // cluster and the correct locality.
@@ -492,7 +536,7 @@ TEST_F(HdsTest, TestSendResponseMultipleEndpoints) {
 
   // Carry over cluster name on a call to createClusterInfo,
   // in the same way that the prod factory does.
-  EXPECT_CALL(test_factory_, createClusterInfo(_))
+  EXPECT_CALL(*test_factory_, createClusterInfo(_))
       .WillRepeatedly(Invoke([](const ClusterInfoFactory::CreateClusterInfoParams& params) {
         std::shared_ptr<Upstream::MockClusterInfo> cluster_info{
             new NiceMock<Upstream::MockClusterInfo>()};
@@ -501,7 +545,8 @@ TEST_F(HdsTest, TestSendResponseMultipleEndpoints) {
         cluster_info->name_ = params.cluster_.name();
         return cluster_info;
       }));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(NumClusters * NumLocalities * NumEndpoints);
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_))
+      .Times(NumClusters * NumLocalities * NumEndpoints);
 
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
@@ -570,35 +615,36 @@ TEST_F(HdsTest, TestSocketContext) {
   addTransportSocketMatches(message->mutable_cluster_health_checks(0), "test_match", "test_match");
 
   Network::MockClientConnection* connection = new NiceMock<Network::MockClientConnection>();
-  EXPECT_CALL(dispatcher_, createClientConnection_(_, _, _, _)).WillRepeatedly(Return(connection));
+  EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
+      .WillRepeatedly(Return(connection));
 
   // Pull out socket_matcher object normally internal to createClusterInfo, to test that a matcher
   // would match the expected socket.
   std::unique_ptr<TransportSocketMatcherImpl> socket_matcher;
-  EXPECT_CALL(test_factory_, createClusterInfo(_))
+  EXPECT_CALL(*test_factory_, createClusterInfo(_))
       .WillRepeatedly(Invoke([&](const ClusterInfoFactory::CreateClusterInfoParams& params) {
         // Build scope, factory_context as does ProdClusterInfoFactory.
-        Envoy::Stats::ScopePtr scope =
+        Envoy::Stats::ScopeSharedPtr scope =
             params.stats_.createScope(fmt::format("cluster.{}.", params.cluster_.name()));
         Envoy::Server::Configuration::TransportSocketFactoryContextImpl factory_context(
-            params.admin_, params.ssl_context_manager_, *scope, params.cm_, params.local_info_,
-            params.dispatcher_, params.stats_, params.singleton_manager_, params.tls_,
-            params.validation_visitor_, params.api_, params.options_);
+            params.server_context_, *scope, params.server_context_.messageValidationVisitor());
 
         // Create a mock socket_factory for the scope of this unit test.
-        std::unique_ptr<Envoy::Network::TransportSocketFactory> socket_factory =
+        std::unique_ptr<Envoy::Network::UpstreamTransportSocketFactory> socket_factory =
             std::make_unique<Network::MockTransportSocketFactory>();
 
         // set socket_matcher object in test scope.
-        socket_matcher = std::make_unique<Envoy::Upstream::TransportSocketMatcherImpl>(
-            params.cluster_.transport_socket_matches(), factory_context, socket_factory, *scope);
+        socket_matcher =
+            Envoy::Upstream::TransportSocketMatcherImpl::create(
+                params.cluster_.transport_socket_matches(), factory_context, socket_factory, *scope)
+                .value();
 
         // But still use the fake cluster_info_.
         return cluster_info_;
       }));
 
   EXPECT_CALL(*connection, setBufferLimits(_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_));
 
   // Process message.
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
@@ -616,7 +662,7 @@ TEST_F(HdsTest, TestSocketContext) {
   // Check that our match hits.
   HealthCheckerImplBase* health_checker_base = dynamic_cast<HealthCheckerImplBase*>(hcs[0].get());
   const auto match =
-      socket_matcher->resolve(health_checker_base->transportSocketMatchMetadata().get());
+      socket_matcher->resolve(health_checker_base->transportSocketMatchMetadata().get(), nullptr);
   EXPECT_EQ(match.name_, "test_socket");
 }
 
@@ -696,12 +742,13 @@ TEST_F(HdsTest, TestSendResponseOneEndpointTimeout) {
   message.reset(createSimpleMessage());
 
   Network::MockClientConnection* connection_ = new NiceMock<Network::MockClientConnection>();
-  EXPECT_CALL(dispatcher_, createClientConnection_(_, _, _, _)).WillRepeatedly(Return(connection_));
+  EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
+      .WillRepeatedly(Return(connection_));
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(2);
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
   EXPECT_CALL(*connection_, setBufferLimits(_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_));
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
   connection_->raiseEvent(Network::ConnectionEvent::Connected);
@@ -743,8 +790,8 @@ TEST_F(HdsTest, TestSameSpecifier) {
 
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   hds_delegate_->onReceiveMessage(std::move(message));
   hds_delegate_->sendResponse();
 
@@ -778,8 +825,8 @@ TEST_F(HdsTest, TestClusterChange) {
 
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
   hds_delegate_->sendResponse();
@@ -843,8 +890,8 @@ TEST_F(HdsTest, TestUpdateEndpoints) {
 
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
   hds_delegate_->sendResponse();
@@ -895,6 +942,42 @@ TEST_F(HdsTest, TestUpdateEndpoints) {
   checkHdsCounters(3, 0, 0, 3);
 }
 
+// Skip the endpoints with disabled active health check during message processing.
+TEST_F(HdsTest, TestUpdateEndpointsWithActiveHCflag) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Create Message, and later add/remove endpoints from the second cluster.
+  message.reset(createSimpleMessage());
+  message->MergeFrom(*createComplexSpecifier(1, 1, 2));
+
+  // Create a new active connection on request, setting its status to connected
+  // to mock a found endpoint.
+  expectCreateClientConnection();
+
+  EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  // Process message
+  hds_delegate_->onReceiveMessage(std::move(message));
+  hds_delegate_->sendResponse();
+
+  // Save list of hosts/endpoints for comparison later.
+  auto original_hosts = hds_delegate_->hdsClusters()[1]->hosts();
+  ASSERT_EQ(original_hosts.size(), 2);
+
+  // Ignoring the endpoints with disabled active health check.
+  message.reset(createSimpleMessage());
+  message->MergeFrom(*createComplexSpecifier(1, 1, 2, true));
+  hds_delegate_->onReceiveMessage(std::move(message));
+
+  // Get the new clusters list from HDS.
+  auto new_hosts = hds_delegate_->hdsClusters()[1]->hosts();
+  ASSERT_EQ(new_hosts.size(), 0);
+}
+
 // Test adding, reusing, and removing health checks.
 TEST_F(HdsTest, TestUpdateHealthCheckers) {
   EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
@@ -913,8 +996,8 @@ TEST_F(HdsTest, TestUpdateHealthCheckers) {
 
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
   hds_delegate_->sendResponse();
@@ -967,8 +1050,8 @@ TEST_F(HdsTest, TestClusterSameName) {
 
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
   EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillRepeatedly(Return(cluster_info_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   // Process message
   hds_delegate_->onReceiveMessage(std::move(message));
   hds_delegate_->sendResponse();
@@ -1027,28 +1110,28 @@ TEST_F(HdsTest, TestUpdateSocketContext) {
   // Pull out socket_matcher object normally internal to createClusterInfo, to test that a matcher
   // would match the expected socket.
   std::vector<std::unique_ptr<TransportSocketMatcherImpl>> socket_matchers;
-  EXPECT_CALL(test_factory_, createClusterInfo(_))
+  EXPECT_CALL(*test_factory_, createClusterInfo(_))
       .WillRepeatedly(Invoke([&](const ClusterInfoFactory::CreateClusterInfoParams& params) {
         // Build scope, factory_context as does ProdClusterInfoFactory.
-        Envoy::Stats::ScopePtr scope =
+        Envoy::Stats::ScopeSharedPtr scope =
             params.stats_.createScope(fmt::format("cluster.{}.", params.cluster_.name()));
         Envoy::Server::Configuration::TransportSocketFactoryContextImpl factory_context(
-            params.admin_, params.ssl_context_manager_, *scope, params.cm_, params.local_info_,
-            params.dispatcher_, params.stats_, params.singleton_manager_, params.tls_,
-            params.validation_visitor_, params.api_, params.options_);
+            params.server_context_, *scope, params.server_context_.messageValidationVisitor());
 
         // Create a mock socket_factory for the scope of this unit test.
-        std::unique_ptr<Envoy::Network::TransportSocketFactory> socket_factory =
+        std::unique_ptr<Envoy::Network::UpstreamTransportSocketFactory> socket_factory =
             std::make_unique<Network::MockTransportSocketFactory>();
 
         // set socket_matcher object in test scope.
-        socket_matchers.push_back(std::make_unique<Envoy::Upstream::TransportSocketMatcherImpl>(
-            params.cluster_.transport_socket_matches(), factory_context, socket_factory, *scope));
+        socket_matchers.push_back(
+            Envoy::Upstream::TransportSocketMatcherImpl::create(
+                params.cluster_.transport_socket_matches(), factory_context, socket_factory, *scope)
+                .value());
 
         // But still use the fake cluster_info_.
         return cluster_info_;
       }));
-  EXPECT_CALL(dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_)).Times(AtLeast(1));
   EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(AtLeast(1));
 
   // Create Message, with a non-valid match and process.
@@ -1065,8 +1148,8 @@ TEST_F(HdsTest, TestUpdateSocketContext) {
   // Check that our fails so it uses default.
   HealthCheckerImplBase* first_health_checker_base =
       dynamic_cast<HealthCheckerImplBase*>(first_hcs[0].get());
-  const auto first_match =
-      socket_matchers[0]->resolve(first_health_checker_base->transportSocketMatchMetadata().get());
+  const auto first_match = socket_matchers[0]->resolve(
+      first_health_checker_base->transportSocketMatchMetadata().get(), nullptr);
   EXPECT_EQ(first_match.name_, "default");
 
   // Create a new Message, this time with a good match.
@@ -1089,8 +1172,8 @@ TEST_F(HdsTest, TestUpdateSocketContext) {
   HealthCheckerImplBase* second_health_checker_base =
       dynamic_cast<HealthCheckerImplBase*>(second_hcs[0].get());
   ASSERT_EQ(socket_matchers.size(), 2);
-  const auto second_match =
-      socket_matchers[1]->resolve(second_health_checker_base->transportSocketMatchMetadata().get());
+  const auto second_match = socket_matchers[1]->resolve(
+      second_health_checker_base->transportSocketMatchMetadata().get(), nullptr);
   EXPECT_EQ(second_match.name_, "test_socket");
 
   // Create a new Message, this we leave the transport socket the same but change the health check's
@@ -1118,8 +1201,8 @@ TEST_F(HdsTest, TestUpdateSocketContext) {
   // Check that our socket matchers is still a size 2. This is because createClusterInfo(_) is never
   // called again since there was no update to transportSocketMatches.
   ASSERT_EQ(socket_matchers.size(), 2);
-  const auto third_match =
-      socket_matchers[1]->resolve(third_health_checker_base->transportSocketMatchMetadata().get());
+  const auto third_match = socket_matchers[1]->resolve(
+      third_health_checker_base->transportSocketMatchMetadata().get(), nullptr);
   // Since this again does not match, it uses default.
   EXPECT_EQ(third_match.name_, "default");
 }
@@ -1137,7 +1220,9 @@ TEST_F(HdsTest, TestCustomHealthCheckPortWhenCreate) {
   auto* health_check = message->add_cluster_health_checks();
   health_check->set_cluster_name("anna");
   for (int i = 0; i < 3; i++) {
-    auto* endpoint = health_check->add_locality_endpoints()->add_endpoints();
+    auto* locality_endpoints = health_check->add_locality_endpoints();
+    locality_endpoints->mutable_locality()->set_zone(std::to_string(i));
+    auto* endpoint = locality_endpoints->add_endpoints();
     endpoint->mutable_health_check_config()->set_port_value(4321 + i);
     auto* address = endpoint->mutable_address();
     address->mutable_socket_address()->set_address("127.0.0.1");
@@ -1145,7 +1230,7 @@ TEST_F(HdsTest, TestCustomHealthCheckPortWhenCreate) {
   }
 
   // Process message
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
   hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
 
   // Check Correctness
@@ -1178,8 +1263,9 @@ TEST_F(HdsTest, TestCustomHealthCheckPortWhenUpdate) {
   }
 
   // Process message
-  EXPECT_CALL(test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
-  hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  auto message_copy = std::make_unique<envoy::service::health::v3::HealthCheckSpecifier>(*message);
+  hds_delegate_friend_.processPrivateMessage(*hds_delegate_, std::move(message_copy));
 
   for (int i = 0; i < 3; i++) {
     auto& host =
@@ -1206,6 +1292,178 @@ TEST_F(HdsTest, TestCustomHealthCheckPortWhenUpdate) {
     EXPECT_EQ(host->address()->ip()->port(), 1234 + i);
     EXPECT_EQ(host->healthCheckAddress()->ip()->port(), 4321 + i);
   }
+}
+
+// Test that sendResponse includes health_metadata with http_status_code
+// when setHealthCheckMetadata has been called on a host.
+TEST_F(HdsTest, TestSendResponseWithHealthMetadata) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Create Message
+  message.reset(createSimpleMessage());
+
+  Network::MockClientConnection* connection_ = new NiceMock<Network::MockClientConnection>();
+  EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
+      .WillRepeatedly(Return(connection_));
+  EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(2);
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*connection_, setBufferLimits(_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_));
+
+  // Process message
+  hds_delegate_->onReceiveMessage(std::move(message));
+  connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  // Set the HTTP response code on the host to simulate a health check result.
+  auto& host = hds_delegate_->hdsClusters()[0]->prioritySet().hostSetsPerPriority()[0]->hosts()[0];
+  host->setLastHealthCheckHttpStatus(200);
+
+  // Send Response
+  auto msg = hds_delegate_->sendResponse();
+
+  // Verify health_metadata contains the HTTP status code in the legacy flat list.
+  const auto& endpoint_health = msg.endpoint_health_response().endpoints_health(0);
+  ASSERT_TRUE(endpoint_health.has_health_metadata());
+  const auto& fields = endpoint_health.health_metadata().fields();
+  auto it = fields.find("http_status_code");
+  ASSERT_NE(it, fields.end());
+  EXPECT_EQ(it->second.number_value(), 200.0);
+
+  // Also verify the structured (cluster-based) response.
+  const auto& cluster_endpoint =
+      msg.endpoint_health_response().cluster_endpoints_health(0).locality_endpoints_health(0);
+  const auto& structured_endpoint = cluster_endpoint.endpoints_health(0);
+  ASSERT_TRUE(structured_endpoint.has_health_metadata());
+  EXPECT_THAT(structured_endpoint.health_metadata().fields(),
+              Contains(IsStructNumber("http_status_code", 200.0)));
+}
+
+// Test that sendResponse does not include health_metadata when no metadata
+// has been set on the host (default empty Struct).
+TEST_F(HdsTest, TestSendResponseNoHealthMetadataByDefault) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Create Message
+  message.reset(createSimpleMessage());
+
+  Network::MockClientConnection* connection_ = new NiceMock<Network::MockClientConnection>();
+  EXPECT_CALL(server_context_.dispatcher_, createClientConnection_(_, _, _, _))
+      .WillRepeatedly(Return(connection_));
+  EXPECT_CALL(*server_response_timer_, enableTimer(_, _)).Times(2);
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, false));
+  EXPECT_CALL(*test_factory_, createClusterInfo(_)).WillOnce(Return(cluster_info_));
+  EXPECT_CALL(*connection_, setBufferLimits(_));
+  EXPECT_CALL(server_context_.dispatcher_, deferredDelete_(_));
+
+  // Process message (do NOT set any health metadata on host)
+  hds_delegate_->onReceiveMessage(std::move(message));
+  connection_->raiseEvent(Network::ConnectionEvent::Connected);
+
+  // Send Response
+  auto msg = hds_delegate_->sendResponse();
+
+  // Verify health_metadata is absent when no metadata has been set.
+  EXPECT_FALSE(msg.endpoint_health_response().endpoints_health(0).has_health_metadata());
+}
+
+// Test that createClusterConfig sets http2_protocol_options when a gRPC health check is present.
+TEST_F(HdsTest, TestCreateClusterConfigGrpcHealthCheckEnablesHttp2) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Build a ClusterHealthCheck with only a gRPC health check (no HTTP).
+  envoy::service::health::v3::ClusterHealthCheck cluster_health_check;
+  cluster_health_check.set_cluster_name("test-grpc-cluster");
+  auto* hc = cluster_health_check.add_health_checks();
+  hc->mutable_timeout()->set_seconds(1);
+  hc->mutable_interval()->set_seconds(1);
+  hc->mutable_unhealthy_threshold()->set_value(2);
+  hc->mutable_healthy_threshold()->set_value(2);
+  hc->mutable_grpc_health_check();
+
+  auto* locality_endpoints = cluster_health_check.add_locality_endpoints();
+  auto* socket_address =
+      locality_endpoints->add_endpoints()->mutable_address()->mutable_socket_address();
+  socket_address->set_address("127.0.0.1");
+  socket_address->set_port_value(9090);
+
+  auto cluster_config =
+      hds_delegate_friend_.createClusterConfig(*hds_delegate_, cluster_health_check);
+
+  // The cluster config should have http2_protocol_options set for gRPC.
+  EXPECT_TRUE(cluster_config.has_http2_protocol_options());
+}
+
+// Test that createClusterConfig does NOT set http2_protocol_options for HTTP-only health checks.
+TEST_F(HdsTest, TestCreateClusterConfigHttpHealthCheckNoHttp2) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Build a ClusterHealthCheck with only an HTTP health check.
+  envoy::service::health::v3::ClusterHealthCheck cluster_health_check;
+  cluster_health_check.set_cluster_name("test-http-cluster");
+  auto* hc = cluster_health_check.add_health_checks();
+  hc->mutable_timeout()->set_seconds(1);
+  hc->mutable_interval()->set_seconds(1);
+  hc->mutable_unhealthy_threshold()->set_value(2);
+  hc->mutable_healthy_threshold()->set_value(2);
+  hc->mutable_http_health_check()->set_path("/healthcheck");
+
+  auto* locality_endpoints = cluster_health_check.add_locality_endpoints();
+  auto* socket_address =
+      locality_endpoints->add_endpoints()->mutable_address()->mutable_socket_address();
+  socket_address->set_address("127.0.0.1");
+  socket_address->set_port_value(8080);
+
+  auto cluster_config =
+      hds_delegate_friend_.createClusterConfig(*hds_delegate_, cluster_health_check);
+
+  // The cluster config should NOT have http2_protocol_options for HTTP-only.
+  EXPECT_FALSE(cluster_config.has_http2_protocol_options());
+}
+
+// Test that createClusterConfig sets http2_protocol_options when mixed health checks include gRPC.
+TEST_F(HdsTest, TestCreateClusterConfigMixedHealthChecksWithGrpcEnablesHttp2) {
+  EXPECT_CALL(*async_client_, startRaw(_, _, _, _)).WillOnce(Return(&async_stream_));
+  EXPECT_CALL(async_stream_, sendMessageRaw_(_, _));
+  createHdsDelegate();
+
+  // Build a ClusterHealthCheck with both HTTP and gRPC health checks.
+  envoy::service::health::v3::ClusterHealthCheck cluster_health_check;
+  cluster_health_check.set_cluster_name("test-mixed-cluster");
+
+  auto* hc_http = cluster_health_check.add_health_checks();
+  hc_http->mutable_timeout()->set_seconds(1);
+  hc_http->mutable_interval()->set_seconds(1);
+  hc_http->mutable_unhealthy_threshold()->set_value(2);
+  hc_http->mutable_healthy_threshold()->set_value(2);
+  hc_http->mutable_http_health_check()->set_path("/healthcheck");
+
+  auto* hc_grpc = cluster_health_check.add_health_checks();
+  hc_grpc->mutable_timeout()->set_seconds(1);
+  hc_grpc->mutable_interval()->set_seconds(1);
+  hc_grpc->mutable_unhealthy_threshold()->set_value(2);
+  hc_grpc->mutable_healthy_threshold()->set_value(2);
+  hc_grpc->mutable_grpc_health_check();
+
+  auto* locality_endpoints = cluster_health_check.add_locality_endpoints();
+  auto* socket_address =
+      locality_endpoints->add_endpoints()->mutable_address()->mutable_socket_address();
+  socket_address->set_address("127.0.0.1");
+  socket_address->set_port_value(8080);
+
+  auto cluster_config =
+      hds_delegate_friend_.createClusterConfig(*hds_delegate_, cluster_health_check);
+
+  // The cluster config should have http2_protocol_options because gRPC is present.
+  EXPECT_TRUE(cluster_config.has_http2_protocol_options());
 }
 
 } // namespace Upstream

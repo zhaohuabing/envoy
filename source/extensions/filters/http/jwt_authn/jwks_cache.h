@@ -6,14 +6,15 @@
 #include "envoy/common/pure.h"
 #include "envoy/common/time.h"
 #include "envoy/extensions/filters/http/jwt_authn/v3/config.pb.h"
-#include "envoy/thread_local/thread_local.h"
+#include "envoy/init/manager.h"
 
+#include "source/common/jwt/jwks.h"
 #include "source/extensions/filters/http/common/jwks_fetcher.h"
 #include "source/extensions/filters/http/jwt_authn/jwks_async_fetcher.h"
 #include "source/extensions/filters/http/jwt_authn/jwt_cache.h"
 #include "source/extensions/filters/http/jwt_authn/stats.h"
 
-#include "jwt_verify_lib/jwks.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -23,8 +24,8 @@ namespace JwtAuthn {
 class JwksCache;
 using JwksCachePtr = std::unique_ptr<JwksCache>;
 
-using JwksConstPtr = std::unique_ptr<const ::google::jwt_verify::Jwks>;
-using JwksConstSharedPtr = std::shared_ptr<const ::google::jwt_verify::Jwks>;
+using JwksConstPtr = std::unique_ptr<const JwtVerify::Jwks>;
+using JwksConstSharedPtr = std::shared_ptr<const JwtVerify::Jwks>;
 
 /**
  * Interface to access all configured Jwt rules and their cached Jwks objects.
@@ -51,27 +52,52 @@ public:
   // Interface to access a Jwks config rule and its cached Jwks object.
   class JwksData {
   public:
+    // A `claim_to_headers` entry with its claim path resolved once, at config load.
+    // The segments point into the JwtProvider proto, which the FilterConfig owns and never
+    // mutates after construction, and which every in-flight request keeps alive via its
+    // FilterConfigSharedPtr. They must not point at anything shorter-lived.
+    struct ClaimToHeader {
+      std::vector<absl::string_view> claim_path_;
+      std::string header_name_;
+    };
+
     virtual ~JwksData() = default;
 
     // Check if a list of audiences are allowed.
     virtual bool areAudiencesAllowed(const std::vector<std::string>& audiences) const PURE;
 
+    // Check if a subject is allowed.
+    virtual bool isSubjectAllowed(absl::string_view sub) const PURE;
+
+    // Check if the current credential lifetime is allowed.
+    virtual bool isLifetimeAllowed(const absl::Time& now, const absl::Time* exp) const PURE;
+
     // Get the cached config: JWT rule.
     virtual const envoy::extensions::filters::http::jwt_authn::v3::JwtProvider&
     getJwtProvider() const PURE;
 
+    // Get the provider's `claim_to_headers` with claim paths already resolved.
+    virtual const std::vector<ClaimToHeader>& claimsToHeaders() const PURE;
+
+    // Get the retry policy for remote Jwks fetcher.
+    virtual const Router::RetryPolicyConstSharedPtr& retryPolicy() const PURE;
+
     // Get the Jwks object.
-    virtual const ::google::jwt_verify::Jwks* getJwksObj() const PURE;
+    virtual const JwtVerify::Jwks* getJwksObj() const PURE;
 
     // Return true if jwks object is expired.
     virtual bool isExpired() const PURE;
 
     // Set a remote Jwks.
-    virtual const ::google::jwt_verify::Jwks* setRemoteJwks(JwksConstPtr&& jwks) PURE;
+    virtual const JwtVerify::Jwks* setRemoteJwks(JwksConstPtr&& jwks) PURE;
 
-    // Get Token Cache
+    // Get Token Cache.
     virtual JwtCache& getJwtCache() PURE;
   };
+
+  // If there is only one provider in the config, return the data for that provider.
+  // It is only used for checking "failed_status_in_metadata" config for now.
+  virtual JwksData* getSingleProvider() PURE;
 
   // Lookup issuer cache map. The cache only stores Jwks specified in the config.
   virtual JwksData* findByIssuer(const std::string& issuer) PURE;
@@ -82,10 +108,10 @@ public:
   virtual JwtAuthnFilterStats& stats() PURE;
 
   // Factory function to create an instance.
-  static JwksCachePtr
+  static absl::StatusOr<JwksCachePtr>
   create(const envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication& config,
-         Server::Configuration::FactoryContext& context, CreateJwksFetcherCb fetcher_fn,
-         JwtAuthnFilterStats& stats);
+         Server::Configuration::ServerFactoryContext& context, OptRef<Init::Manager> init_manager,
+         CreateJwksFetcherCb fetcher_fn, JwtAuthnFilterStats& stats);
 };
 
 } // namespace JwtAuthn

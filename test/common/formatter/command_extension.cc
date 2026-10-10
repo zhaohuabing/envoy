@@ -5,24 +5,31 @@
 namespace Envoy {
 namespace Formatter {
 
-absl::optional<std::string> TestFormatter::format(const Http::RequestHeaderMap&,
-                                                  const Http::ResponseHeaderMap&,
-                                                  const Http::ResponseTrailerMap&,
-                                                  const StreamInfo::StreamInfo&,
-                                                  absl::string_view) const {
+std::optional<std::string> TestFormatter::format(const Context&,
+                                                 const StreamInfo::StreamInfo&) const {
   return "TestFormatter";
 }
 
-ProtobufWkt::Value TestFormatter::formatValue(const Http::RequestHeaderMap&,
-                                              const Http::ResponseHeaderMap&,
-                                              const Http::ResponseTrailerMap&,
-                                              const StreamInfo::StreamInfo&,
-                                              absl::string_view) const {
-  return ValueUtil::stringValue("");
+Protobuf::Value TestFormatter::formatValue(const Context& context,
+                                           const StreamInfo::StreamInfo& stream_info) const {
+  return ValueUtil::stringValue(format(context, stream_info).value());
 }
 
-FormatterProviderPtr TestCommandParser::parse(const std::string& token, size_t, size_t) const {
-  if (absl::StartsWith(token, "COMMAND_EXTENSION")) {
+bool TestFormatter::formatTo(std::string& sink, const Context& context,
+                             const StreamInfo::StreamInfo& stream_info) const {
+  sink.append(format(context, stream_info).value());
+  return true;
+}
+
+void TestFormatter::formatValueTo(ValueSink& sink, const Context& context,
+                                  const StreamInfo::StreamInfo& stream_info) const {
+  sink.addString(format(context, stream_info).value());
+}
+
+absl::StatusOr<FormatterProviderPtr> TestCommandParser::parse(absl::string_view command,
+                                                              absl::string_view,
+                                                              std::optional<size_t>) const {
+  if (command == "COMMAND_EXTENSION") {
     return std::make_unique<TestFormatter>();
   }
 
@@ -30,71 +37,84 @@ FormatterProviderPtr TestCommandParser::parse(const std::string& token, size_t, 
 }
 
 CommandParserPtr
-TestCommandFactory::createCommandParserFromProto(const Protobuf::Message& message) {
+TestCommandFactory::createCommandParserFromProto(const Protobuf::Message& message,
+                                                 Server::Configuration::GenericFactoryContext&) {
   // Cast the config message to the actual type to test that it was constructed properly.
-  [[maybe_unused]] const auto config = dynamic_cast<const ProtobufWkt::StringValue&>(message);
+  [[maybe_unused]] const auto& config =
+      *Envoy::Protobuf::DynamicCastMessage<const Protobuf::StringValue>(&message);
   return std::make_unique<TestCommandParser>();
 }
 
-std::string TestCommandFactory::configType() { return "google.protobuf.StringValue"; }
+std::set<std::string> TestCommandFactory::configTypes() { return {"google.protobuf.StringValue"}; }
 
 ProtobufTypes::MessagePtr TestCommandFactory::createEmptyConfigProto() {
-  return std::make_unique<ProtobufWkt::StringValue>();
+  return std::make_unique<Protobuf::StringValue>();
 }
 
 std::string TestCommandFactory::name() const { return "envoy.formatter.TestFormatter"; }
 
-absl::optional<std::string> AdditionalFormatter::format(const Http::RequestHeaderMap&,
-                                                        const Http::ResponseHeaderMap&,
-                                                        const Http::ResponseTrailerMap&,
-                                                        const StreamInfo::StreamInfo&,
-                                                        absl::string_view) const {
+std::optional<std::string> AdditionalFormatter::format(const Context&,
+                                                       const StreamInfo::StreamInfo&) const {
   return "AdditionalFormatter";
 }
 
-ProtobufWkt::Value AdditionalFormatter::formatValue(const Http::RequestHeaderMap&,
-                                                    const Http::ResponseHeaderMap&,
-                                                    const Http::ResponseTrailerMap&,
-                                                    const StreamInfo::StreamInfo&,
-                                                    absl::string_view) const {
-  return ValueUtil::stringValue("");
+Protobuf::Value AdditionalFormatter::formatValue(const Context& context,
+                                                 const StreamInfo::StreamInfo& stream_info) const {
+  return ValueUtil::stringValue(format(context, stream_info).value());
 }
 
-FormatterProviderPtr AdditionalCommandParser::parse(const std::string& token, size_t,
-                                                    size_t) const {
-  if (absl::StartsWith(token, "ADDITIONAL_EXTENSION")) {
+bool AdditionalFormatter::formatTo(std::string& sink, const Context& context,
+                                   const StreamInfo::StreamInfo& stream_info) const {
+  sink.append(format(context, stream_info).value());
+  return true;
+}
+
+void AdditionalFormatter::formatValueTo(ValueSink& sink, const Context& context,
+                                        const StreamInfo::StreamInfo& stream_info) const {
+  sink.addString(format(context, stream_info).value());
+}
+
+absl::StatusOr<FormatterProviderPtr> AdditionalCommandParser::parse(absl::string_view command,
+                                                                    absl::string_view,
+                                                                    std::optional<size_t>) const {
+  if (command == "ADDITIONAL_EXTENSION") {
     return std::make_unique<AdditionalFormatter>();
   }
 
   return nullptr;
 }
 
-CommandParserPtr
-AdditionalCommandFactory::createCommandParserFromProto(const Protobuf::Message& message) {
+CommandParserPtr AdditionalCommandFactory::createCommandParserFromProto(
+    const Protobuf::Message& message, Server::Configuration::GenericFactoryContext&) {
   // Cast the config message to the actual type to test that it was constructed properly.
-  [[maybe_unused]] const auto config = dynamic_cast<const ProtobufWkt::UInt32Value&>(message);
+  [[maybe_unused]] const auto& config =
+      *Envoy::Protobuf::DynamicCastMessage<const Protobuf::UInt32Value>(&message);
   return std::make_unique<AdditionalCommandParser>();
 }
 
-std::string AdditionalCommandFactory::configType() { return "google.protobuf.UInt32Value"; }
+std::set<std::string> AdditionalCommandFactory::configTypes() {
+  return {"google.protobuf.UInt32Value"};
+}
 
 ProtobufTypes::MessagePtr AdditionalCommandFactory::createEmptyConfigProto() {
-  return std::make_unique<ProtobufWkt::UInt32Value>();
+  return std::make_unique<Protobuf::UInt32Value>();
 }
 
 std::string AdditionalCommandFactory::name() const { return "envoy.formatter.AdditionalFormatter"; }
 
 CommandParserPtr
-FailCommandFactory::createCommandParserFromProto(const Protobuf::Message& message) {
+FailCommandFactory::createCommandParserFromProto(const Protobuf::Message& message,
+                                                 Server::Configuration::GenericFactoryContext&) {
   // Cast the config message to the actual type to test that it was constructed properly.
-  [[maybe_unused]] const auto config = dynamic_cast<const ProtobufWkt::UInt64Value&>(message);
+  [[maybe_unused]] const auto& config =
+      *Envoy::Protobuf::DynamicCastMessage<const Protobuf::UInt64Value>(&message);
   return nullptr;
 }
 
-std::string FailCommandFactory::configType() { return "google.protobuf.UInt64Value"; }
+std::set<std::string> FailCommandFactory::configTypes() { return {"google.protobuf.UInt64Value"}; }
 
 ProtobufTypes::MessagePtr FailCommandFactory::createEmptyConfigProto() {
-  return std::make_unique<ProtobufWkt::UInt64Value>();
+  return std::make_unique<Protobuf::UInt64Value>();
 }
 
 std::string FailCommandFactory::name() const { return "envoy.formatter.FailFormatter"; }

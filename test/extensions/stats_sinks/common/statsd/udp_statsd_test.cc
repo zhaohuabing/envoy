@@ -47,8 +47,9 @@ public:
 #ifndef WIN32
 // Regression test for https://github.com/envoyproxy/envoy/issues/8911
 TEST(UdpOverUdsStatsdSinkTest, InitWithPipeAddress) {
-  auto uds_address = std::make_shared<Network::Address::PipeInstance>(
-      TestEnvironment::unixDomainSocketPath("udstest.1.sock"));
+  std::shared_ptr<Network::Address::PipeInstance> uds_address =
+      *Network::Address::PipeInstance::create(
+          TestEnvironment::unixDomainSocketPath("udstest.1.sock"));
   NiceMock<ThreadLocal::MockInstance> tls_;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   UdpStatsdSink sink(tls_, uds_address, false);
@@ -63,7 +64,7 @@ TEST(UdpOverUdsStatsdSinkTest, InitWithPipeAddress) {
   sink.flush(snapshot);
 
   // Start the server.
-  Network::SocketImpl sock(Network::Socket::Type::Datagram, uds_address, nullptr);
+  Network::SocketImpl sock(Network::Socket::Type::Datagram, uds_address, nullptr, {});
   RELEASE_ASSERT(sock.setBlockingForTest(false).return_value_ != -1, "");
   sock.bind(uds_address);
 
@@ -98,13 +99,39 @@ TEST_P(UdpStatsdSinkTest, InitWithIpAddress) {
   gauge.used_ = true;
   snapshot.gauges_.push_back(gauge);
 
+  Stats::PrimitiveCounter host_counter;
+  host_counter.add(3);
+  Stats::PrimitiveCounterSnapshot host_counter_snap(host_counter);
+  host_counter_snap.setName("test_host_counter");
+  snapshot.host_counters_.push_back(host_counter_snap);
+
+  Stats::PrimitiveGauge host_gauge;
+  host_gauge.add(4);
+  Stats::PrimitiveGaugeSnapshot host_gauge_snap(host_gauge);
+  host_gauge_snap.setName("test_host_gauge");
+  snapshot.host_gauges_.push_back(host_gauge_snap);
+
   sink.flush(snapshot);
-  Network::UdpRecvData data;
-  server.recv(data);
-  EXPECT_EQ("envoy.test_counter:1|c", data.buffer_->toString());
-  Network::UdpRecvData data2;
-  server.recv(data2);
-  EXPECT_EQ("envoy.test_gauge:1|g", data2.buffer_->toString());
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_counter:1|c", data.buffer_->toString());
+  }
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_host_counter:3|c", data.buffer_->toString());
+  }
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_gauge:1|g", data.buffer_->toString());
+  }
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_host_gauge:4|g", data.buffer_->toString());
+  }
 
   NiceMock<Stats::MockHistogram> timer;
   timer.name_ = "test_timer";
@@ -142,13 +169,41 @@ TEST_P(UdpStatsdSinkWithTagsTest, InitWithIpAddress) {
   gauge.setTags(tags);
   snapshot.gauges_.push_back(gauge);
 
+  Stats::PrimitiveCounter host_counter;
+  host_counter.add(3);
+  Stats::PrimitiveCounterSnapshot host_counter_snap(host_counter);
+  host_counter_snap.setTagExtractedName("test_host_counter");
+  host_counter_snap.setTags(tags);
+  snapshot.host_counters_.push_back(host_counter_snap);
+
+  Stats::PrimitiveGauge host_gauge;
+  host_gauge.add(4);
+  Stats::PrimitiveGaugeSnapshot host_gauge_snap(host_gauge);
+  host_gauge_snap.setTagExtractedName("test_host_gauge");
+  host_gauge_snap.setTags(tags);
+  snapshot.host_gauges_.push_back(host_gauge_snap);
+
   sink.flush(snapshot);
-  Network::UdpRecvData data;
-  server.recv(data);
-  EXPECT_EQ("envoy.test_counter:1|c|#node:test", data.buffer_->toString());
-  Network::UdpRecvData data2;
-  server.recv(data2);
-  EXPECT_EQ("envoy.test_gauge:1|g|#node:test", data2.buffer_->toString());
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_counter:1|c|#node:test", data.buffer_->toString());
+  }
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_host_counter:3|c|#node:test", data.buffer_->toString());
+  }
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_gauge:1|g|#node:test", data.buffer_->toString());
+  }
+  {
+    Network::UdpRecvData data;
+    server.recv(data);
+    EXPECT_EQ("envoy.test_host_gauge:4|g|#node:test", data.buffer_->toString());
+  }
 
   NiceMock<Stats::MockHistogram> timer;
   timer.name_ = "test_timer";
@@ -326,7 +381,8 @@ TEST(UdpStatsdSinkTest, SiSuffix) {
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   NiceMock<ThreadLocal::MockInstance> tls_;
-  UdpStatsdSink sink(tls_, writer_ptr, false);
+  UdpStatsdSink sink(tls_, writer_ptr, false, getDefaultPrefix(), std::nullopt,
+                     getDefaultTagFormat(), /*scale_histogram_units=*/true);
 
   NiceMock<Stats::MockHistogram> items;
   items.name_ = "items";
@@ -335,6 +391,10 @@ TEST(UdpStatsdSinkTest, SiSuffix) {
   EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
               write("envoy.items:1|ms"));
   sink.onHistogramComplete(items, 1);
+  // Unscaled samples keep their integer representation however large they are.
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.items:1234567|ms"));
+  sink.onHistogramComplete(items, 1234567);
 
   NiceMock<Stats::MockHistogram> information;
   information.name_ = "information";
@@ -343,14 +403,37 @@ TEST(UdpStatsdSinkTest, SiSuffix) {
   EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
               write("envoy.information:2|ms"));
   sink.onHistogramComplete(information, 2);
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.information:2097152|ms"));
+  sink.onHistogramComplete(information, 2097152);
 
   NiceMock<Stats::MockHistogram> duration_micro;
   duration_micro.name_ = "duration";
   duration_micro.unit_ = Stats::Histogram::Unit::Microseconds;
 
+  // Microseconds are scaled to milliseconds.
   EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
-              write("envoy.duration:3|ms"));
+              write("envoy.duration:0.003|ms"));
   sink.onHistogramComplete(duration_micro, 3);
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:1.5|ms"));
+  sink.onHistogramComplete(duration_micro, 1500);
+  // Large scaled samples keep full precision and never use scientific notation.
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:1234567.891|ms"));
+  sink.onHistogramComplete(duration_micro, 1234567891);
+
+  NiceMock<Stats::MockHistogram> duration_nano;
+  duration_nano.name_ = "duration";
+  duration_nano.unit_ = Stats::Histogram::Unit::Nanoseconds;
+
+  // Nanoseconds are scaled to milliseconds without losing the sub-microsecond part.
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:0.0407|ms"));
+  sink.onHistogramComplete(duration_nano, 40700);
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:3.943277|ms"));
+  sink.onHistogramComplete(duration_nano, 3943277);
 
   NiceMock<Stats::MockHistogram> duration_milli;
   duration_milli.name_ = "duration";
@@ -359,6 +442,31 @@ TEST(UdpStatsdSinkTest, SiSuffix) {
   EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
               write("envoy.duration:4|ms"));
   sink.onHistogramComplete(duration_milli, 4);
+
+  tls_.shutdownThread();
+}
+
+// Unit scaling is off by default: every sample is reported unscaled with an ms suffix.
+TEST(UdpStatsdSinkTest, HistogramUnitScalingOffByDefault) {
+  auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
+  NiceMock<ThreadLocal::MockInstance> tls_;
+  UdpStatsdSink sink(tls_, writer_ptr, false);
+
+  NiceMock<Stats::MockHistogram> duration_micro;
+  duration_micro.name_ = "duration";
+  duration_micro.unit_ = Stats::Histogram::Unit::Microseconds;
+
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:1500|ms"));
+  sink.onHistogramComplete(duration_micro, 1500);
+
+  NiceMock<Stats::MockHistogram> duration_nano;
+  duration_nano.name_ = "duration";
+  duration_nano.unit_ = Stats::Histogram::Unit::Nanoseconds;
+
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:40700|ms"));
+  sink.onHistogramComplete(duration_nano, 40700);
 
   tls_.shutdownThread();
 }
@@ -427,7 +535,8 @@ TEST(UdpStatsdSinkWithTagsTest, SiSuffix) {
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   NiceMock<ThreadLocal::MockInstance> tls_;
-  UdpStatsdSink sink(tls_, writer_ptr, true);
+  UdpStatsdSink sink(tls_, writer_ptr, true, getDefaultPrefix(), std::nullopt,
+                     getDefaultTagFormat(), /*scale_histogram_units=*/true);
 
   std::vector<Stats::Tag> tags = {Stats::Tag{"key1", "value1"}, Stats::Tag{"key2", "value2"}};
 
@@ -455,8 +564,17 @@ TEST(UdpStatsdSinkWithTagsTest, SiSuffix) {
   duration_micro.setTags(tags);
 
   EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
-              write("envoy.duration:3|ms|#key1:value1,key2:value2"));
+              write("envoy.duration:0.003|ms|#key1:value1,key2:value2"));
   sink.onHistogramComplete(duration_micro, 3);
+
+  NiceMock<Stats::MockHistogram> duration_nano;
+  duration_nano.name_ = "duration";
+  duration_nano.unit_ = Stats::Histogram::Unit::Nanoseconds;
+  duration_nano.setTags(tags);
+
+  EXPECT_CALL(*std::dynamic_pointer_cast<NiceMock<MockWriter>>(writer_ptr),
+              write("envoy.duration:0.0407|ms|#key1:value1,key2:value2"));
+  sink.onHistogramComplete(duration_nano, 40700);
 
   NiceMock<Stats::MockHistogram> duration_milli;
   duration_milli.name_ = "duration";

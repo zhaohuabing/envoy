@@ -1,29 +1,17 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
-#include <string>
-#include <vector>
-
-#include "envoy/config/core/v3/base.pb.h"
 
 #include "source/common/network/address_impl.h"
 #include "source/common/network/socket_option_factory.h"
-#include "source/common/network/socket_option_impl.h"
 #include "source/common/network/udp_listener_impl.h"
-#include "source/common/network/udp_packet_writer_handler_impl.h"
-#include "source/common/network/utility.h"
 
 #include "test/common/network/listener_impl_test_base.h"
-#include "test/mocks/api/mocks.h"
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/server/mocks.h"
-#include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
-#include "test/test_common/threadsafe_singleton_injector.h"
-#include "test/test_common/utility.h"
 
-#include "absl/time/time.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -31,13 +19,24 @@ namespace Envoy {
 namespace Network {
 
 class UdpListenerImplTestBase : public ListenerImplTestBase {
-public:
-  UdpListenerImplTestBase()
-      : server_socket_(createServerSocket(true)), send_to_addr_(getServerLoopbackAddress()) {
+protected:
+  MockIoHandle&
+  useHotRestartSocket(OptRef<ParentDrainedCallbackRegistrar> parent_drained_callback_registrar) {
+    auto io_handle = std::make_unique<testing::NiceMock<MockIoHandle>>();
+    MockIoHandle& ret = *io_handle;
+    server_socket_ = createServerSocketFromExistingHandle(std::move(io_handle),
+                                                          parent_drained_callback_registrar);
+    return ret;
+  }
+
+  void setup() {
+    if (server_socket_ == nullptr) {
+      server_socket_ = createServerSocket(true);
+    }
+    send_to_addr_ = Address::InstanceConstSharedPtr(getServerLoopbackAddress());
     time_system_.advanceTimeWait(std::chrono::milliseconds(100));
   }
 
-protected:
   Address::Instance* getServerLoopbackAddress() {
     if (version_ == Address::IpVersion::v4) {
       return new Address::Ipv4Instance(
@@ -58,6 +57,14 @@ protected:
                                              nullptr,
 #endif
                                              bind);
+  }
+
+  SocketSharedPtr createServerSocketFromExistingHandle(
+      IoHandlePtr&& io_handle,
+      OptRef<ParentDrainedCallbackRegistrar> parent_drained_callback_registrar) {
+    return std::make_shared<UdpListenSocket>(
+        std::move(io_handle), Network::Test::getCanonicalLoopbackAddress(version_),
+        SocketOptionFactory::buildIpFreebindOptions(), parent_drained_callback_registrar);
   }
 
   Address::InstanceConstSharedPtr getNonDefaultSourceAddress() {

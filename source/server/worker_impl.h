@@ -33,6 +33,7 @@ public:
 
   // Server::WorkerFactory
   WorkerPtr createWorker(uint32_t index, OverloadManager& overload_manager,
+                         OverloadManager& null_overload_manager,
                          const std::string& worker_name) override;
 
 private:
@@ -52,24 +53,34 @@ public:
              Api::Api& api, WorkerStatNames& stat_names);
 
   // Server::Worker
-  void addListener(absl::optional<uint64_t> overridden_listener, Network::ListenerConfig& listener,
-                   AddListenerCompletion completion) override;
+  void addListener(std::optional<uint64_t> overridden_listener, Network::ListenerConfig& listener,
+                   AddListenerCompletion completion, Runtime::Loader& loader,
+                   Random::RandomGenerator& random) override;
   uint64_t numConnections() const override;
 
   void removeListener(Network::ListenerConfig& listener, std::function<void()> completion) override;
   void removeFilterChains(uint64_t listener_tag,
                           const std::list<const Network::FilterChain*>& filter_chains,
                           std::function<void()> completion) override;
-  void start(GuardDog& guard_dog, const Event::PostCb& cb) override;
+  void start(OptRef<GuardDog> guard_dog, const std::function<void()>& cb,
+             std::optional<uint32_t> cpu_id) override;
   void initializeStats(Stats::Scope& scope) override;
   void stop() override;
-  void stopListener(Network::ListenerConfig& listener, std::function<void()> completion) override;
+  void stopListener(Network::ListenerConfig& listener,
+                    const Network::ExtraShutdownListenerOptions& options,
+                    std::function<void()> completion) override;
+  void onFilterChainDrain(uint64_t listener_tag,
+                          const std::list<const Network::FilterChain*>& filter_chains,
+                          Network::ConnectionDrainEvent drain_event) override;
+  void onListenerDrain(uint64_t listener_tag, Network::ConnectionDrainEvent drain_event) override;
 
 private:
-  void threadRoutine(GuardDog& guard_dog, const Event::PostCb& cb);
+  void threadRoutine(OptRef<GuardDog> guard_dog, const std::function<void()>& cb);
   void stopAcceptingConnectionsCb(OverloadActionState state);
   void rejectIncomingConnectionsCb(OverloadActionState state);
   void resetStreamsUsingExcessiveMemory(OverloadActionState state);
+  void closeIdleHttpConnectionsCb(OverloadActionState::Phase phase);
+  void maybeCloseIdleHttpConnections();
 
   ThreadLocal::Instance& tls_;
   ListenerHooks& hooks_;
@@ -79,6 +90,9 @@ private:
   Stats::Counter& reset_streams_counter_;
   Thread::ThreadPtr thread_;
   WatchDogSharedPtr watch_dog_;
+  Event::TimerPtr close_idle_connection_timer_;
+  OverloadActionState::Phase close_idle_http_connections_state_ =
+      OverloadActionState::Phase::Inactive;
 };
 
 } // namespace Server

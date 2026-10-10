@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
+
+#include "absl/types/span.h"
 
 namespace Envoy {
 /**
@@ -16,16 +19,10 @@ public:
    * @return the hex encoded string representing data
    */
   static std::string encode(const std::vector<uint8_t>& data) {
-    return encode(data.data(), data.size());
+    return encode(absl::Span<const uint8_t>(data));
   }
 
-  /**
-   * Generates a hex dump of the given data
-   * @param data the binary data to convert
-   * @param length the length of the data
-   * @return the hex encoded string representing data
-   */
-  static std::string encode(const uint8_t* data, size_t length);
+  static std::string encode(absl::Span<const uint8_t> data);
 
   /**
    * Converts a hex dump to binary data

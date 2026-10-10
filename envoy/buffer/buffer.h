@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "envoy/api/os_sys_calls.h"
@@ -16,8 +17,8 @@
 #include "source/common/common/utility.h"
 
 #include "absl/container/inlined_vector.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 #include "absl/types/span.h"
 
 namespace Envoy {
@@ -28,6 +29,17 @@ namespace Buffer {
  */
 struct RawSlice {
   void* mem_ = nullptr;
+  size_t len_ = 0;
+
+  bool operator==(const RawSlice& rhs) const { return mem_ == rhs.mem_ && len_ == rhs.len_; }
+  bool operator!=(const RawSlice& rhs) const { return !(*this == rhs); }
+};
+
+/**
+ * A const raw memory data slice including the location and length.
+ */
+struct ConstRawSlice {
+  const void* mem_ = nullptr;
   size_t len_ = 0;
 
   bool operator==(const RawSlice& rhs) const { return mem_ == rhs.mem_ && len_ == rhs.len_; }
@@ -67,9 +79,17 @@ public:
   virtual ~SliceData() = default;
 
   /**
+   * Must only be called if the slice is mutable, e.g. it does not wrap an externally
+   * owned buffer fragment. Slices obtained via extractMutableFrontSlice() are always
+   * mutable, slices obtained via extractImmutableFrontSlice() may not be.
    * @return a mutable view of the slice data.
    */
   virtual absl::Span<uint8_t> getMutableData() PURE;
+
+  /**
+   * @return an immutable view of the slice data. May be called on any slice.
+   */
+  virtual absl::Span<const uint8_t> getImmutableData() const PURE;
 };
 
 using SliceDataPtr = std::unique_ptr<SliceData>;
@@ -202,6 +222,16 @@ public:
   virtual void copyOut(size_t start, uint64_t size, void* data) const PURE;
 
   /**
+   * Copy out a section of the buffer to  dynamic array of slices.
+   * @param size supplies the size of the data that will be copied.
+   * @param slices supplies the output slices to fill.
+   * @param num_slice supplies the number of slices to fill.
+   * @return the number of bytes copied.
+   */
+  virtual uint64_t copyOutToSlices(uint64_t size, Buffer::RawSlice* slices,
+                                   uint64_t num_slice) const PURE;
+
+  /**
    * Drain data from the buffer.
    * @param size supplies the length of data to drain.
    */
@@ -212,8 +242,7 @@ public:
    * @param max_slices supplies an optional limit on the number of slices to fetch, for performance.
    * @return RawSliceVector with non-empty slices in the buffer.
    */
-  virtual RawSliceVector
-  getRawSlices(absl::optional<uint64_t> max_slices = absl::nullopt) const PURE;
+  virtual RawSliceVector getRawSlices(std::optional<uint64_t> max_slices = std::nullopt) const PURE;
 
   /**
    * Fetch the valid data pointer and valid data length of the first non-zero-length
@@ -228,14 +257,33 @@ public:
    * buffer is not empty otherwise the implementation will have undefined behavior.
    * If the underlying slice is immutable then the implementation must create and return
    * a mutable slice that has a copy of the immutable data.
+   * The slice's drain trackers are called and its account charges credited as part of
+   * the extraction.
    * @return pointer to SliceData object that wraps the front slice
    */
   virtual SliceDataPtr extractMutableFrontSlice() PURE;
 
   /**
+   * Transfer ownership of the front slice to the caller. Must only be called if the
+   * buffer is not empty otherwise the implementation will have undefined behavior.
+   * The slice is transferred as is without copying, so it may be immutable (wrap an externally
+   * owned buffer fragment) and must be read via ``SliceData::getImmutableData()``. Use
+   * ``extractMutableFrontSlice()`` if mutable access is required. The slice keeps its drain
+   * trackers and account charges attached, they are called and credited once the slice is
+   * destroyed.
+   * @return pointer to SliceData object that wraps the front slice
+   */
+  virtual SliceDataPtr extractImmutableFrontSlice() PURE;
+
+  /**
    * @return uint64_t the total length of the buffer (not necessarily contiguous in memory).
    */
   virtual uint64_t length() const PURE;
+
+  /**
+   * @return uint64_t the total number of slices in the buffer.
+   */
+  virtual uint64_t sliceCount() const PURE;
 
   /**
    * @return a pointer to the first byte of data that has been linearized out to size bytes.
@@ -254,6 +302,18 @@ public:
    * @param length supplies the amount of data to move.
    */
   virtual void move(Instance& rhs, uint64_t length) PURE;
+
+  /**
+   * Move a portion of a buffer into this buffer. If reset_drain_trackers_and_accounting is true,
+   * then any drain trackers on the source buffer are also called and cleared so that the
+   * connection originating the source buffer (e.g. an internal listener connection) may be deleted
+   * without causing a use-after-free.
+   * @param rhs supplies the buffer to move.
+   * @param length supplies the amount of data to move.
+   * @param reset_drain_trackers_and_accounting whether the drain trackers on the source buffers
+   * should be cleared, so that the source buffer is deletable.
+   */
+  virtual void move(Instance& rhs, uint64_t length, bool reset_drain_trackers_and_accounting) PURE;
 
   /**
    * Reserve space in the buffer for reading into. The amount of space reserved is determined
@@ -459,17 +519,27 @@ public:
   }
 
   /**
+   * Copy multiple string type fragments to the buffer.
+   * @param fragments A sequence of string views with variable length.
+   * @return The total size of the data copied to the buffer.
+   */
+  virtual size_t addFragments(absl::Span<const absl::string_view> fragments) PURE;
+
+  /**
    * Set the buffer's high watermark. The buffer's low watermark is implicitly set to half the high
    * watermark. Setting the high watermark to 0 disables watermark functionality.
    * @param watermark supplies the buffer high watermark size threshold, in bytes.
+   * @param watermark supplies the overflow multiplier, in bytes.
+   *        If set to non-zero, overflow callbacks will be called if the
+   *        buffered data exceeds watermark * overflow_multiplier.
    */
-  virtual void setWatermarks(uint32_t watermark) PURE;
+  virtual void setWatermarks(uint64_t watermark, uint32_t overflow_multiplier = 0) PURE;
 
   /**
    * Returns the configured high watermark. A return value of 0 indicates that watermark
    * functionality is disabled.
    */
-  virtual uint32_t highWatermark() const PURE;
+  virtual uint64_t highWatermark() const PURE;
   /**
    * Determine if the buffer watermark trigger condition is currently set. The watermark trigger is
    * set when the buffer size exceeds the configured high watermark and is cleared once the buffer
@@ -509,9 +579,9 @@ public:
    *   high watermark.
    * @return a newly created InstancePtr.
    */
-  virtual InstancePtr createBuffer(std::function<void()> below_low_watermark,
-                                   std::function<void()> above_high_watermark,
-                                   std::function<void()> above_overflow_watermark) PURE;
+  virtual InstancePtr createBuffer(absl::AnyInvocable<void()> below_low_watermark,
+                                   absl::AnyInvocable<void()> above_high_watermark,
+                                   absl::AnyInvocable<void()> above_overflow_watermark) PURE;
 
   /**
    * Create and returns a buffer memory account.
@@ -604,7 +674,7 @@ public:
   // The following are for use only by implementations of Buffer. Because c++
   // doesn't allow inheritance of friendship, these are just trying to make
   // misuse easy to spot in a code review.
-  static Reservation bufferImplUseOnlyConstruct(Instance& buffer) { return Reservation(buffer); }
+  static Reservation bufferImplUseOnlyConstruct(Instance& buffer) { return {buffer}; }
   decltype(slices_)& bufferImplUseOnlySlices() { return slices_; }
   ReservationSlicesOwnerPtr& bufferImplUseOnlySlicesOwner() { return slices_owner_; }
   void bufferImplUseOnlySetLength(uint64_t length) { length_ = length; }
@@ -665,9 +735,7 @@ public:
   // The following are for use only by implementations of Buffer. Because c++
   // doesn't allow inheritance of friendship, these are just trying to make
   // misuse easy to spot in a code review.
-  static ReservationSingleSlice bufferImplUseOnlyConstruct(Instance& buffer) {
-    return ReservationSingleSlice(buffer);
-  }
+  static ReservationSingleSlice bufferImplUseOnlyConstruct(Instance& buffer) { return {buffer}; }
   RawSlice& bufferImplUseOnlySlice() { return slice_; }
   ReservationSlicesOwnerPtr& bufferImplUseOnlySliceOwner() { return slice_owner_; }
 };

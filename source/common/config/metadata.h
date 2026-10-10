@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include "envoy/common/exception.h"
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/typed_metadata.h"
 #include "envoy/event/dispatcher.h"
@@ -10,23 +11,38 @@
 #include "envoy/singleton/manager.h"
 #include "envoy/type/metadata/v3/metadata.pb.h"
 
+#include "source/common/common/thread.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/shared_pool/shared_pool.h"
 
 #include "absl/container/node_hash_map.h"
+#include "absl/status/statusor.h"
 
 namespace Envoy {
 namespace Config {
 
-using ConstMetadataSharedPoolSharedPtr = std::shared_ptr<
-    SharedPool::ObjectSharedPool<const envoy::config::core::v3::Metadata, MessageUtil>>;
+using ConstMetadataSharedPoolSharedPtr =
+    std::shared_ptr<SharedPool::ObjectSharedPool<const envoy::config::core::v3::Metadata,
+                                                 MessageUtil, MessageUtil>>;
+
+/**
+ * PathSegment represents one segment in a metadata access path.
+ * Can be either a struct field key or a list element index. A non-empty
+ * `key_` means this segment accesses a struct field; otherwise `index_`
+ * is used to access a list element (a key segment can never be empty, per
+ * the MetadataKey.PathSegment proto's validation rules).
+ */
+struct PathSegment {
+  std::string key_;
+  uint32_t index_ = 0;
+};
 
 /**
  * MetadataKey presents the key name and path to retrieve value from metadata.
  */
 struct MetadataKey {
   std::string key_;
-  std::vector<std::string> path_;
+  std::vector<PathSegment> path_;
 
   MetadataKey(const envoy::type::metadata::v3::MetadataKey& metadata_key);
 };
@@ -37,46 +53,64 @@ struct MetadataKey {
 class Metadata {
 public:
   /**
+   * Lookup value by a multi-key path in a Struct. If path is empty will return the entire struct.
+   * @param struct_value reference.
+   * @param path multi-key path.
+   * @return const Protobuf::Value& value if found, empty if not found.
+   */
+  static const Protobuf::Value& structValue(const Protobuf::Struct& struct_value,
+                                            const std::vector<std::string>& path);
+
+  /**
+   * Lookup value by a path of keys and indices in a Struct. Supports traversing both
+   * struct fields (via key segments) and list elements (via index segments).
+   * @param struct_value reference.
+   * @param path path with key and/or index segments.
+   * @return const Protobuf::Value& value if found, empty if not found.
+   */
+  static const Protobuf::Value& structValue(const Protobuf::Struct& struct_value,
+                                            const std::vector<PathSegment>& path);
+
+  /**
    * Lookup value of a key for a given filter in Metadata.
    * @param metadata reference.
    * @param filter name.
    * @param key for filter metadata.
-   * @return const ProtobufWkt::Value& value if found, empty if not found.
+   * @return const Protobuf::Value& value if found, empty if not found.
    */
-  static const ProtobufWkt::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
-                                                 const std::string& filter, const std::string& key);
+  static const Protobuf::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
+                                              const std::string& filter, const std::string& key);
   /**
    * Lookup value by a multi-key path for a given filter in Metadata. If path is empty
    * will return the empty struct.
    * @param metadata reference.
    * @param filter name.
    * @param path multi-key path.
-   * @return const ProtobufWkt::Value& value if found, empty if not found.
+   * @return const Protobuf::Value& value if found, empty if not found.
    */
-  static const ProtobufWkt::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
-                                                 const std::string& filter,
-                                                 const std::vector<std::string>& path);
+  static const Protobuf::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
+                                              const std::string& filter,
+                                              const std::vector<std::string>& path);
   /**
    * Lookup the value by a metadata key from a Metadata.
    * @param metadata reference.
    * @param metadata_key with key name and path to retrieve the value.
-   * @return const ProtobufWkt::Value& value if found, empty if not found.
+   * @return const Protobuf::Value& value if found, empty if not found.
    */
-  static const ProtobufWkt::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
-                                                 const MetadataKey& metadata_key);
+  static const Protobuf::Value& metadataValue(const envoy::config::core::v3::Metadata* metadata,
+                                              const MetadataKey& metadata_key);
 
   /**
    * Obtain mutable reference to metadata value for a given filter and key.
    * @param metadata reference.
    * @param filter name.
    * @param key for filter metadata.
-   * @return ProtobufWkt::Value&. A Value message is created if not found.
+   * @return Protobuf::Value&. A Value message is created if not found.
    */
-  static ProtobufWkt::Value& mutableMetadataValue(envoy::config::core::v3::Metadata& metadata,
-                                                  const std::string& filter,
-                                                  const std::string& key);
+  static Protobuf::Value& mutableMetadataValue(envoy::config::core::v3::Metadata& metadata,
+                                               const std::string& filter, const std::string& key);
 
-  using LabelSet = std::vector<std::pair<std::string, ProtobufWkt::Value>>;
+  using LabelSet = std::vector<std::pair<std::string, Protobuf::Value>>;
 
   /**
    * Returns whether a set of the labels match a particular host's metadata.
@@ -139,6 +173,35 @@ protected:
 
   absl::node_hash_map<std::string, std::unique_ptr<const TypedMetadata::Object>> data_;
 };
+
+// MetadataPack is struct that contains both the proto and typed metadata.
+template <class FactoryClass> struct MetadataPack {
+  MetadataPack(const envoy::config::core::v3::Metadata& metadata)
+      : proto_metadata_(metadata), typed_metadata_(proto_metadata_) {}
+  MetadataPack(envoy::config::core::v3::Metadata&& metadata)
+      : proto_metadata_(std::move(metadata)), typed_metadata_(proto_metadata_) {}
+  MetadataPack() : proto_metadata_(), typed_metadata_(proto_metadata_) {}
+
+  // Builds a pack, running the registered typed metadata factories, and returns an error instead of
+  // throwing when a factory rejects the metadata. This lets a caller on the request path turn a
+  // rejected namespace into a failure and build a pack once, before it is handed to a consumer that
+  // must not throw. The metadata is moved in, so no copy is made.
+  static absl::StatusOr<std::unique_ptr<MetadataPack<FactoryClass>>>
+  create(envoy::config::core::v3::Metadata&& metadata) {
+    TRY_NEEDS_AUDIT { return std::make_unique<MetadataPack<FactoryClass>>(std::move(metadata)); }
+    END_TRY
+    MULTI_CATCH(
+        const EnvoyException& e, { return absl::InvalidArgumentError(e.what()); },
+        { return absl::InvalidArgumentError("rejected by a typed metadata factory"); });
+  }
+
+  const envoy::config::core::v3::Metadata proto_metadata_;
+  const TypedMetadataImpl<FactoryClass> typed_metadata_;
+};
+
+template <class FactoryClass> using MetadataPackPtr = std::unique_ptr<MetadataPack<FactoryClass>>;
+template <class FactoryClass>
+using MetadataPackSharedPtr = std::shared_ptr<MetadataPack<FactoryClass>>;
 
 } // namespace Config
 } // namespace Envoy

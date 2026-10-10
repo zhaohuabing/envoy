@@ -1,14 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load(
+    "@rules_fuzzing//fuzzing:cc_defs.bzl",
+    "cc_fuzzing_engine",
+)
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_test",
     "envoy_cc_test_library",
     "envoy_package",
     "envoy_proto_library",
+    "envoy_select_signal_trace",
 )
-load(
-    "@rules_fuzzing//fuzzing:cc_defs.bzl",
-    "cc_fuzzing_engine",
-)
+load("//bazel:toolchains.bzl", "LLVM_MAJOR")
 
 licenses(["notice"])  # Apache 2
 
@@ -22,23 +25,27 @@ envoy_proto_library(
 
 exports_files(["headers.dict"])
 
+cc_library(
+    name = "fuzzed_data_provider",
+    hdrs = ["@llvm_toolchain_llvm//:lib/clang/" + LLVM_MAJOR + "/include/fuzzer/FuzzedDataProvider.h"],
+    include_prefix = "",
+    strip_include_prefix = "/lib/clang/" + LLVM_MAJOR + "/include",
+    visibility = ["//visibility:public"],
+)
+
 envoy_cc_test_library(
     name = "main",
     srcs = ["main.cc"],
-    external_deps = [
-        "abseil_symbolize",
-    ],
     deps = [
         ":fuzz_runner_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/stats:isolated_store_lib",
+        "//test:test_listener_lib",
         "//test/test_common:environment_lib",
         "//test/test_common:utility_lib",
-    ] + select({
-        "//bazel:disable_signal_trace": [],
-        "//conditions:default": ["//source/common/signal:sigaction_lib"],
-    }),
+        "@abseil-cpp//absl/synchronization",
+    ] + envoy_select_signal_trace(["//source/common/signal:sigaction_lib"]),
 )
 
 envoy_cc_test_library(
@@ -46,6 +53,8 @@ envoy_cc_test_library(
     srcs = ["fuzz_runner.cc"],
     hdrs = ["fuzz_runner.h"],
     deps = [
+        ":fuzzed_data_provider",
+        "//bazel/deps:libprotobuf-mutator",
         "//source/common/common:minimal_logger_lib",
         "//source/common/common:thread_lib",
         "//source/common/common:utility_lib",
@@ -53,24 +62,55 @@ envoy_cc_test_library(
         "//source/common/http/http2:codec_lib",
         "//source/exe:process_wide_lib",
         "//test/test_common:environment_lib",
-        "@com_github_google_libprotobuf_mutator//:libprotobuf_mutator",
-        "@org_llvm_releases_compiler_rt//:fuzzed_data_provider",
     ],
 )
 
 envoy_cc_test_library(
     name = "utility_lib",
+    srcs = ["utility.cc"],
     hdrs = ["utility.h"],
+    rbe_pool = "linux_x64_small",
     deps = [
         ":common_proto_cc_proto",
         "//source/common/common:empty_string",
         "//source/common/network:resolver_lib",
         "//source/common/network:utility_lib",
+        "//source/common/protobuf:utility_lib_header",
         "//test/common/stream_info:test_util",
         "//test/mocks/ssl:ssl_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+        "@quiche//:http2_adapter",
+    ],
+)
+
+envoy_cc_test_library(
+    name = "mutable_visitor_lib",
+    srcs = ["mutable_visitor.cc"],
+    hdrs = ["mutable_visitor.h"],
+    deps = [
+        "//source/common/protobuf",
+        "//source/common/protobuf:message_validator_lib",
+        "//source/common/protobuf:utility_lib_header",
+        "//source/common/protobuf:visitor_lib",
+        "@abseil-cpp//absl/cleanup",
+        "@xds//udpa/type/v1:pkg_cc_proto",
+        "@xds//xds/type/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test_library(
+    name = "validated_input_generator_lib",
+    srcs = ["validated_input_generator.cc"],
+    hdrs = ["validated_input_generator.h"],
+    deps = [
+        "//bazel/deps:libprotobuf-mutator",
+        "//test/fuzz:mutable_visitor_lib",
+        "//test/fuzz:random_lib",
+        "@protoc-gen-validate//validate:cc_validate",
+        "@xds//udpa/type/v1:pkg_cc_proto",
+        "@xds//xds/type/v3:pkg_cc_proto",
     ],
 )
 
@@ -87,6 +127,7 @@ envoy_cc_test_library(
 envoy_cc_test(
     name = "random_test",
     srcs = ["random_test.cc"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//test/fuzz:random_lib",
     ],

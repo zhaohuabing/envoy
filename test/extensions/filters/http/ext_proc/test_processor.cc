@@ -1,3 +1,6 @@
+// Changing the default behavior of ext_proc is generally not allowed. While you may add tests, you
+// generally should not change or remove existing tests.
+
 #include "test/extensions/filters/http/ext_proc/test_processor.h"
 
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
@@ -20,17 +23,11 @@ grpc::Status ProcessorWrapper::Process(
     (*context_callback_)(ctx);
   }
   callback_(stream);
-  if (testing::Test::HasFatalFailure()) {
-    // This is not strictly necessary, but it may help in troubleshooting to
-    // ensure that we return a bad gRPC status if an "ASSERT" failed in the
-    // processor.
-    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Fatal test error");
-  }
   return grpc::Status::OK;
 }
 
 void TestProcessor::start(const Network::Address::IpVersion ip_version, ProcessingFunc cb,
-                          absl::optional<ContextProcessingFunc> context_cb) {
+                          std::optional<ContextProcessingFunc> context_cb) {
   wrapper_ = std::make_unique<ProcessorWrapper>(cb, context_cb);
   grpc::ServerBuilder builder;
   builder.RegisterService(wrapper_.get());

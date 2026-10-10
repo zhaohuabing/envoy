@@ -1,6 +1,8 @@
 #pragma once
 
-#include <functional>
+#include <algorithm>
+#include <iostream>
+#include <ostream>
 
 #include "source/common/common/logger.h"
 #include "source/common/version/version.h"
@@ -11,7 +13,7 @@
 namespace Envoy {
 #define BACKTRACE_LOG()                                                                            \
   do {                                                                                             \
-    BackwardsTrace t;                                                                              \
+    ::Envoy::BackwardsTrace t;                                                                     \
     t.capture();                                                                                   \
     t.logTrace();                                                                                  \
   } while (0)
@@ -39,6 +41,38 @@ public:
   BackwardsTrace() = default;
 
   /**
+   * Construct a trace directly from raw frame pointers that were captured
+   * elsewhere. The number of frames copied is clamped to MaxStackDepth.
+   *
+   * @param frames Pointer to an array of captured frame addresses.
+   * @param depth Number of valid entries in @p frames.
+   */
+  BackwardsTrace(void* const* frames, int depth) {
+    stack_depth_ = std::min(depth, MaxStackDepth);
+    std::copy(frames, frames + stack_depth_, stack_trace_);
+  }
+
+  /**
+   * Attempts to get the memory offsets of the current process, so the
+   * stack trace addresses can be mapped to line numbers even after the
+   * process is not running.
+   *
+   * This acts as a global singleton since it will be the same values for
+   * the duration of an execution - as such, it should be called once
+   * during startup, to avoid performing the lookup during the
+   * crash process.
+   *
+   * @return a string representing the memory offset from `ASLR` of the
+   * current process, or an empty string if the information is not
+   * available.
+   * The format of this line is
+   *   `[start_addr]-[end_addr] [path_to_binary]`
+   * e.g.
+   *   `7d34c0e28000-7d34c1e0d000 /build/foo/bar/source/exe/envoy-static`
+   */
+  static absl::string_view addrMapping(bool setup = false);
+
+  /**
    * Directs the output of logTrace() to directly stderr rather than the
    * logging infrastructure.
    *
@@ -53,6 +87,20 @@ public:
    * @return whether the system directing backtraces directly to stderr.
    */
   static bool logToStderr() { return log_to_stderr_; }
+
+  /**
+   * Directs all stack trace output to be formatted as a single log line
+   * rather than one line per frame. This makes stack traces easier to
+   * consume in log aggregation systems.
+   *
+   * @param single_line Whether to log the entire stack trace on a single line.
+   */
+  static void setSingleLine(bool single_line);
+
+  /**
+   * @return whether stack traces are formatted as a single line.
+   */
+  static bool singleLine() { return single_line_; }
 
   /**
    * Capture a stack trace.
@@ -88,8 +136,29 @@ public:
       return;
     }
 
+    if (single_line_) {
+      std::string buf = fmt::format(
+          "Backtrace (use tools/stack_decode.py to get line numbers):\nEnvoy version: {}",
+          VersionInfo::version());
+      if (!addrMapping().empty()) {
+        fmt::format_to(std::back_inserter(buf), "\nAddress mapping: {}", addrMapping());
+      }
+      visitTrace([&buf](int index, const char* symbol, void* address) {
+        if (symbol != nullptr) {
+          fmt::format_to(std::back_inserter(buf), "\n#{}: {} [{}]", index, symbol, address);
+        } else {
+          fmt::format_to(std::back_inserter(buf), "\n#{}: [{}]", index, address);
+        }
+      });
+      ENVOY_LOG(critical, "{}", buf);
+      return;
+    }
+
     ENVOY_LOG(critical, "Backtrace (use tools/stack_decode.py to get line numbers):");
     ENVOY_LOG(critical, "Envoy version: {}", VersionInfo::version());
+    if (!addrMapping().empty()) {
+      ENVOY_LOG(critical, "Address mapping: {}", addrMapping());
+    }
 
     visitTrace([](int index, const char* symbol, void* address) {
       if (symbol != nullptr) {
@@ -116,6 +185,7 @@ public:
 
 private:
   static bool log_to_stderr_;
+  static bool single_line_;
 
   /**
    * Visit the previously captured stack trace.
@@ -126,7 +196,7 @@ private:
    * symbolization failed.
    * 3. (void*) The address of the current frame.
    */
-  void visitTrace(const std::function<void(int, const char*, void*)>& visitor) {
+  template <typename F> void visitTrace(F visitor) {
     for (int i = 0; i < stack_depth_; ++i) {
       char out[1024];
       const bool success = absl::Symbolize(stack_trace_[i], out, sizeof(out));

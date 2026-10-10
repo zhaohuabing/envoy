@@ -8,7 +8,7 @@ page](https://github.com/google/oss-fuzz/blob/master/docs/ideal_integration.md).
 
 Tests should be unit test-like, fast and not require writable access to the filesystem (beyond
 temporary files), network (including loopback) or multiple processes. See the [ClusterFuzz
-environment](https://github.com/google/oss-fuzz/blob/master/docs/fuzzer_environment.md) for further
+environment](https://github.com/google/oss-fuzz/blob/master/docs/further-reading/fuzzer_environment.md) for further
 details.
 
 ## Corpus
@@ -95,8 +95,10 @@ your local machine vs. the fuzz cluster). The binary takes the location of the s
 directory. Fuzzing continues indefinitely until a bug is found or the number of iterations it should
 perform is specified with `-runs`. For example,
 
-`bazel run //test/common/common:base64_fuzz_test --config asan-fuzzer
---test/common/common/base64_corpus -runs=1000`
+```console
+bazel run //test/common/common:base64_fuzz_test --config asan-fuzzer \
+    -- test/common/common/base64_corpus -runs=1000
+```
 
 The fuzzer prints information to stderr:
 
@@ -168,7 +170,7 @@ This generates a coverage report after running the fuzz targets for one minute a
 
 Otherwise, you can generate reports from the
 ClusterFuzz corpus following the general ClusterFuzz [instructions for profiling
-setup](https://github.com/google/oss-fuzz/blob/master/docs/code_coverage.md).
+setup](https://google.github.io/oss-fuzz/advanced-topics/code-coverage/).
 
 To filter out unrelated artifacts (e.g. Bazel cache, libfuzzer src), the following profile command
 can be used:

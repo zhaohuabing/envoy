@@ -1,11 +1,16 @@
 #include <cstdint>
 #include <fstream>
+#include <thread>
+
+#include "envoy/common/exception.h"
 
 #include "source/common/common/assert.h"
 #include "source/common/event/dispatcher_impl.h"
 #include "source/common/filesystem/watcher_impl.h"
 
 #include "test/test_common/environment.h"
+#include "test/test_common/logging.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -13,6 +18,9 @@
 
 namespace Envoy {
 namespace Filesystem {
+
+using ::Envoy::StatusHelpers::IsOk;
+using ::testing::Not;
 
 class WatcherImplTest : public testing::Test {
 protected:
@@ -37,21 +45,26 @@ TEST_F(WatcherImplTest, All) {
   unlink(TestEnvironment::temporaryPath("envoy_test/watcher_new_link").c_str());
 
   TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test"));
-  { std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target")); }
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"));
+  }
   TestEnvironment::createSymlink(TestEnvironment::temporaryPath("envoy_test/watcher_target"),
                                  TestEnvironment::temporaryPath("envoy_test/watcher_link"));
 
-  { std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_new_target")); }
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_new_target"));
+  }
   TestEnvironment::createSymlink(TestEnvironment::temporaryPath("envoy_test/watcher_new_target"),
                                  TestEnvironment::temporaryPath("envoy_test/watcher_new_link"));
 
   WatchCallback callback;
   EXPECT_CALL(callback, called(Watcher::Events::MovedTo)).Times(2);
-  watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_link"),
-                    Watcher::Events::MovedTo, [&](uint32_t events) -> void {
-                      callback.called(events);
-                      dispatcher_->exit();
-                    });
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_link"),
+                              Watcher::Events::MovedTo, [&](uint32_t events) {
+                                callback.called(events);
+                                dispatcher_->exit();
+                                return absl::OkStatus();
+                              }));
   TestEnvironment::renameFile(TestEnvironment::temporaryPath("envoy_test/watcher_new_link"),
                               TestEnvironment::temporaryPath("envoy_test/watcher_link"));
   dispatcher_->run(Event::Dispatcher::RunType::Block);
@@ -72,16 +85,21 @@ TEST_F(WatcherImplTest, Create) {
   unlink(TestEnvironment::temporaryPath("envoy_test/other_file").c_str());
 
   TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test"));
-  { std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target")); }
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"));
+  }
 
   WatchCallback callback;
-  watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_link"),
-                    Watcher::Events::MovedTo, [&](uint32_t events) -> void {
-                      callback.called(events);
-                      dispatcher_->exit();
-                    });
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_link"),
+                              Watcher::Events::MovedTo, [&](uint32_t events) {
+                                callback.called(events);
+                                dispatcher_->exit();
+                                return absl::OkStatus();
+                              }));
 
-  { std::ofstream file(TestEnvironment::temporaryPath("envoy_test/other_file")); }
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/other_file"));
+  }
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
 
   EXPECT_CALL(callback, called(Watcher::Events::MovedTo));
@@ -99,11 +117,12 @@ TEST_F(WatcherImplTest, Modify) {
   std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"));
 
   WatchCallback callback;
-  watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_target"),
-                    Watcher::Events::Modified, [&](uint32_t events) -> void {
-                      callback.called(events);
-                      dispatcher_->exit();
-                    });
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_target"),
+                              Watcher::Events::Modified, [&](uint32_t events) {
+                                callback.called(events);
+                                dispatcher_->exit();
+                                return absl::OkStatus();
+                              }));
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
 
   file << "text" << std::flush;
@@ -115,13 +134,13 @@ TEST_F(WatcherImplTest, Modify) {
 TEST_F(WatcherImplTest, BadPath) {
   Filesystem::WatcherPtr watcher = dispatcher_->createFilesystemWatcher();
 
-  EXPECT_THROW(
-      watcher->addWatch("this_is_not_a_file", Watcher::Events::MovedTo, [&](uint32_t) -> void {}),
-      EnvoyException);
+  EXPECT_THAT(watcher->addWatch("this_is_not_a_file", Watcher::Events::MovedTo,
+                                [&](uint32_t) { return absl::OkStatus(); }),
+              Not(IsOk()));
 
-  EXPECT_THROW(watcher->addWatch("this_is_not_a_dir/file", Watcher::Events::MovedTo,
-                                 [&](uint32_t) -> void {}),
-               EnvoyException);
+  EXPECT_THAT(watcher->addWatch("this_is_not_a_dir/file", Watcher::Events::MovedTo,
+                                [&](uint32_t) { return absl::OkStatus(); }),
+              Not(IsOk()));
 }
 
 TEST_F(WatcherImplTest, ParentDirectoryRemoved) {
@@ -132,9 +151,11 @@ TEST_F(WatcherImplTest, ParentDirectoryRemoved) {
   WatchCallback callback;
   EXPECT_CALL(callback, called(testing::_)).Times(0);
 
-  watcher->addWatch(TestEnvironment::temporaryPath("envoy_test_empty/watcher_link"),
-                    Watcher::Events::MovedTo,
-                    [&](uint32_t events) -> void { callback.called(events); });
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test_empty/watcher_link"),
+                              Watcher::Events::MovedTo, [&](uint32_t events) {
+                                callback.called(events);
+                                return absl::OkStatus();
+                              }));
 
   int rc = rmdir(TestEnvironment::temporaryPath("envoy_test_empty").c_str());
   EXPECT_EQ(0, rc);
@@ -146,9 +167,11 @@ TEST_F(WatcherImplTest, RootDirectoryPath) {
   Filesystem::WatcherPtr watcher = dispatcher_->createFilesystemWatcher();
 
 #ifndef WIN32
-  EXPECT_NO_THROW(watcher->addWatch("/", Watcher::Events::MovedTo, [&](uint32_t) -> void {}));
+  EXPECT_OK(
+      watcher->addWatch("/", Watcher::Events::MovedTo, [&](uint32_t) { return absl::OkStatus(); }));
 #else
-  EXPECT_NO_THROW(watcher->addWatch("c:\\", Watcher::Events::MovedTo, [&](uint32_t) -> void {}));
+  EXPECT_OK(watcher->addWatch("c:\\", Watcher::Events::MovedTo,
+                              [&](uint32_t) { return absl::OkStatus(); }));
 #endif
 }
 
@@ -160,7 +183,9 @@ TEST_F(WatcherImplTest, SymlinkAtomicRename) {
 
   TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test"));
   TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test/..timestamp1"));
-  { std::ofstream file(TestEnvironment::temporaryPath("envoy_test/..timestamp1/watched_file")); }
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/..timestamp1/watched_file"));
+  }
 
   TestEnvironment::createSymlink(TestEnvironment::temporaryPath("envoy_test/..timestamp1"),
                                  TestEnvironment::temporaryPath("envoy_test/..data"));
@@ -169,14 +194,17 @@ TEST_F(WatcherImplTest, SymlinkAtomicRename) {
 
   WatchCallback callback;
   EXPECT_CALL(callback, called(Watcher::Events::MovedTo));
-  watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/"), Watcher::Events::MovedTo,
-                    [&](uint32_t events) -> void {
-                      callback.called(events);
-                      dispatcher_->exit();
-                    });
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/"),
+                              Watcher::Events::MovedTo, [&](uint32_t events) {
+                                callback.called(events);
+                                dispatcher_->exit();
+                                return absl::OkStatus();
+                              }));
 
   TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test/..timestamp2"));
-  { std::ofstream file(TestEnvironment::temporaryPath("envoy_test/..timestamp2/watched_file")); }
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/..timestamp2/watched_file"));
+  }
   TestEnvironment::createSymlink(TestEnvironment::temporaryPath("envoy_test/..timestamp2"),
                                  TestEnvironment::temporaryPath("envoy_test/..tmp"));
   TestEnvironment::renameFile(TestEnvironment::temporaryPath("envoy_test/..tmp"),
@@ -185,6 +213,93 @@ TEST_F(WatcherImplTest, SymlinkAtomicRename) {
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 }
 #endif
+
+// Test that callback returning error status is logged and doesn't crash.
+TEST_F(WatcherImplTest, CallbackReturnsErrorStatus) {
+  Filesystem::WatcherPtr watcher = dispatcher_->createFilesystemWatcher();
+
+  TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test"));
+  std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"));
+
+  WatchCallback callback;
+  EXPECT_CALL(callback, called(Watcher::Events::Modified));
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_target"),
+                              Watcher::Events::Modified, [&](uint32_t events) {
+                                callback.called(events);
+                                dispatcher_->exit();
+                                // Return an error status - should be logged but not crash.
+                                return absl::InternalError("simulated callback error");
+                              }));
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_LOG_CONTAINS("warn", "Filesystem watch callback for", file << "text" << std::flush;
+                      file.close(); dispatcher_->run(Event::Dispatcher::RunType::Block););
+}
+
+// Test that callback throwing exception is caught and logged.
+TEST_F(WatcherImplTest, CallbackThrowsException) {
+  Filesystem::WatcherPtr watcher = dispatcher_->createFilesystemWatcher();
+
+  TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test"));
+  std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"));
+
+  WatchCallback callback;
+  EXPECT_CALL(callback, called(Watcher::Events::Modified));
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_target"),
+                              Watcher::Events::Modified, [&](uint32_t events) -> absl::Status {
+                                callback.called(events);
+                                dispatcher_->exit();
+                                // Throw an exception - should be caught and logged.
+                                throw EnvoyException("simulated callback exception");
+                              }));
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_LOG_CONTAINS("warn", "threw exception", file << "text" << std::flush; file.close();
+                      dispatcher_->run(Event::Dispatcher::RunType::Block););
+}
+
+// Test that multiple callbacks can fail without affecting each other.
+TEST_F(WatcherImplTest, MultipleCallbacksWithErrors) {
+  Filesystem::WatcherPtr watcher = dispatcher_->createFilesystemWatcher();
+
+  TestEnvironment::createPath(TestEnvironment::temporaryPath("envoy_test"));
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"));
+  }
+
+  int callback_count = 0;
+  ASSERT_OK(watcher->addWatch(TestEnvironment::temporaryPath("envoy_test/watcher_target"),
+                              Watcher::Events::Modified, [&](uint32_t) {
+                                callback_count++;
+                                if (callback_count >= 2) {
+                                  dispatcher_->exit();
+                                }
+                                // First callback returns error, second returns OK.
+                                if (callback_count == 1) {
+                                  return absl::InternalError("first callback error");
+                                }
+                                return absl::OkStatus();
+                              }));
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  // Trigger first modification. The first callback returns error, but watcher continues.
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"), std::ios::app);
+    file << "text1";
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100)); // NO_CHECK_FORMAT(real_time)
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100)); // NO_CHECK_FORMAT(real_time)
+  // Trigger second modification. It should still work.
+  {
+    std::ofstream file(TestEnvironment::temporaryPath("envoy_test/watcher_target"), std::ios::app);
+    file << "text2";
+  }
+  dispatcher_->run(Event::Dispatcher::RunType::Block);
+
+  EXPECT_EQ(2, callback_count);
+}
 
 } // namespace Filesystem
 } // namespace Envoy

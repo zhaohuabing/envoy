@@ -3,40 +3,27 @@ load(
     "envoy_cc_library",
     "envoy_extension_package",
 )
-load("//bazel:envoy_internal.bzl", "envoy_external_dep_path")
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 
 licenses(["notice"])  # Apache 2
 
 envoy_extension_package()
-
-bool_flag(
-    name = "moonjit",
-    build_setting_default = False,
-)
-
-config_setting(
-    name = "with_moonjit",
-    flag_values = {
-        ":moonjit": "True",
-    },
-)
 
 envoy_cc_library(
     name = "lua_lib",
     srcs = ["lua.cc"],
     hdrs = ["lua.h"],
     deps = [
+        "//bazel/deps:luajit",
         "//envoy/thread_local:thread_local_interface",
         "//source/common/common:assert_lib",
+        "//source/common/common:c_smart_ptr_lib",
         "//source/common/common:lock_guard_lib",
         "//source/common/common:thread_lib",
-        "//source/common/common:c_smart_ptr_lib",
         "//source/common/protobuf",
-    ] + select({
-        ":with_moonjit": [envoy_external_dep_path("moonjit")],
-        "//conditions:default": [envoy_external_dep_path("luajit")],
-    }),
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+    ],
 )
 
 envoy_cc_library(
@@ -48,5 +35,19 @@ envoy_cc_library(
         "//envoy/buffer:buffer_interface",
         "//source/common/common:hex_lib",
         "//source/common/protobuf",
+    ],
+)
+
+envoy_cc_library(
+    name = "protobuf_converter_lib",
+    srcs = ["protobuf_converter.cc"],
+    hdrs = ["protobuf_converter.h"],
+    deps = [
+        ":lua_lib",
+        "//bazel/deps:luajit",
+        "//source/common/protobuf",
+        "//source/common/protobuf:create_reflectable_message_lib",
+        "//source/common/protobuf:utility_lib",
+        "@abseil-cpp//absl/strings",
     ],
 )

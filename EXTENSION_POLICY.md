@@ -37,7 +37,7 @@ The following procedure will be used when proposing new extensions for inclusion
   [DEPENDENCY_POLICY.md](DEPENDENCY_POLICY.md), please follow the steps detailed there.
   6. If an extension depends on platform specific functionality, be sure to guard it in the build
   system. See [platform specific features](./PULL_REQUESTS.md#platform-specific-features).
-  Add the extension to the necessary `*_SKIP_TARGETS` in [bazel/repositories.bzl](bazel/repositories.bzl)
+  Add the extension to the necessary `*_SKIP_TARGETS` in [bazel/extension_configs.bzl](bazel/extension_configs.bzl)
   and tag tests to be skipped/failed on the unsupported platform.
 
 ## Removing existing extensions
@@ -49,6 +49,17 @@ However, if an extension has known issues that are not being rectified by the or
 reviewers or new contributors that are willing to step into the role of extension owner, a
 [vote of the maintainers](./GOVERNANCE.md#conflict-resolution-and-voting) can be called to remove the
 extension from the repository.
+
+Extension removal process:
+
+  1. A GitHub Issue is opened listing the reason for extension removal and any available replacements.
+  2. Extension factory is modified to emit a deprecation warning.
+  3. This starts a 6 month deprecation interval, after which extension is decommissioned.
+  4. An announcement about extension deprecation is sent to the
+     [envoy-announce](https://groups.google.com/forum/#!forum/envoy-announce) email list, with the
+     instruction to comment on the GitHub issue to extend the deprecation interval. Heavily used
+     extensions may have their deprecation interval extended by 6 more months.
+  5. After the deprecation interval has expired the extension source code is removed.
 
 ## Extension pull request reviews
 
@@ -78,22 +89,30 @@ part of the Wasm implementation validation. The rationale for this policy:
 
 ## Extension stability and security posture
 
-Every extension is expected to be tagged with a `status` and `security_posture` in its
-`envoy_cc_extension` rule.
+Every extension is expected to be tagged with a `status` and `security_posture` in its entry in the
+extension metadata file
+([source/extensions/extensions_metadata.yaml](source/extensions/extensions_metadata.yaml) for core
+extensions, [contrib/extensions_metadata.yaml](contrib/extensions_metadata.yaml) for contrib
+extensions). The schema for these files is defined in
+[tools/extensions/extensions_schema.yaml](tools/extensions/extensions_schema.yaml).
 
 The `status` is one of:
-* `stable`: The extension is stable and is expected to be production usable. This is the default if
-  no `status` is specified.
+* `stable`: The extension is stable and is expected to be production usable.
 * `alpha`: The extension is functional but has not had substantial production burn time, use only
   with this caveat.
 * `wip`: The extension is work-in-progress. Functionality is incomplete and it is not intended for
   production use.
 
+Extensions that can be used in both downstream and upstream contexts (e.g., HTTP filters listed
+under both `envoy.filters.http` and `envoy.filters.http.upstream` categories) may also specify a
+`status_upstream` field. This allows the upstream usage to have a different maturity level than
+the downstream usage (e.g., `status: stable` with `status_upstream: alpha`).
+
 The extension status may be adjusted by the extension [CODEOWNERS](./CODEOWNERS) and/or Envoy
 maintainers based on an assessment of the above criteria. Note that the status of the extension
 reflects the implementation status. It is orthogonal to the API stability, for example, an extension
 API marked with `(xds.annotations.v3.file_status).work_in_progress` might have a `stable` implementation and
-and an extension with a stable config proto can have a `wip` implementation.
+an extension with a stable config proto can have a `wip` implementation.
 
 The `security_posture` is one of:
 * `robust_to_untrusted_downstream`: The extension is hardened against untrusted downstream traffic. It
@@ -122,7 +141,7 @@ An assessment of a robust security posture for an extension is subject to the fo
 * Does the extension have active [CODEOWNERS](CODEOWNERS) who are willing to
   vouch for the robustness of the extension?
 * Is the extension absent a [low coverage
-  exception](https://github.com/envoyproxy/envoy/blob/main/test/per_file_coverage.sh#L5)?
+  exception](https://github.com/envoyproxy/envoy/blob/main/test/coverage.yaml)?
 
 The current stability and security posture of all extensions can be seen
 [here](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/security/threat_model#core-and-extensions).
@@ -147,6 +166,16 @@ included by default in the main image builds. Consumers need to pull directly fr
 images described in the installation guide. Please read the linked document in detail to determine
 whether contrib extensions are the right choice for a newly proposed extension.
 
+**NOTE:** Contrib extensions **require** an end-user sponsor. The sponsor is someone who will run
+the extension at sufficient scale as to make the build maintenance and other overhead worthwhile.
+The definition of "sufficient scale" is up to the maintainers and can change at any time. The
+end-user sponsor *does not* have to author the extension, but the end-user sponsor will need to make
+an "on the record" attestation of their planned usage of the extension. This attestation should
+occur in a GitHub issue opened to discuss the new extension. In this context "end user" has the
+same definition as the one specified in the [security policy](SECURITY.md#membership-criteria)
+membership criteria (point 1.3.5).
+
 **NOTE:** Contrib extensions are not eligible for Envoy security team coverage.
+
 **NOTE:** As per the linked Google Doc, contrib extensions generally should use `v3alpha` to avoid
 requiring API shepherd reviews.

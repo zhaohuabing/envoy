@@ -19,8 +19,14 @@ enum class StreamResetReason {
   RemoteReset,
   // If a remote codec level refused stream reset was received on the stream (allowing for retry).
   RemoteRefusedStreamReset,
-  // If the stream was locally reset by a connection pool due to an initial connection failure.
-  ConnectionFailure,
+  // If the stream was locally reset by a connection pool due to an initial local connection
+  // failure.
+  LocalConnectionFailure,
+  // If the stream was locally reset by a connection pool due to an initial remote connection
+  // failure.
+  RemoteConnectionFailure,
+  // If the stream was reset due to timing out while creating a new connection.
+  ConnectionTimeout,
   // If the stream was locally reset due to connection termination.
   ConnectionTermination,
   // The stream was reset because of a resource overflow.
@@ -30,7 +36,13 @@ enum class StreamResetReason {
   // Received payload did not conform to HTTP protocol.
   ProtocolError,
   // If the stream was locally reset by the Overload Manager.
-  OverloadManager
+  OverloadManager,
+  // If stream was locally reset due to HTTP/1 upstream half closing before downstream.
+  Http1PrematureUpstreamHalfClose,
+  // If a remote RST_STREAM(NO_ERROR) was received after a complete response.
+  // Per RFC 9113 Section 8.1 (HTTP/2) and RFC 9114 Section 4.1 (HTTP/3), this is not an error, and
+  // the client should not discard the response.
+  RemoteResetNoError,
 };
 
 /**

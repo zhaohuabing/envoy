@@ -3,6 +3,7 @@
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/mocks/server/factory_context.h"
+#include "test/test_common/status_utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -19,7 +20,7 @@ class TestHttpFilterConfigFactory : public Server::Configuration::NamedHttpFilte
 public:
   TestHttpFilterConfigFactory() = default;
 
-  Http::FilterFactoryCb
+  absl::StatusOr<Http::FilterFactoryCb>
   createFilterFactoryFromProto(const Protobuf::Message&, const std::string&,
                                Server::Configuration::FactoryContext&) override {
     return [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
@@ -39,25 +40,25 @@ public:
   }
 
   std::string name() const override { return "envoy.test.http_filter"; }
-  std::string configType() override { return ""; };
+  std::set<std::string> configTypes() override { return {}; };
 };
 
 TEST(NamedHttpFilterConfigFactoryTest, CreateFilterFactory) {
   TestHttpFilterConfigFactory factory;
   const std::string stats_prefix = "foo";
   Server::Configuration::MockFactoryContext context;
-  ProtobufTypes::MessagePtr message{new Envoy::ProtobufWkt::Struct()};
+  ProtobufTypes::MessagePtr message{new Envoy::Protobuf::Struct()};
 
-  factory.createFilterFactoryFromProto(*message, stats_prefix, context);
+  EXPECT_OK(factory.createFilterFactoryFromProto(*message, stats_prefix, context).status());
 }
 
 TEST(NamedHttpFilterConfigFactoryTest, Dependencies) {
   TestHttpFilterConfigFactory factory;
   const std::string stats_prefix = "foo";
   Server::Configuration::MockFactoryContext context;
-  ProtobufTypes::MessagePtr message{new Envoy::ProtobufWkt::Struct()};
+  ProtobufTypes::MessagePtr message{new Envoy::Protobuf::Struct()};
 
-  factory.createFilterFactoryFromProto(*message, stats_prefix, context);
+  EXPECT_OK(factory.createFilterFactoryFromProto(*message, stats_prefix, context).status());
 
   EXPECT_EQ(factory.dependencies()->decode_required().size(), 1);
 }

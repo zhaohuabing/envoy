@@ -5,7 +5,7 @@
 #include "source/extensions/stat_sinks/hystrix/config.h"
 #include "source/extensions/stat_sinks/hystrix/hystrix.h"
 
-#include "test/mocks/server/instance.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/utility.h"
@@ -32,7 +32,8 @@ TEST(StatsConfigTest, ValidHystrixSink) {
   TestUtility::jsonConvert(sink_config, *message);
 
   NiceMock<Server::Configuration::MockServerFactoryContext> server;
-  Stats::SinkPtr sink = factory->createStatsSink(*message, server);
+  Stats::SinkPtr sink = factory->createStatsSink(*message, server).value();
+  ;
   EXPECT_NE(sink, nullptr);
   EXPECT_NE(dynamic_cast<Hystrix::HystrixSink*>(sink.get()), nullptr);
 }

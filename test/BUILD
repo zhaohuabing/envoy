@@ -1,3 +1,4 @@
+load("@aspect_bazel_lib//lib:yq.bzl", "yq")
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_test_library",
@@ -8,6 +9,22 @@ load(
 licenses(["notice"])  # Apache 2
 
 envoy_package()
+
+yq(
+    name = "coverage_config",
+    srcs = [":coverage.yaml"],
+    outs = ["coverage_config.json"],
+    args = ["-o=json"],
+    visibility = ["//visibility:public"],
+)
+
+yq(
+    name = "fuzz_coverage_config",
+    srcs = [":fuzz_coverage.yaml"],
+    outs = ["fuzz_coverage_config.json"],
+    args = ["-o=json"],
+    visibility = ["//visibility:public"],
+)
 
 # TODO(htuch): remove when we have a solution for https://github.com/bazelbuild/bazel/issues/3510
 envoy_cc_test_library(
@@ -21,30 +38,43 @@ envoy_cc_test_library(
         "main.cc",
         "test_listener.cc",
         "test_runner.cc",
+    ],
+    hdrs = [
+        "test_listener.h",
         "test_runner.h",
     ],
-    hdrs = ["test_listener.h"],
     deps = [
+        "//bazel:cpp_runfiles",
         "//source/common/common:logger_lib",
         "//source/common/common:thread_lib",
         "//source/common/event:libevent_lib",
         "//source/exe:process_wide_lib",
         "//source/server:backtrace_lib",
-        "//test/common/runtime:utility_lib",
         "//test/mocks/access_log:access_log_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:global_lib",
+        "//test/test_common:logging_lib",
         "//test/test_common:printers_lib",
+    ],
+)
+
+envoy_cc_test_library(
+    name = "test_listener_lib",
+    srcs = [
+        "test_listener.cc",
+    ],
+    hdrs = ["test_listener.h"],
+    deps = [
+        "//source/common/common:logger_lib",
+        "//source/common/common:thread_lib",
+        "//source/common/runtime:runtime_features_lib",
+        "//test/test_common:global_lib",
     ],
 )
 
 envoy_pch_library(
     name = "test_pch",
     testonly = True,
-    external_deps = [
-        "googletest",
-        "spdlog",
-    ],
     includes = [
         "envoy/config/bootstrap/v3/bootstrap.pb.h",
         "envoy/config/cluster/v3/cluster.pb.h",
@@ -84,5 +114,7 @@ envoy_pch_library(
         "@envoy_api//envoy/config/route/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
         "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
+        "@googletest//:gtest",
+        "@spdlog",
     ],
 )

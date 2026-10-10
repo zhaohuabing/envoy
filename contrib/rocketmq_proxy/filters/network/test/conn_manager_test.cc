@@ -5,7 +5,6 @@
 #include "test/mocks/network/connection.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/server/factory_context.h"
-#include "test/mocks/server/instance.h"
 
 #include "contrib/rocketmq_proxy/filters/network/source/config.h"
 #include "contrib/rocketmq_proxy/filters/network/source/conn_manager.h"
@@ -40,7 +39,8 @@ private:
 
 class RocketmqConnectionManagerTest : public Event::TestUsingSimulatedTime, public testing::Test {
 public:
-  RocketmqConnectionManagerTest() : stats_(RocketmqFilterStats::generateStats("test.", store_)) {}
+  RocketmqConnectionManagerTest()
+      : stats_(RocketmqFilterStats::generateStats("test.", *store_.rootScope())) {}
 
   ~RocketmqConnectionManagerTest() override {
     filter_callbacks_.connection_.dispatcher_.clearDeferredDeleteList();
@@ -53,12 +53,14 @@ public:
       TestUtility::loadFromYaml(yaml, proto_config_);
       TestUtility::validate(proto_config_);
     }
-    config_ = std::make_unique<TestConfigImpl>(proto_config_, factory_context_, stats_);
+    config_ = std::make_shared<TestConfigImpl>(proto_config_, factory_context_, stats_);
     conn_manager_ = std::make_unique<ConnectionManager>(
-        *config_, factory_context_.mainThreadDispatcher().timeSource());
+        config_, factory_context_.server_factory_context_.mainThreadDispatcher().timeSource());
     conn_manager_->initializeReadFilterCallbacks(filter_callbacks_);
     conn_manager_->onNewConnection();
-    current_ = factory_context_.mainThreadDispatcher().timeSource().monotonicTime();
+    current_ = factory_context_.server_factory_context_.mainThreadDispatcher()
+                   .timeSource()
+                   .monotonicTime();
   }
 
   void initializeCluster() {
@@ -69,8 +71,10 @@ public:
         Upstream::HostSetImpl::partitionHosts(std::make_shared<Upstream::HostVector>(hosts),
                                               Upstream::HostsPerLocalityImpl::empty()),
         nullptr, hosts, {}, 100);
-    factory_context_.cluster_manager_.initializeThreadLocalClusters({"fake_cluster"});
-    ON_CALL(factory_context_.cluster_manager_.thread_local_cluster_, prioritySet())
+    factory_context_.server_factory_context_.cluster_manager_.initializeThreadLocalClusters(
+        {"fake_cluster"});
+    ON_CALL(factory_context_.server_factory_context_.cluster_manager_.thread_local_cluster_,
+            prioritySet())
         .WillByDefault(ReturnRef(priority_set_));
   }
 
@@ -79,7 +83,7 @@ public:
   RocketmqFilterStats stats_;
   ConfigRocketmqProxy proto_config_;
 
-  std::unique_ptr<TestConfigImpl> config_;
+  std::shared_ptr<TestConfigImpl> config_;
 
   Buffer::OwnedImpl buffer_;
   NiceMock<Network::MockReadFilterCallbacks> filter_callbacks_;
@@ -92,8 +96,7 @@ public:
 
   std::shared_ptr<Upstream::MockClusterInfo> cluster_info_{
       new NiceMock<Upstream::MockClusterInfo>()};
-  Upstream::HostSharedPtr host_{
-      Upstream::makeTestHost(cluster_info_, "tcp://127.0.0.1:80", simTime())};
+  Upstream::HostSharedPtr host_{Upstream::makeTestHost(cluster_info_, "tcp://127.0.0.1:80")};
   Upstream::PrioritySetImpl priority_set_;
 };
 
@@ -362,7 +365,7 @@ route_config:
   initializeFilter(yaml);
 
   auto metadata = std::make_shared<envoy::config::core::v3::Metadata>();
-  ProtobufWkt::Struct topic_route_data;
+  Protobuf::Struct topic_route_data;
   auto* fields = topic_route_data.mutable_fields();
   (*fields)[RocketmqConstants::get().ReadQueueNum] = ValueUtil::numberValue(4);
   (*fields)[RocketmqConstants::get().WriteQueueNum] = ValueUtil::numberValue(4);
@@ -370,7 +373,7 @@ route_config:
   (*fields)[RocketmqConstants::get().BrokerName] = ValueUtil::stringValue("broker-a");
   (*fields)[RocketmqConstants::get().BrokerId] = ValueUtil::numberValue(0);
   (*fields)[RocketmqConstants::get().Perm] = ValueUtil::numberValue(6);
-  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, ProtobufWkt::Struct>(
+  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, Protobuf::Struct>(
       NetworkFilterNames::get().RocketmqProxy, topic_route_data));
   host_->metadata(metadata);
   initializeCluster();
@@ -420,7 +423,7 @@ route_config:
 )EOF";
   initializeFilter(yaml);
 
-  EXPECT_CALL(factory_context_.cluster_manager_, getThreadLocalCluster(_))
+  EXPECT_CALL(factory_context_.server_factory_context_.cluster_manager_, getThreadLocalCluster(_))
       .WillRepeatedly(Return(nullptr));
 
   BufferUtility::fillRequestBuffer(buffer_, RequestCode::GetRouteInfoByTopic);
@@ -449,7 +452,7 @@ route_config:
   NiceMock<Network::MockIp> ip;
   std::shared_ptr<const Network::MockResolvedAddress> instance =
       std::make_shared<Network::MockResolvedAddress>("logical", "physical");
-  EXPECT_CALL(factory_context_, getServerFactoryContext())
+  EXPECT_CALL(factory_context_, serverFactoryContext())
       .WillRepeatedly(ReturnRef(server_factory_context));
   EXPECT_CALL(server_factory_context, localInfo()).WillRepeatedly(ReturnRef(local_info));
   EXPECT_CALL(local_info, address()).WillRepeatedly(Return(instance));
@@ -461,7 +464,7 @@ route_config:
   initializeFilter(yaml);
 
   auto metadata = std::make_shared<envoy::config::core::v3::Metadata>();
-  ProtobufWkt::Struct topic_route_data;
+  Protobuf::Struct topic_route_data;
   auto* fields = topic_route_data.mutable_fields();
   (*fields)[RocketmqConstants::get().ReadQueueNum] = ValueUtil::numberValue(4);
   (*fields)[RocketmqConstants::get().WriteQueueNum] = ValueUtil::numberValue(4);
@@ -469,7 +472,7 @@ route_config:
   (*fields)[RocketmqConstants::get().BrokerName] = ValueUtil::stringValue("broker-a");
   (*fields)[RocketmqConstants::get().BrokerId] = ValueUtil::numberValue(0);
   (*fields)[RocketmqConstants::get().Perm] = ValueUtil::numberValue(6);
-  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, ProtobufWkt::Struct>(
+  metadata->mutable_filter_metadata()->insert(Protobuf::MapPair<std::string, Protobuf::Struct>(
       NetworkFilterNames::get().RocketmqProxy, topic_route_data));
   host_->metadata(metadata);
   initializeCluster();

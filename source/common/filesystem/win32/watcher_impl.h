@@ -1,11 +1,10 @@
 #pragma once
 
-#include <concurrent_queue.h>
-
 #include <codecvt>
 #include <cstdint>
 #include <list>
 #include <locale>
+#include <queue>
 #include <string>
 
 #include "envoy/api/api.h"
@@ -21,17 +20,40 @@
 #include "source/common/network/io_socket_handle_impl.h"
 
 #include "absl/container/node_hash_map.h"
+#include "absl/synchronization/mutex.h"
 
 namespace Envoy {
 namespace Filesystem {
 
+template <typename T> class ThreadSafeQueue {
+public:
+  void push(const T& value) {
+    absl::WriterMutexLock lock(&mutex_);
+    queue_.push(value);
+  }
+
+  bool try_pop(T& value) {
+    absl::WriterMutexLock lock(&mutex_);
+    if (queue_.empty()) {
+      return false;
+    }
+    value = std::move(queue_.front());
+    queue_.pop();
+    return true;
+  }
+
+private:
+  absl::Mutex mutex_;
+  std::queue<T> queue_;
+};
+
 class WatcherImpl : public Watcher, Logger::Loggable<Logger::Id::file> {
 public:
-  WatcherImpl(Event::Dispatcher& dispatcher, Api::Api& api);
+  WatcherImpl(Event::Dispatcher& dispatcher, Filesystem::Instance& file_system);
   ~WatcherImpl();
 
   // Filesystem::Watcher
-  void addWatch(absl::string_view path, uint32_t events, OnChangedCb cb) override;
+  absl::Status addWatch(absl::string_view path, uint32_t events, OnChangedCb cb) override;
 
 private:
   static void issueFirstRead(ULONG_PTR param);
@@ -39,6 +61,7 @@ private:
   static void endDirectoryWatch(Network::IoHandle& io_handle, HANDLE hEvent);
   void watchLoop();
   void onDirectoryEvent();
+  void callAndLogOnError(const OnChangedCb& cb, uint32_t events, const std::string& file);
 
   struct FileWatch {
     // store the wide character string for ReadDirectoryChangesW
@@ -52,14 +75,15 @@ private:
   struct DirectoryWatch {
     OVERLAPPED overlapped_;
     std::list<FileWatch> watches_;
+    absl::Mutex watches_mutex_;
     HANDLE dir_handle_;
-    std::vector<uint8_t> buffer_;
+    std::vector<DWORD> buffer_;
     WatcherImpl* watcher_;
   };
 
   typedef std::unique_ptr<DirectoryWatch> DirectoryWatchPtr;
 
-  Api::Api& api_;
+  Filesystem::Instance& file_system_;
   absl::node_hash_map<std::string, DirectoryWatchPtr> callback_map_;
   Network::IoHandlePtr read_handle_;
   Network::IoHandlePtr write_handle_;
@@ -68,7 +92,7 @@ private:
   HANDLE thread_exit_event_;
   std::vector<HANDLE> dir_watch_complete_events_;
   std::atomic<bool> keep_watching_;
-  concurrency::concurrent_queue<CbClosure> active_callbacks_;
+  ThreadSafeQueue<CbClosure> active_callbacks_;
   Api::OsSysCallsImpl& os_sys_calls_;
   std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> wstring_converter_;
 };

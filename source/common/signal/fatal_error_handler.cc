@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <list>
+#include <utility>
 
 #include "envoy/event/dispatcher.h"
 
@@ -103,7 +104,7 @@ FatalAction::Status runFatalActions(FatalActionType action_type) {
 
 void registerFatalErrorHandler(const FatalErrorHandlerInterface& handler) {
 #ifdef ENVOY_OBJECT_TRACE_ON_DUMP
-  absl::MutexLock l(&failure_mutex);
+  absl::MutexLock l(failure_mutex);
   FailureFunctionList* list = fatal_error_handlers.exchange(nullptr);
   if (list == nullptr) {
     list = new FailureFunctionList;
@@ -118,7 +119,7 @@ void registerFatalErrorHandler(const FatalErrorHandlerInterface& handler) {
 
 void removeFatalErrorHandler(const FatalErrorHandlerInterface& handler) {
 #ifdef ENVOY_OBJECT_TRACE_ON_DUMP
-  absl::MutexLock l(&failure_mutex);
+  absl::MutexLock l(failure_mutex);
   FailureFunctionList* list = fatal_error_handlers.exchange(nullptr);
   if (list == nullptr) {
     // removeFatalErrorHandler() may see an empty list of fatal error handlers
@@ -153,12 +154,15 @@ void registerFatalActions(FatalAction::FatalActionPtrList safe_actions,
                           FatalAction::FatalActionPtrList unsafe_actions,
                           Thread::ThreadFactory& thread_factory) {
   // Create a FatalActionManager and store it.
-  FatalAction::FatalActionManager* previous_manager =
-      fatal_action_manager.exchange(new FatalAction::FatalActionManager(
-          std::move(safe_actions), std::move(unsafe_actions), thread_factory));
-
-  // Previous manager should be NULL.
-  ASSERT(!previous_manager);
+  if (!fatal_action_manager.load(std::memory_order_acquire)) {
+    auto* new_manager = new FatalAction::FatalActionManager(
+        std::move(safe_actions), std::move(unsafe_actions), thread_factory);
+    FatalAction::FatalActionManager* expected = nullptr;
+    if (!fatal_action_manager.compare_exchange_strong(expected, new_manager,
+                                                      std::memory_order_acq_rel)) {
+      delete new_manager;
+    }
+  }
 }
 
 FatalAction::Status runSafeActions() { return runFatalActions(FatalActionType::Safe); }

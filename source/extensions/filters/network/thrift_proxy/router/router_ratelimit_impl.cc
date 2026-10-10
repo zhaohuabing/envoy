@@ -40,7 +40,7 @@ bool RequestHeadersAction::populateDescriptor(const RouteEntry&, RateLimit::Desc
     return true;
   }
 
-  const auto header_value = metadata.headers().get(header_name_);
+  const auto header_value = metadata.requestHeaders().get(header_name_);
   if (header_value.empty()) {
     return false;
   }
@@ -70,16 +70,18 @@ bool GenericKeyAction::populateDescriptor(const RouteEntry&, RateLimit::Descript
 }
 
 HeaderValueMatchAction::HeaderValueMatchAction(
-    const envoy::config::route::v3::RateLimit::Action::HeaderValueMatch& action)
+    const envoy::config::route::v3::RateLimit::Action::HeaderValueMatch& action,
+    Server::Configuration::CommonFactoryContext& context)
     : descriptor_value_(action.descriptor_value()),
       expect_match_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(action, expect_match, true)),
-      action_headers_(Http::HeaderUtility::buildHeaderDataVector(action.headers())) {}
+      action_headers_(Http::HeaderUtility::buildHeaderDataVector(action.headers(), context)) {}
 
 bool HeaderValueMatchAction::populateDescriptor(const RouteEntry&,
                                                 RateLimit::Descriptor& descriptor,
                                                 const std::string&, const MessageMetadata& metadata,
                                                 const Network::Address::Instance&) const {
-  if (expect_match_ == Http::HeaderUtility::matchHeaders(metadata.headers(), action_headers_)) {
+  if (expect_match_ ==
+      Http::HeaderUtility::matchHeaders(metadata.requestHeaders(), action_headers_)) {
     descriptor.entries_.push_back({"header_match", descriptor_value_});
     return true;
   } else {
@@ -88,9 +90,11 @@ bool HeaderValueMatchAction::populateDescriptor(const RouteEntry&,
 }
 
 RateLimitPolicyEntryImpl::RateLimitPolicyEntryImpl(
-    const envoy::config::route::v3::RateLimit& config)
+    const envoy::config::route::v3::RateLimit& config,
+    Server::Configuration::CommonFactoryContext& context)
     : disable_key_(config.disable_key()),
       stage_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, stage, 0)) {
+  actions_.reserve(config.actions().size());
   for (const auto& action : config.actions()) {
     switch (action.action_specifier_case()) {
     case envoy::config::route::v3::RateLimit::Action::ActionSpecifierCase::kSourceCluster:
@@ -109,7 +113,7 @@ RateLimitPolicyEntryImpl::RateLimitPolicyEntryImpl(
       actions_.emplace_back(new GenericKeyAction(action.generic_key()));
       break;
     case envoy::config::route::v3::RateLimit::Action::ActionSpecifierCase::kHeaderValueMatch:
-      actions_.emplace_back(new HeaderValueMatchAction(action.header_value_match()));
+      actions_.emplace_back(new HeaderValueMatchAction(action.header_value_match(), context));
       break;
     default:
       throw EnvoyException(
@@ -138,11 +142,13 @@ void RateLimitPolicyEntryImpl::populateDescriptors(
 }
 
 RateLimitPolicyImpl::RateLimitPolicyImpl(
-    const Protobuf::RepeatedPtrField<envoy::config::route::v3::RateLimit>& rate_limits)
+    const Protobuf::RepeatedPtrField<envoy::config::route::v3::RateLimit>& rate_limits,
+    Server::Configuration::CommonFactoryContext& context)
     : rate_limit_entries_reference_(RateLimitPolicyImpl::MAX_STAGE_NUMBER + 1) {
+  rate_limit_entries_.reserve(rate_limits.size());
   for (const auto& rate_limit : rate_limits) {
     std::unique_ptr<RateLimitPolicyEntry> rate_limit_policy_entry(
-        new RateLimitPolicyEntryImpl(rate_limit));
+        new RateLimitPolicyEntryImpl(rate_limit, context));
     uint32_t stage = rate_limit_policy_entry->stage();
     ASSERT(stage < rate_limit_entries_reference_.size());
     rate_limit_entries_reference_[stage].emplace_back(*rate_limit_policy_entry);

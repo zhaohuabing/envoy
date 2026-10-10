@@ -44,6 +44,14 @@ TEST_P(UdsUpstreamIntegrationTest, RouterDownstreamDisconnectBeforeResponseCompl
   testRouterDownstreamDisconnectBeforeResponseComplete();
 }
 
+TEST_P(UdsUpstreamIntegrationTest, TestTls) {
+  upstream_tls_ = true;
+  setUpstreamProtocol(Http::CodecType::HTTP1);
+  config_helper_.configureUpstreamTls(false, upstreamProtocol() == Http::CodecType::HTTP3);
+
+  testRouterHeaderOnlyRequestAndResponse();
+}
+
 #if defined(__linux__)
 INSTANTIATE_TEST_SUITE_P(
     TestParameters, UdsListenerIntegrationTest,
@@ -84,8 +92,8 @@ void UdsListenerIntegrationTest::initialize() {
 HttpIntegrationTest::ConnectionCreationFunction UdsListenerIntegrationTest::createConnectionFn() {
   return [&]() -> Network::ClientConnectionPtr {
     Network::ClientConnectionPtr conn(dispatcher_->createClientConnection(
-        Network::Utility::resolveUrl(fmt::format("unix://{}", getListenerSocketName())),
-        Network::Address::InstanceConstSharedPtr(), Network::Test::createRawBufferSocket(),
+        *Network::Utility::resolveUrl(fmt::format("unix://{}", getListenerSocketName())),
+        Network::Address::InstanceConstSharedPtr(), Network::Test::createRawBufferSocket(), nullptr,
         nullptr));
     conn->enableHalfClose(enableHalfClose());
     return conn;
@@ -127,7 +135,7 @@ TEST_P(UdsListenerIntegrationTest, TestPeerCredentials) {
 
   auto credentials = codec_client_->connection()->unixSocketPeerCredentials();
 #ifndef SO_PEERCRED
-  EXPECT_EQ(credentials, absl::nullopt);
+  EXPECT_EQ(credentials, std::nullopt);
 #else
   EXPECT_EQ(credentials->pid, getpid());
   EXPECT_EQ(credentials->uid, getuid());

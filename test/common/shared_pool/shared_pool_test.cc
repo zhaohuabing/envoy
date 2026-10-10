@@ -1,3 +1,4 @@
+#include <atomic>
 #include <thread>
 
 #include "source/common/event/timer_impl.h"
@@ -13,6 +14,21 @@
 namespace Envoy {
 namespace SharedPool {
 
+namespace {
+struct Counted {
+  explicit Counted(int v) : v_(v) { ++live; }
+  Counted(const Counted& o) : v_(o.v_) { ++live; }
+  Counted(Counted&& o) noexcept : v_(o.v_) { ++live; }
+  ~Counted() { --live; }
+  bool operator==(const Counted& o) const { return v_ == o.v_; }
+  int v_;
+  inline static std::atomic<int> live{0};
+};
+struct CountedHash {
+  size_t operator()(const Counted& c) const { return static_cast<size_t>(c.v_); }
+};
+} // namespace
+
 class SharedPoolTest : public testing::Test {
 protected:
   SharedPoolTest()
@@ -25,6 +41,10 @@ protected:
       keepalive_timer_->enableTimer(time_interval);
       dispatcher_->run(Event::Dispatcher::RunType::Block);
     });
+  }
+
+  template <typename T> void deleteObject(std::shared_ptr<ObjectSharedPool<T>> pool, T* ptr) {
+    pool->deleteObject(ptr);
   }
 
   ~SharedPoolTest() override {
@@ -94,9 +114,10 @@ TEST_F(SharedPoolTest, ThreadSafeForDeleteObject) {
   std::shared_ptr<ObjectSharedPool<int>> pool;
   {
     // same thread
+    int* an_int = new int(4);
     createObjectSharedPool(pool);
-    dispatcher_->post([&pool, this]() {
-      pool->deleteObject(std::hash<int>{}(4));
+    dispatcher_->post([&pool, this, &an_int]() {
+      deleteObject(pool, an_int);
       go_.Notify();
     });
     go_.WaitForNotification();
@@ -104,10 +125,11 @@ TEST_F(SharedPoolTest, ThreadSafeForDeleteObject) {
 
   {
     // different threads
+    int* an_int = new int(4);
     createObjectSharedPool(pool);
     Thread::ThreadFactory& thread_factory = Thread::threadFactoryForTest();
     auto thread =
-        thread_factory.createThread([&pool]() { pool->deleteObject(std::hash<int>{}(4)); });
+        thread_factory.createThread([this, &pool, &an_int]() { deleteObject(pool, an_int); });
     thread->join();
   }
 }
@@ -172,6 +194,85 @@ TEST_F(SharedPoolTest, RaceCondtionForGetObjectWithObjectDeleter) {
   thread->join();
   EXPECT_EQ(4, *o2);
   deferredDeleteSharedPoolOnMainThread(pool);
+}
+
+TEST_F(SharedPoolTest, HashCollision) {
+  Event::MockDispatcher dispatcher;
+  struct MyHash {
+    constexpr size_t operator()(int x) const { return x < 10 ? 0 : 1; }
+  };
+
+  auto pool = std::make_shared<ObjectSharedPool<int, MyHash>>(dispatcher);
+  {
+    // Verify that the hash function works as intended.
+    static_assert(MyHash{}(4) == 0);
+    static_assert(MyHash{}(3) == 0);
+    static_assert(MyHash{}(15) == 1);
+    static_assert(MyHash{}(12) == 1);
+
+    // Instantiate objects that hash to the same value.
+    auto o = pool->getObject(4);
+    auto o1 = pool->getObject(3);
+
+    // Verify that there are separate entries in the pool for objects with the
+    // same hash value.
+    EXPECT_EQ(2, pool->poolSize());
+
+    EXPECT_EQ(*o, 4);
+    EXPECT_EQ(*o1, 3);
+
+    auto o2 = pool->getObject(15);
+    auto o3 = pool->getObject(12);
+    auto o4 = pool->getObject(3);
+    auto o5 = pool->getObject(1);
+
+    EXPECT_EQ(o4.get(), o1.get());
+    EXPECT_EQ(*o2, 15);
+    EXPECT_EQ(*o3, 12);
+    EXPECT_EQ(*o4, 3);
+    EXPECT_EQ(*o5, 1);
+
+    EXPECT_EQ(5, pool->poolSize());
+  }
+
+  EXPECT_EQ(0, pool->poolSize());
+}
+
+TEST_F(SharedPoolTest, DispatcherTeardownDropsCrossThreadDeleteFreesObject) {
+  ASSERT_EQ(0, Counted::live.load());
+
+  testing::NiceMock<Event::MockDispatcher> dispatcher;
+  std::vector<Event::PostCb> posted_cbs;
+  EXPECT_CALL(dispatcher, post(testing::_)).WillRepeatedly(testing::Invoke([&](Event::PostCb cb) {
+    posted_cbs.push_back(std::move(cb));
+  }));
+
+  auto pool = std::make_shared<ObjectSharedPool<Counted, CountedHash>>(dispatcher);
+  auto obj = pool->getObject(Counted{7});
+  ASSERT_EQ(1, Counted::live.load());
+  ASSERT_TRUE(posted_cbs.empty());
+
+  // Drop the last shared_ptr from a different thread, triggering the cross-thread delete path.
+  Thread::ThreadFactory& thread_factory = Thread::threadFactoryForTest();
+  auto thread = thread_factory.createThread([&]() { obj.reset(); });
+  thread->join();
+
+  // One callback should have been posted (the deferred delete).
+  ASSERT_EQ(1u, posted_cbs.size());
+  // The object is still alive — held by the captured unique_ptr inside the posted lambda.
+  EXPECT_EQ(1, Counted::live.load());
+
+  // Simulate dispatcher teardown: drop the queued callback without running it.
+  // The captured unique_ptr destructor must free the object.
+  posted_cbs.clear();
+
+  // Regression assertion: prior to the fix, the raw T* was captured by value and the
+  // callback destructor could not free it, causing a leak (live would still be 1).
+  EXPECT_EQ(0, Counted::live.load());
+
+  // Release the pool; the object is already destroyed, so this is a no-op for the counter.
+  pool.reset();
+  EXPECT_EQ(0, Counted::live.load());
 }
 
 } // namespace SharedPool

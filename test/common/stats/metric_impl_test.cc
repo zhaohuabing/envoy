@@ -1,8 +1,9 @@
 #include <string>
 
-#include "source/common/stats/allocator_impl.h"
+#include "source/common/stats/allocator.h"
 #include "source/common/stats/utility.h"
 
+#include "test/mocks/stats/mocks.h"
 #include "test/test_common/logging.h"
 
 #include "gtest/gtest.h"
@@ -24,7 +25,7 @@ protected:
   }
 
   SymbolTableImpl symbol_table_;
-  AllocatorImpl alloc_;
+  Allocator alloc_;
   StatNamePool pool_;
 };
 
@@ -69,6 +70,18 @@ TEST_F(MetricImplTest, FindTag) {
   EXPECT_EQ(makeStat("value1"), Utility::findTag(*counter, makeStat("name1")));
   EXPECT_EQ(makeStat("value2"), Utility::findTag(*counter, makeStat("name2")));
   EXPECT_FALSE(Utility::findTag(*counter, makeStat("name3")));
+}
+
+TEST(GaugeHelperTest, AdjustAddsWhenAddIsBigger) {
+  MockGauge gauge;
+  EXPECT_CALL(gauge, add(3));
+  gauge.adjust(5, 2);
+}
+
+TEST(GaugeHelperTest, AdjustSubtractsWhenSubIsBigger) {
+  MockGauge gauge;
+  EXPECT_CALL(gauge, sub(3));
+  gauge.adjust(2, 5);
 }
 
 } // namespace

@@ -1,24 +1,48 @@
 #include "source/server/worker_impl.h"
 
+#include <chrono>
 #include <functional>
 #include <memory>
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
+#include "envoy/network/drain_decision.h"
 #include "envoy/network/exception.h"
 #include "envoy/server/configuration.h"
 #include "envoy/thread_local/thread_local.h"
 
-#include "source/server/connection_handler_impl.h"
+#include "source/common/config/utility.h"
+#include "source/server/listener_manager_factory.h"
 
 namespace Envoy {
 namespace Server {
+namespace {
+
+constexpr std::chrono::milliseconds kCloseIdleHttpConnectionsInterval =
+    std::chrono::milliseconds(100);
+
+std::unique_ptr<ConnectionHandler> getHandler(Event::Dispatcher& dispatcher, uint32_t index,
+                                              OverloadManager& overload_manager,
+                                              OverloadManager& null_overload_manager) {
+
+  auto* factory = Config::Utility::getFactoryByName<ConnectionHandlerFactory>(
+      "envoy.connection_handler.default");
+  if (factory) {
+    return factory->createConnectionHandler(dispatcher, index, overload_manager,
+                                            null_overload_manager);
+  }
+  ENVOY_LOG_MISC(debug, "Unable to find envoy.connection_handler.default factory");
+  return nullptr;
+}
+
+} // namespace
 
 WorkerPtr ProdWorkerFactory::createWorker(uint32_t index, OverloadManager& overload_manager,
+                                          OverloadManager& null_overload_manager,
                                           const std::string& worker_name) {
   Event::DispatcherPtr dispatcher(
       api_.allocateDispatcher(worker_name, overload_manager.scaledTimerFactory()));
-  auto conn_handler = std::make_unique<ConnectionHandlerImpl>(*dispatcher, index);
+  auto conn_handler = getHandler(*dispatcher, index, overload_manager, null_overload_manager);
   return std::make_unique<WorkerImpl>(tls_, hooks_, std::move(dispatcher), std::move(conn_handler),
                                       overload_manager, api_, stat_names_);
 }
@@ -40,15 +64,21 @@ WorkerImpl::WorkerImpl(ThreadLocal::Instance& tls, ListenerHooks& hooks,
   overload_manager.registerForAction(
       OverloadActionNames::get().ResetStreams, *dispatcher_,
       [this](OverloadActionState state) { resetStreamsUsingExcessiveMemory(state); });
+
+  overload_manager.registerForAction(
+      OverloadActionNames::get().CloseIdleHttpConnections, *dispatcher_,
+      [this](OverloadActionState state) { closeIdleHttpConnectionsCb(state.phase()); });
 }
 
-void WorkerImpl::addListener(absl::optional<uint64_t> overridden_listener,
-                             Network::ListenerConfig& listener, AddListenerCompletion completion) {
-  dispatcher_->post([this, overridden_listener, &listener, completion]() -> void {
-    handler_->addListener(overridden_listener, listener);
-    hooks_.onWorkerListenerAdded();
-    completion();
-  });
+void WorkerImpl::addListener(std::optional<uint64_t> overridden_listener,
+                             Network::ListenerConfig& listener, AddListenerCompletion completion,
+                             Runtime::Loader& runtime, Random::RandomGenerator& random) {
+  dispatcher_->post(
+      [this, overridden_listener, &listener, &runtime, &random, completion]() -> void {
+        handler_->addListener(overridden_listener, listener, runtime, random);
+        hooks_.onWorkerListenerAdded();
+        completion();
+      });
 }
 
 uint64_t WorkerImpl::numConnections() const {
@@ -80,7 +110,8 @@ void WorkerImpl::removeFilterChains(uint64_t listener_tag,
       });
 }
 
-void WorkerImpl::start(GuardDog& guard_dog, const Event::PostCb& cb) {
+void WorkerImpl::start(OptRef<GuardDog> guard_dog, const std::function<void()>& cb,
+                       std::optional<uint32_t> cpu_id) {
   ASSERT(!thread_);
 
   // In posix, thread names are limited to 15 characters, so contrive to make
@@ -94,8 +125,9 @@ void WorkerImpl::start(GuardDog& guard_dog, const Event::PostCb& cb) {
   // TODO(jmarantz): consider refactoring how this naming works so this naming
   // architecture is centralized, resulting in clearer names.
   Thread::Options options{absl::StrCat("wrk:", dispatcher_->name())};
+  options.cpu_affinity_ = cpu_id;
   thread_ = api_.threadFactory().createThread(
-      [this, &guard_dog, cb]() -> void { threadRoutine(guard_dog, cb); }, options);
+      [this, guard_dog, cb]() -> void { threadRoutine(guard_dog, cb); }, options);
 }
 
 void WorkerImpl::initializeStats(Stats::Scope& scope) { dispatcher_->initializeStats(scope); }
@@ -104,33 +136,54 @@ void WorkerImpl::stop() {
   // It's possible for the server to cleanly shut down while cluster initialization during startup
   // is happening, so we might not yet have a thread.
   if (thread_) {
+    close_idle_connection_timer_ = nullptr;
     dispatcher_->exit();
     thread_->join();
   }
 }
 
-void WorkerImpl::stopListener(Network::ListenerConfig& listener, std::function<void()> completion) {
+void WorkerImpl::stopListener(Network::ListenerConfig& listener,
+                              const Network::ExtraShutdownListenerOptions& options,
+                              std::function<void()> completion) {
   const uint64_t listener_tag = listener.listenerTag();
-  dispatcher_->post([this, listener_tag, completion]() -> void {
-    handler_->stopListeners(listener_tag);
+  dispatcher_->post([this, listener_tag, options, completion]() -> void {
+    handler_->stopListeners(listener_tag, options);
     if (completion != nullptr) {
       completion();
     }
   });
 }
 
-void WorkerImpl::threadRoutine(GuardDog& guard_dog, const Event::PostCb& cb) {
+void WorkerImpl::onFilterChainDrain(uint64_t listener_tag,
+                                    const std::list<const Network::FilterChain*>& filter_chains,
+                                    Network::ConnectionDrainEvent drain_event) {
+  dispatcher_->post([this, listener_tag, &filter_chains, drain_event]() -> void {
+    handler_->onFilterChainDrain(listener_tag, filter_chains, drain_event);
+  });
+}
+
+void WorkerImpl::onListenerDrain(uint64_t listener_tag, Network::ConnectionDrainEvent drain_event) {
+  dispatcher_->post([this, listener_tag, drain_event]() -> void {
+    handler_->onListenerDrain(listener_tag, drain_event);
+  });
+}
+
+void WorkerImpl::threadRoutine(OptRef<GuardDog> guard_dog, const std::function<void()>& cb) {
   ENVOY_LOG(debug, "worker entering dispatch loop");
   // The watch dog must be created after the dispatcher starts running and has post events flushed,
   // as this is when TLS stat scopes start working.
   dispatcher_->post([this, &guard_dog, cb]() {
     cb();
-    watch_dog_ = guard_dog.createWatchDog(api_.threadFactory().currentThreadId(),
-                                          dispatcher_->name(), *dispatcher_);
+    if (guard_dog.has_value()) {
+      watch_dog_ = guard_dog->createWatchDog(api_.threadFactory().currentThreadId(),
+                                             dispatcher_->name(), *dispatcher_);
+    }
   });
   dispatcher_->run(Event::Dispatcher::RunType::Block);
   ENVOY_LOG(debug, "worker exited dispatch loop");
-  guard_dog.stopWatching(watch_dog_);
+  if (guard_dog.has_value()) {
+    guard_dog->stopWatching(watch_dog_);
+  }
   dispatcher_->shutdown();
 
   // We must close all active connections before we actually exit the thread. This prevents any
@@ -157,6 +210,42 @@ void WorkerImpl::resetStreamsUsingExcessiveMemory(OverloadActionState state) {
   uint64_t streams_reset_count =
       dispatcher_->getWatermarkFactory().resetAccountsGivenPressure(state.value().value());
   reset_streams_counter_.add(streams_reset_count);
+}
+
+void WorkerImpl::closeIdleHttpConnectionsCb(OverloadActionState::Phase phase) {
+  if (close_idle_http_connections_state_ == phase) {
+    return;
+  }
+
+  close_idle_http_connections_state_ = phase;
+
+  // Lazy initialize the timer if it does not exist.
+  if (close_idle_connection_timer_ == nullptr) {
+    close_idle_connection_timer_ = dispatcher_->createTimer([this]() {
+      maybeCloseIdleHttpConnections();
+      ASSERT(close_idle_http_connections_state_ != OverloadActionState::Phase::Inactive);
+      close_idle_connection_timer_->enableTimer(kCloseIdleHttpConnectionsInterval);
+    });
+  }
+
+  if (close_idle_http_connections_state_ != OverloadActionState::Phase::Inactive) {
+    if (!close_idle_connection_timer_->enabled()) {
+      close_idle_connection_timer_->enableTimer(kCloseIdleHttpConnectionsInterval);
+    }
+  } else {
+    ASSERT(close_idle_connection_timer_->enabled());
+    close_idle_connection_timer_->disableTimer();
+  }
+}
+
+void WorkerImpl::maybeCloseIdleHttpConnections() {
+  if (handler_) {
+    // If state is saturated, aggressive closure is triggered (ignoring the
+    // idle timer threshold). Otherwise, it's a "scaled active" state which
+    // respects it.
+    handler_->closeIdleHttpConnections(close_idle_http_connections_state_ ==
+                                       OverloadActionState::Phase::Saturated);
+  }
 }
 
 } // namespace Server

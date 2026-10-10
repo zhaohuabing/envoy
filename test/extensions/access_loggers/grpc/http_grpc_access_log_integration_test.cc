@@ -15,6 +15,9 @@
 #include "gtest/gtest.h"
 
 using testing::AssertionResult;
+using testing::Eq;
+using testing::Ge;
+using testing::HasSubstr;
 
 namespace Envoy {
 namespace {
@@ -22,7 +25,11 @@ namespace {
 class AccessLogIntegrationTest : public Grpc::GrpcClientIntegrationParamTest,
                                  public HttpIntegrationTest {
 public:
-  AccessLogIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, ipVersion()) {}
+  AccessLogIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, ipVersion()) {
+    // grpc.accesslog.streams_closed_* is now covered by the grpc.$.** rule (#36673), so the
+    // tag-extraction check can be enabled here. Toward #21595.
+    skip_tag_extraction_rule_check_ = false;
+  }
 
   void createUpstreams() override {
     HttpIntegrationTest::createUpstreams();
@@ -50,7 +57,7 @@ public:
           common_config->set_transport_api_version(envoy::config::core::v3::ApiVersion::V3);
           setGrpcService(*common_config->mutable_grpc_service(), "accesslog",
                          fake_upstreams_.back()->localAddress());
-          access_log->mutable_typed_config()->PackFrom(config);
+          std::ignore = access_log->mutable_typed_config()->PackFrom(config);
         });
 
     HttpIntegrationTest::initialize();
@@ -84,10 +91,12 @@ public:
     log_entry->mutable_common_properties()->clear_downstream_direct_remote_address();
     log_entry->mutable_common_properties()->clear_downstream_local_address();
     log_entry->mutable_common_properties()->clear_start_time();
+    log_entry->mutable_common_properties()->clear_duration();
     log_entry->mutable_common_properties()->clear_time_to_last_rx_byte();
     log_entry->mutable_common_properties()->clear_time_to_first_downstream_tx_byte();
     log_entry->mutable_common_properties()->clear_time_to_last_downstream_tx_byte();
     log_entry->mutable_request()->clear_request_id();
+    log_entry->mutable_common_properties()->clear_stream_id();
     if (request_msg.has_identifier()) {
       auto* node = request_msg.mutable_identifier()->mutable_node();
       node->clear_extensions();
@@ -133,18 +142,23 @@ http_logs:
     common_properties:
       response_flags:
         no_route_found: true
+      downstream_wire_bytes_sent: 178
+      downstream_wire_bytes_received: 38
+      access_log_type: DownstreamEnd
     protocol_version: HTTP11
     request:
       scheme: http
       authority: host
+      downstream_header_bytes_received: 11
       path: /notfound
       request_headers_bytes: 118
       request_method: GET
     response:
+      downstream_header_bytes_sent: 152
       response_code:
         value: 404
       response_code_details: "route_not_found"
-      response_headers_bytes: 54
+      response_headers_bytes: 131
 )EOF")));
 
   BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
@@ -157,18 +171,23 @@ http_logs:
     common_properties:
       response_flags:
         no_route_found: true
+      downstream_wire_bytes_sent: 178
+      downstream_wire_bytes_received: 38
+      access_log_type: DownstreamEnd
     protocol_version: HTTP11
     request:
+      downstream_header_bytes_received: 11
       scheme: http
       authority: host
       path: /notfound
       request_headers_bytes: 118
       request_method: GET
     response:
+      downstream_header_bytes_sent: 152
       response_code:
         value: 404
       response_code_details: "route_not_found"
-      response_headers_bytes: 54
+      response_headers_bytes: 131
 )EOF"));
 
   // Send an empty response and end the stream. This should never happen but make sure nothing
@@ -179,13 +198,13 @@ http_logs:
   access_log_request_->finishGrpcStream(Grpc::Status::Ok);
   switch (clientType()) {
   case Grpc::ClientType::EnvoyGrpc:
-    test_server_->waitForGaugeEq("cluster.accesslog.upstream_rq_active", 0);
+    test_server_->waitForGauge("cluster.accesslog.upstream_rq_active", Eq(0));
     break;
   case Grpc::ClientType::GoogleGrpc:
-    test_server_->waitForCounterGe("grpc.accesslog.streams_closed_0", 1);
+    test_server_->waitForCounter("grpc.accesslog.streams_closed_0", Ge(1));
     break;
   default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("reached unexpected code");
   }
   response = IntegrationUtil::makeSingleRequest(lookupPort("http"), "GET", "/notfound", "",
                                                 downstream_protocol_, version_);
@@ -206,20 +225,138 @@ http_logs:
     common_properties:
       response_flags:
         no_route_found: true
+      downstream_wire_bytes_sent: 178
+      downstream_wire_bytes_received: 38
+      access_log_type: DownstreamEnd
     protocol_version: HTTP11
     request:
+      downstream_header_bytes_received: 11
       scheme: http
       authority: host
       path: /notfound
       request_headers_bytes: 118
       request_method: GET
     response:
+      downstream_header_bytes_sent: 152
       response_code:
         value: 404
       response_code_details: "route_not_found"
-      response_headers_bytes: 54
+      response_headers_bytes: 131
 )EOF")));
   cleanup();
+}
+
+// Regression test to make sure that configuring upstream logs over gRPC will not crash Envoy.
+// TODO(asraa): Test output of the upstream logs.
+// See https://github.com/envoyproxy/envoy/issues/8828.
+TEST_P(AccessLogIntegrationTest, ConfigureHttpOverGrpcLogs) {
+  setUpstreamProtocol(Http::CodecType::HTTP2);
+  setDownstreamProtocol(Http::CodecType::HTTP2);
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+        // Configure just enough of an upstream access log to reference the upstream headers.
+        const std::string yaml_string = R"EOF(
+name: router
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  upstream_log:
+    name: grpc_accesslog
+    filter:
+      not_health_check_filter: {}
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig
+      common_config:
+        log_name: foo
+        grpc_service:
+          envoy_grpc:
+            cluster_name: cluster_0
+  )EOF";
+        // Replace the terminal envoy.router.
+        hcm.clear_http_filters();
+        TestUtility::loadFromYaml(yaml_string, *hcm.add_http_filters());
+      });
+
+  initialize();
+
+  // Send the request.
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+
+  // Send the response headers.
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// Verify the grpc cached logger is available after the initial logger filter is destroyed.
+// Regression test for https://github.com/envoyproxy/envoy/issues/18066
+TEST_P(AccessLogIntegrationTest, GrpcLoggerSurvivesAfterReloadConfig) {
+  config_helper_.disableDelayClose();
+  autonomous_upstream_ = true;
+  // The grpc access logger connection never closes. It's ok to see an incomplete logging stream.
+  autonomous_allow_incomplete_streams_ = true;
+
+  const std::string grpc_logger_string = R"EOF(
+    name: grpc_accesslog
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig
+      common_config:
+        log_name: bar
+        grpc_service:
+          envoy_grpc:
+            cluster_name: cluster_0
+  )EOF";
+
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* listener = bootstrap.mutable_static_resources()->mutable_listeners(0);
+    listener->set_stat_prefix("listener_0");
+  });
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) { TestUtility::loadFromYaml(grpc_logger_string, *hcm.add_access_log()); });
+  initialize();
+  // Given we're using LDS in this test, initialize() will not complete until
+  // the initial LDS file has loaded.
+  EXPECT_EQ(1, test_server_->counter("listener_manager.lds.update_success")->value());
+
+  // HTTP 1.1 is allowed and the connection is kept open until the listener update.
+  std::string response;
+  sendRawHttpAndWaitForResponse(lookupPort("http"), "GET / HTTP/1.1\r\nHost: host\r\n\r\n",
+                                &response, true);
+  EXPECT_TRUE(response.find("HTTP/1.1 200") == 0);
+
+  test_server_->waitForCounter("access_logs.grpc_access_log.logs_written", Eq(2));
+
+  // Create a new config with HTTP/1.0 proxying. The goal is to trigger a listener update.
+  ConfigHelper new_config_helper(version_, config_helper_.bootstrap());
+  new_config_helper.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) {
+        hcm.mutable_http_protocol_options()->set_accept_http_10(true);
+        hcm.mutable_http_protocol_options()->set_default_host_for_http_10("default.com");
+      });
+
+  // Create an LDS response with the new config, and reload config.
+  new_config_helper.setLds("1");
+  test_server_->waitForCounter("listener_manager.listener_in_place_updated", Ge(1));
+  test_server_->waitForCounter("listener_manager.lds.update_success", Eq(2));
+
+  // Wait until the http 1.1 connection is destroyed due to the listener update. It indicates the
+  // listener starts draining.
+  test_server_->waitForGauge("listener.listener_0.downstream_cx_active", Eq(0));
+  // Wait until all the draining filter chain is gone. It indicates the old listener and filter
+  // chains are destroyed.
+  test_server_->waitForGauge("listener_manager.total_filter_chains_draining", Eq(0));
+
+  // Verify that the new listener config is applied.
+  std::string response2;
+  sendRawHttpAndWaitForResponse(lookupPort("http"), "GET / HTTP/1.0\r\n\r\n", &response2, true);
+  EXPECT_THAT(response2, HasSubstr("HTTP/1.0 200 OK\r\n"));
+
+  // Verify that the grpc access logger is available after the listener update.
+  test_server_->waitForCounter("access_logs.grpc_access_log.logs_written", Eq(4));
 }
 
 } // namespace

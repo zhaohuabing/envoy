@@ -17,7 +17,7 @@ downstream-Envoy-upstream communication.
 Envoy includes some custom Google Mock matchers to make test expectation
 statements simpler to write and easier to understand.
 
-### HeaderValueOf
+### ContainsHeader
 
 Tests that a HeaderMap argument contains exactly one header with the given key,
 whose value satisfies the given expectation. The expectation can be a matcher,
@@ -26,13 +26,13 @@ or a string that the value should equal.
 Examples:
 
 ```cpp
-EXPECT_THAT(response->headers(), HeaderValueOf(Headers::get().Server, "envoy"));
+EXPECT_THAT(response->headers(), ContainsHeader(Headers::get().Server, "envoy"));
 ```
 
 ```cpp
 using testing::HasSubstr;
 EXPECT_THAT(request->headers(),
-            HeaderValueOf(Headers::get().AcceptEncoding, HasSubstr("gzip")));
+            ContainsHeader(Headers::get().AcceptEncoding, HasSubstr("gzip")));
 ```
 
 ### HttpStatusIs
@@ -93,7 +93,7 @@ EXPECT_THAT(response->headers(), IsSupersetOfHeaders(required_headers));
 ## Controlling time in tests
 
 In Envoy production code, time and timers are managed via
-[`Event::TimeSystem`](https://github.com/envoyproxy/envoy/blob/main/include/envoy/event/timer.h),
+[`Event::TimeSystem`](https://github.com/envoyproxy/envoy/blob/main/envoy/event/timer.h),
 which provides a mechanism for querying the time and setting up time-based
 callbacks. Bypassing this abstraction in Envoy code is flagged as a format
 violation in CI.
@@ -132,6 +132,11 @@ which runs the benchmark with a minimal number of iterations and skipping
 expensive benchmarks to quickly verify that the binary is able to run to
 completion. In order to collect meaningful bechmarks, `bazel run -c opt` the
 benchmark binary target on a quiescent machine.
+
+`envoy_cc_benchmark_binary` targets must list `@benchmark` in their `deps`; the macro
+deliberately does not inject it. Downstream bzlmod consumers must therefore declare
+`bazel_dep(name = "google_benchmark", version = "1.9.5", repo_name = "benchmark")` and
+`bazel_dep(name = "tclap", version = "1.2.5")` in their `MODULE.bazel`.
 
 If you would like to detect when your benchmark test is running under the
 wrapper, call

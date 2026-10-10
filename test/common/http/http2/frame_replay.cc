@@ -12,8 +12,10 @@ namespace Http {
 namespace Http2 {
 
 FileFrame::FileFrame(absl::string_view path) : api_(Api::createApiForTest()) {
-  const std::string contents = api_->fileSystem().fileReadToEnd(
-      TestEnvironment::runfilesPath("test/common/http/http2/" + std::string(path)));
+  const std::string contents = api_->fileSystem()
+                                   .fileReadToEnd(TestEnvironment::runfilesPath(
+                                       "test/common/http/http2/" + std::string(path)))
+                                   .value();
   frame_.resize(contents.size());
   contents.copy(reinterpret_cast<char*>(frame_.data()), frame_.size());
 }
@@ -60,15 +62,16 @@ void FrameUtils::fixupHeaders(Frame& frame) {
 
 CodecFrameInjector::CodecFrameInjector(const std::string& injector_name)
     : options_(::Envoy::Http2::Utility::initializeAndValidateOptions(
-          envoy::config::core::v3::Http2ProtocolOptions())),
+                   envoy::config::core::v3::Http2ProtocolOptions())
+                   .value()),
       injector_name_(injector_name) {}
 
 ClientCodecFrameInjector::ClientCodecFrameInjector() : CodecFrameInjector("server") {
   ON_CALL(client_connection_, write(_, _))
       .WillByDefault(Invoke([&](Buffer::Instance& data, bool) -> void {
-        ENVOY_LOG_MISC(
-            trace, "client write: {}",
-            Hex::encode(static_cast<uint8_t*>(data.linearize(data.length())), data.length()));
+        ENVOY_LOG_MISC(trace, "client write: {}",
+                       Hex::encode(absl::Span<const uint8_t>(
+                           static_cast<uint8_t*>(data.linearize(data.length())), data.length())));
         data.drain(data.length());
       }));
 }
@@ -82,9 +85,9 @@ ServerCodecFrameInjector::ServerCodecFrameInjector() : CodecFrameInjector("clien
 
   ON_CALL(server_connection_, write(_, _))
       .WillByDefault(Invoke([&](Buffer::Instance& data, bool) -> void {
-        ENVOY_LOG_MISC(
-            trace, "server write: {}",
-            Hex::encode(static_cast<uint8_t*>(data.linearize(data.length())), data.length()));
+        ENVOY_LOG_MISC(trace, "server write: {}",
+                       Hex::encode(absl::Span<const uint8_t>(
+                           static_cast<uint8_t*>(data.linearize(data.length())), data.length())));
         data.drain(data.length());
       }));
 }
@@ -92,7 +95,8 @@ ServerCodecFrameInjector::ServerCodecFrameInjector() : CodecFrameInjector("clien
 Http::Status CodecFrameInjector::write(const Frame& frame, Http::Connection& connection) {
   Buffer::OwnedImpl buffer;
   buffer.add(frame.data(), frame.size());
-  ENVOY_LOG_MISC(trace, "{} write: {}", injector_name_, Hex::encode(frame.data(), frame.size()));
+  ENVOY_LOG_MISC(trace, "{} write: {}", injector_name_,
+                 Hex::encode(absl::Span<const uint8_t>(frame.data(), frame.size())));
   auto status = Http::okStatus();
   while (buffer.length() > 0 && status.ok()) {
     status = connection.dispatch(buffer);

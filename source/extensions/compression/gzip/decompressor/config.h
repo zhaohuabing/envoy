@@ -39,10 +39,11 @@ private:
   Stats::Scope& scope_;
   const int32_t window_bits_;
   const uint32_t chunk_size_;
+  const uint64_t max_inflate_ratio_;
 };
 
 class GzipDecompressorLibraryFactory
-    : public Common::Decompressor::DecompressorLibraryFactoryBase<
+    : public Compression::Common::Decompressor::DecompressorLibraryFactoryBase<
           envoy::extensions::compression::gzip::decompressor::v3::Gzip> {
 public:
   GzipDecompressorLibraryFactory() : DecompressorLibraryFactoryBase(gzipExtensionName()) {}
@@ -50,7 +51,7 @@ public:
 private:
   Envoy::Compression::Decompressor::DecompressorFactoryPtr createDecompressorFactoryFromProtoTyped(
       const envoy::extensions::compression::gzip::decompressor::v3::Gzip& proto_config,
-      Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::GenericFactoryContext& context) override;
 };
 
 DECLARE_FACTORY(GzipDecompressorLibraryFactory);

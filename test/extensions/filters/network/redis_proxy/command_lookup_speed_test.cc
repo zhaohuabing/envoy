@@ -13,6 +13,7 @@
 
 #include "test/extensions/filters/network/redis_proxy/mocks.h"
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/simulated_time_system.h"
 
 #include "benchmark/benchmark.h"
@@ -30,13 +31,30 @@ public:
   ~NoOpSplitCallbacks() override = default;
 
   bool connectionAllowed() override { return true; }
+  void onQuit() override {}
   void onAuth(const std::string&) override {}
   void onAuth(const std::string&, const std::string&) override {}
   void onResponse(Common::Redis::RespValuePtr&&) override {}
+  Common::Redis::Client::Transaction& transaction() override { return transaction_; }
+  void setDownstreamRespVersion(uint32_t) override {}
+  Common::Redis::RespProtocolVersion protocolVersion() const override {
+    return Common::Redis::RespProtocolVersion::Resp2;
+  }
+  AuthAttempt attemptDownstreamAuthInline(const std::string&, const std::string&,
+                                          uint32_t) override {
+    return AuthAttempt::Denied;
+  }
+  uint32_t currentDownstreamRespVersion() const override { return 2; }
+  std::optional<uint32_t> takePendingHelloAuthVersion() override { return std::nullopt; }
+
+private:
+  Common::Redis::Client::NoOpTransaction transaction_;
 };
 
 class NullRouterImpl : public Router {
-  RouteSharedPtr upstreamPool(std::string&) override { return nullptr; }
+  RouteSharedPtr upstreamPool(std::string&, const StreamInfo::StreamInfo&) override {
+    return nullptr;
+  }
 };
 
 class CommandLookUpSpeedTest {
@@ -57,13 +75,13 @@ public:
     for (const std::string& command : Common::Redis::SupportedCommands::simpleCommands()) {
       Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
       makeBulkStringArray(*request, {command, "hello"});
-      splitter_.makeRequest(std::move(request), callbacks_, dispatcher_);
+      splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
     }
 
     for (const std::string& command : Common::Redis::SupportedCommands::evalCommands()) {
       Common::Redis::RespValuePtr request{new Common::Redis::RespValue()};
       makeBulkStringArray(*request, {command, "hello"});
-      splitter_.makeRequest(std::move(request), callbacks_, dispatcher_);
+      splitter_.makeRequest(std::move(request), callbacks_, dispatcher_, stream_info_);
     }
   }
 
@@ -72,9 +90,16 @@ public:
   Event::SimulatedTimeSystem time_system_;
   NiceMock<MockFaultManager> fault_manager_;
   NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<StreamInfo::MockStreamInfo> stream_info_;
+  absl::flat_hash_set<std::string> custom_commands_;
   CommandSplitter::InstanceImpl splitter_{
-      RouterPtr{router_}, store_, "redis.foo.",
-      time_system_,       false,  std::make_unique<NiceMock<MockFaultManager>>(fault_manager_)};
+      RouterPtr{router_},
+      *store_.rootScope(),
+      "redis.foo.",
+      time_system_,
+      false,
+      std::make_unique<NiceMock<MockFaultManager>>(fault_manager_),
+      std::move(custom_commands_)};
   NoOpSplitCallbacks callbacks_;
   CommandSplitter::SplitRequestPtr handle_;
 };
@@ -84,11 +109,12 @@ public:
 } // namespace Extensions
 } // namespace Envoy
 
-static void BM_MakeRequests(benchmark::State& state) {
+static void bmMakeRequests(benchmark::State& state) {
   Envoy::Extensions::NetworkFilters::RedisProxy::CommandLookUpSpeedTest context;
 
   for (auto _ : state) {
+    UNREFERENCED_PARAMETER(_);
     context.makeRequests();
   }
 }
-BENCHMARK(BM_MakeRequests);
+BENCHMARK(bmMakeRequests);

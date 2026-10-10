@@ -11,6 +11,7 @@
 
 #include "source/common/grpc/typed_async_client.h"
 
+#include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -24,6 +25,8 @@ public:
   ~MockAsyncRequest() override;
 
   MOCK_METHOD(void, cancel, ());
+  MOCK_METHOD(const StreamInfo::StreamInfo&, streamInfo, (), (const));
+  MOCK_METHOD(void, detach, ());
 };
 
 class MockAsyncStream : public RawAsyncStream {
@@ -37,15 +40,18 @@ public:
   MOCK_METHOD(void, sendMessageRaw_, (Buffer::InstancePtr & request, bool end_stream));
   MOCK_METHOD(void, closeStream, ());
   MOCK_METHOD(void, resetStream, ());
+  MOCK_METHOD(void, waitForRemoteCloseAndDelete, ());
   MOCK_METHOD(bool, isAboveWriteBufferHighWatermark, (), (const));
+  MOCK_METHOD(const StreamInfo::StreamInfo&, streamInfo, (), (const));
+  MOCK_METHOD(StreamInfo::StreamInfo&, streamInfo, (), ());
+  MOCK_METHOD(void, setWatermarkCallbacks, (Http::SidestreamWatermarkCallbacks&));
+  MOCK_METHOD(void, removeWatermarkCallbacks, ());
 };
-
-template <class ResponseType> using ResponseTypePtr = std::unique_ptr<ResponseType>;
 
 template <class ResponseType>
 class MockAsyncRequestCallbacks : public AsyncRequestCallbacks<ResponseType> {
 public:
-  void onSuccess(ResponseTypePtr<ResponseType>&& response, Tracing::Span& span) {
+  void onSuccess(ResponsePtr<ResponseType>&& response, Tracing::Span& span) override {
     onSuccess_(*response, span);
   }
 
@@ -58,13 +64,15 @@ public:
 template <class ResponseType>
 class MockAsyncStreamCallbacks : public AsyncStreamCallbacks<ResponseType> {
 public:
-  void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&& metadata) {
+  void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&& metadata) override {
     onReceiveInitialMetadata_(*metadata);
   }
 
-  void onReceiveMessage(ResponseTypePtr<ResponseType>&& message) { onReceiveMessage_(*message); }
+  void onReceiveMessage(ResponsePtr<ResponseType>&& message) override {
+    onReceiveMessage_(*message);
+  }
 
-  void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&& metadata) {
+  void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&& metadata) override {
     onReceiveTrailingMetadata_(*metadata);
   }
 
@@ -88,6 +96,7 @@ public:
               (absl::string_view service_full_name, absl::string_view method_name,
                RawAsyncStreamCallbacks& callbacks,
                const Http::AsyncClient::StreamOptions& options));
+  MOCK_METHOD(absl::string_view, destination, ());
 
   std::unique_ptr<testing::NiceMock<Grpc::MockAsyncRequest>> async_request_;
   // Keep track of the number of requests to detect potential race condition.
@@ -99,7 +108,7 @@ public:
   MockAsyncClientFactory();
   ~MockAsyncClientFactory() override;
 
-  MOCK_METHOD(RawAsyncClientPtr, createUncachedRawAsyncClient, ());
+  MOCK_METHOD(absl::StatusOr<RawAsyncClientPtr>, createUncachedRawAsyncClient, ());
 };
 
 class MockAsyncClientManager : public AsyncClientManager {
@@ -107,15 +116,20 @@ public:
   MockAsyncClientManager();
   ~MockAsyncClientManager() override;
 
-  MOCK_METHOD(AsyncClientFactoryPtr, factoryForGrpcService,
+  MOCK_METHOD(absl::StatusOr<AsyncClientFactoryPtr>, factoryForGrpcService,
               (const envoy::config::core::v3::GrpcService& grpc_service, Stats::Scope& scope,
                bool skip_cluster_check));
 
-  MOCK_METHOD(RawAsyncClientSharedPtr, getOrCreateRawAsyncClient,
+  MOCK_METHOD(absl::StatusOr<RawAsyncClientSharedPtr>, getOrCreateRawAsyncClient,
               (const envoy::config::core::v3::GrpcService& grpc_service, Stats::Scope& scope,
-               bool skip_cluster_check, Grpc::CacheOption cache_option));
+               bool skip_cluster_check));
+
+  MOCK_METHOD(absl::StatusOr<RawAsyncClientSharedPtr>, getOrCreateRawAsyncClientWithHashKey,
+              (const GrpcServiceConfigWithHashKey& config_with_hash_key, Stats::Scope& scope,
+               bool skip_cluster_check));
 };
 
+#if defined(ENVOY_ENABLE_FULL_PROTOS)
 MATCHER_P(ProtoBufferEq, expected, "") {
   typename std::remove_const<decltype(expected)>::type proto;
   if (!proto.ParseFromString(arg->toString())) {
@@ -175,6 +189,7 @@ MATCHER_P(ProtoBufferEqIgnoreRepeatedFieldOrdering, expected, "") {
   }
   return equal;
 }
+#endif
 
 } // namespace Grpc
 } // namespace Envoy

@@ -29,7 +29,7 @@ using MockParserSharedPtr = std::shared_ptr<MockParser>;
 
 class MockResponseParserResolver : public ResponseParserResolver {
 public:
-  MockResponseParserResolver() : ResponseParserResolver({}){};
+  MockResponseParserResolver() : ResponseParserResolver({}) {};
   MOCK_METHOD(ResponseParserSharedPtr, createParser, (ResponseContextSharedPtr), (const));
 };
 
@@ -44,7 +44,7 @@ using MockResponseCallbackSharedPtr = std::shared_ptr<MockResponseCallback>;
 class ResponseCodecUnitTest : public testing::Test, public BufferBasedTest {
 protected:
   MockResponseInitialParserFactory factory_{};
-  MockResponseParserResolver parser_resolver_{};
+  MockResponseParserResolver parser_resolver_;
   MockResponseCallbackSharedPtr callback_{std::make_shared<MockResponseCallback>()};
 };
 
