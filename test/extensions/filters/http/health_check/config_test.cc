@@ -7,19 +7,21 @@
 #include "source/extensions/filters/http/health_check/config.h"
 
 #include "test/mocks/server/factory_context.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using testing::_;
-using testing::Invoke;
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace HealthCheck {
 namespace {
+
+using StatusHelpers::HasStatus;
 
 TEST(HealthCheckFilterConfig, HealthCheckFilter) {
   const std::string yaml_string = R"EOF(
@@ -34,7 +36,8 @@ TEST(HealthCheckFilterConfig, HealthCheckFilter) {
   TestUtility::loadFromYaml(yaml_string, proto_config);
   NiceMock<Server::Configuration::MockFactoryContext> context;
   HealthCheckFilterConfig factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
@@ -51,8 +54,7 @@ TEST(HealthCheckFilterConfig, BadHealthCheckFilterConfig) {
   )EOF";
 
   envoy::extensions::filters::http::health_check::v3::HealthCheck proto_config;
-  EXPECT_THROW_WITH_REGEX(TestUtility::loadFromYaml(yaml_string, proto_config), EnvoyException,
-                          "status: Cannot find field");
+  EXPECT_THROW(TestUtility::loadFromYaml(yaml_string, proto_config), EnvoyException);
 }
 
 TEST(HealthCheckFilterConfig, FailsWhenNotPassThroughButTimeoutSetYaml) {
@@ -71,8 +73,9 @@ TEST(HealthCheckFilterConfig, FailsWhenNotPassThroughButTimeoutSetYaml) {
   HealthCheckFilterConfig factory;
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
-  EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "dummy_stats_prefix", context),
-               EnvoyException);
+  EXPECT_THAT(factory.createFilterFactoryFromProto(proto_config, "dummy_stats_prefix", context),
+              HasStatus(absl::StatusCode::kInvalidArgument,
+                        "cache_time_ms must not be set when path_through_mode is disabled"));
 }
 
 TEST(HealthCheckFilterConfig, NotFailingWhenNotPassThroughAndTimeoutNotSetYaml) {
@@ -91,8 +94,8 @@ TEST(HealthCheckFilterConfig, NotFailingWhenNotPassThroughAndTimeoutNotSetYaml) 
   HealthCheckFilterConfig factory;
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
-  EXPECT_NO_THROW(
-      factory.createFilterFactoryFromProto(proto_config, "dummy_stats_prefix", context));
+  EXPECT_OK(
+      factory.createFilterFactoryFromProto(proto_config, "dummy_stats_prefix", context).status());
 }
 
 TEST(HealthCheckFilterConfig, FailsWhenNotPassThroughButTimeoutSetProto) {
@@ -106,9 +109,10 @@ TEST(HealthCheckFilterConfig, FailsWhenNotPassThroughButTimeoutSetProto) {
   header.set_name(":path");
   header.mutable_string_match()->set_exact("foo");
 
-  EXPECT_THROW(
+  EXPECT_THAT(
       healthCheckFilterConfig.createFilterFactoryFromProto(config, "dummy_stats_prefix", context),
-      EnvoyException);
+      HasStatus(absl::StatusCode::kInvalidArgument,
+                "cache_time_ms must not be set when path_through_mode is disabled"));
 }
 
 TEST(HealthCheckFilterConfig, NotFailingWhenNotPassThroughAndTimeoutNotSetProto) {
@@ -120,21 +124,26 @@ TEST(HealthCheckFilterConfig, NotFailingWhenNotPassThroughAndTimeoutNotSetProto)
   envoy::config::route::v3::HeaderMatcher& header = *config.add_headers();
   header.set_name(":path");
   header.mutable_string_match()->set_exact("foo");
-  healthCheckFilterConfig.createFilterFactoryFromProto(config, "dummy_stats_prefix", context);
+  EXPECT_OK(
+      healthCheckFilterConfig.createFilterFactoryFromProto(config, "dummy_stats_prefix", context)
+          .status());
 }
 
 TEST(HealthCheckFilterConfig, HealthCheckFilterWithEmptyProto) {
   HealthCheckFilterConfig healthCheckFilterConfig;
   NiceMock<Server::Configuration::MockFactoryContext> context;
   envoy::extensions::filters::http::health_check::v3::HealthCheck config =
-      *dynamic_cast<envoy::extensions::filters::http::health_check::v3::HealthCheck*>(
+      *Envoy::Protobuf::DynamicCastMessage<
+          envoy::extensions::filters::http::health_check::v3::HealthCheck>(
           healthCheckFilterConfig.createEmptyConfigProto().get());
 
   config.mutable_pass_through_mode()->set_value(false);
   envoy::config::route::v3::HeaderMatcher& header = *config.add_headers();
   header.set_name(":path");
   header.mutable_string_match()->set_exact("foo");
-  healthCheckFilterConfig.createFilterFactoryFromProto(config, "dummy_stats_prefix", context);
+  EXPECT_OK(
+      healthCheckFilterConfig.createFilterFactoryFromProto(config, "dummy_stats_prefix", context)
+          .status());
 }
 
 void testHealthCheckHeaderMatch(
@@ -143,21 +152,22 @@ void testHealthCheckHeaderMatch(
   HealthCheckFilterConfig healthCheckFilterConfig;
   NiceMock<Server::Configuration::MockFactoryContext> context;
   ProtobufTypes::MessagePtr config_msg = healthCheckFilterConfig.createEmptyConfigProto();
-  auto config = dynamic_cast<envoy::extensions::filters::http::health_check::v3::HealthCheck*>(
-      config_msg.get());
+  auto config = Envoy::Protobuf::DynamicCastMessage<
+      envoy::extensions::filters::http::health_check::v3::HealthCheck>(config_msg.get());
   ASSERT_NE(config, nullptr);
 
   *config = input_config;
 
   Http::FilterFactoryCb cb =
-      healthCheckFilterConfig.createFilterFactoryFromProto(*config, "dummy_stats_prefix", context);
+      healthCheckFilterConfig.createFilterFactoryFromProto(*config, "dummy_stats_prefix", context)
+          .value();
 
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   Http::StreamFilterSharedPtr health_check_filter;
   EXPECT_CALL(filter_callbacks, addStreamFilter(_))
-      .WillRepeatedly(Invoke([&health_check_filter](Http::StreamFilterSharedPtr filter) {
+      .WillRepeatedly([&health_check_filter](Http::StreamFilterSharedPtr filter) {
         health_check_filter = filter;
-      }));
+      });
 
   cb(filter_callbacks);
   ASSERT_NE(health_check_filter, nullptr);
@@ -270,15 +280,26 @@ TEST(HealthCheckFilterConfig, HealthCheckFilterDuplicateNoMatch) {
   testHealthCheckHeaderMatch(config, headers, false);
 }
 
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(HealthCheckFilterConfig, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.health_check";
+TEST(HealthCheckFilterConfig, HealthCheckFilterWithServerContext) {
+  const std::string yaml_string = R"EOF(
+  pass_through_mode: true
+  headers:
+    - name: ":path"
+      string_match:
+        exact: "/hc"
+  )EOF";
 
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedHttpFilterConfigFactory>::getFactory(
-          deprecated_name));
+  envoy::extensions::filters::http::health_check::v3::HealthCheck proto_config;
+  TestUtility::loadFromYaml(yaml_string, proto_config);
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  HealthCheckFilterConfig factory;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(proto_config, context, extra_context).value();
+  Http::MockFilterChainFactoryCallbacks filter_callback;
+  EXPECT_CALL(filter_callback, addStreamFilter(_));
+  cb(filter_callback);
 }
 
 } // namespace

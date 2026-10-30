@@ -1,18 +1,20 @@
 #pragma once
 
-#include "envoy/http/header_map.h"
-#include "envoy/network/address.h"
-#include "envoy/stream_info/filter_state.h"
+#include <optional>
 
-#include "absl/types/optional.h"
+#include "envoy/http/header_map.h"
+#include "envoy/stream_info/stream_info.h"
 
 namespace Envoy {
 namespace Http {
 
-class Hashable {
+/**
+ * CookieAttribute that stores the name and value of a cookie.
+ */
+class CookieAttribute {
 public:
-  virtual absl::optional<uint64_t> hash() const PURE;
-  virtual ~Hashable() = default;
+  std::string name_;
+  std::string value_;
 };
 
 /**
@@ -31,21 +33,20 @@ public:
    * @return std::string the opaque value of the cookie that will be set
    */
   using AddCookieCallback = std::function<std::string(
-      const std::string& key, const std::string& path, std::chrono::seconds ttl)>;
+      absl::string_view name, absl::string_view path, std::chrono::seconds ttl,
+      absl::Span<const CookieAttribute> attributes)>;
 
   /**
-   * @param downstream_address is the address of the connected client host, or nullptr if the
-   * request is initiated from within this host
-   * @param headers stores the HTTP headers for the stream
+   * @param headers stores the HTTP headers for the stream.
+   * @param info stores the stream info for the stream.
    * @param add_cookie is called to add a set-cookie header on the reply sent to the downstream
-   * host
-   * @return absl::optional<uint64_t> an optional hash value to route on. A hash value might not be
+   * host.
+   * @return std::optional<uint64_t> an optional hash value to route on. A hash value might not be
    * returned if for example the specified HTTP header does not exist.
    */
-  virtual absl::optional<uint64_t>
-  generateHash(const Network::Address::Instance* downstream_address,
-               const RequestHeaderMap& headers, AddCookieCallback add_cookie,
-               const StreamInfo::FilterStateSharedPtr filter_state) const PURE;
+  virtual std::optional<uint64_t> generateHash(OptRef<const RequestHeaderMap> headers,
+                                               OptRef<const StreamInfo::StreamInfo> info,
+                                               AddCookieCallback add_cookie = nullptr) const PURE;
 };
 
 } // namespace Http

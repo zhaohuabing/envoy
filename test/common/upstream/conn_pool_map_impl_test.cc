@@ -15,7 +15,6 @@
 #include "gtest/gtest.h"
 
 using testing::AtLeast;
-using testing::Invoke;
 using testing::NiceMock;
 using testing::Return;
 using testing::SaveArg;
@@ -40,7 +39,7 @@ public:
   }
 
   TestMapPtr makeTestMapWithLimitAtPriority(uint64_t limit, ResourcePriority priority) {
-    host_->cluster_.resetResourceManager(1024, 1024, 1024, 1024, limit);
+    host_->cluster_.resetResourceManager(1024, 1024, 1024, 1024, limit, 100);
     return std::make_unique<TestMap>(dispatcher_, host_, priority);
   }
 
@@ -235,7 +234,7 @@ TEST_F(ConnPoolMapImplTest, GetPoolHittingLimitIncrementsFailureCounter) {
   ON_CALL(*mock_pools_[0], hasActiveConnections()).WillByDefault(Return(true));
   test_map->getPool(2, getNeverCalledFactory());
 
-  EXPECT_EQ(host_->cluster_.stats_.upstream_cx_pool_overflow_.value(), 1);
+  EXPECT_EQ(host_->cluster_.traffic_stats_->upstream_cx_pool_overflow_.value(), 1);
 }
 
 TEST_F(ConnPoolMapImplTest, GetPoolHittingLimitIncrementsFailureMultiple) {
@@ -247,7 +246,7 @@ TEST_F(ConnPoolMapImplTest, GetPoolHittingLimitIncrementsFailureMultiple) {
   test_map->getPool(2, getNeverCalledFactory());
   test_map->getPool(2, getNeverCalledFactory());
 
-  EXPECT_EQ(host_->cluster_.stats_.upstream_cx_pool_overflow_.value(), 3);
+  EXPECT_EQ(host_->cluster_.traffic_stats_->upstream_cx_pool_overflow_.value(), 3);
 }
 
 TEST_F(ConnPoolMapImplTest, GetPoolHittingLimitGreaterThan1Fails) {
@@ -284,7 +283,7 @@ TEST_F(ConnPoolMapImplTest, GetPoolLimitHitFollowedBySuccessDoesNotClearFailure)
   ON_CALL(*mock_pools_[0], hasActiveConnections()).WillByDefault(Return(false));
 
   test_map->getPool(2, getBasicFactory());
-  EXPECT_EQ(host_->cluster_.stats_.upstream_cx_pool_overflow_.value(), 1);
+  EXPECT_EQ(host_->cluster_.traffic_stats_->upstream_cx_pool_overflow_.value(), 1);
 }
 
 // Test that only the pool which are idle are actually cleared
@@ -416,7 +415,7 @@ TEST_F(ConnPoolMapImplDeathTest, ReentryClearTripsAssert) {
 
   test_map->getPool(1, getBasicFactory());
   ON_CALL(*mock_pools_[0], addIdleCallback(_))
-      .WillByDefault(Invoke([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); }));
+      .WillByDefault([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); });
 
   EXPECT_DEATH(test_map->addIdleCallback([&test_map]() { test_map->clear(); }),
                ".*Details: A resource should only be entered once");
@@ -427,7 +426,7 @@ TEST_F(ConnPoolMapImplDeathTest, ReentryGetPoolTripsAssert) {
 
   test_map->getPool(1, getBasicFactory());
   ON_CALL(*mock_pools_[0], addIdleCallback(_))
-      .WillByDefault(Invoke([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); }));
+      .WillByDefault([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); });
 
   EXPECT_DEATH(
       test_map->addIdleCallback([&test_map, this]() { test_map->getPool(2, getBasicFactory()); }),
@@ -439,7 +438,7 @@ TEST_F(ConnPoolMapImplDeathTest, ReentryDrainConnectionsTripsAssert) {
 
   test_map->getPool(1, getBasicFactory());
   ON_CALL(*mock_pools_[0], addIdleCallback(_))
-      .WillByDefault(Invoke([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); }));
+      .WillByDefault([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); });
 
   EXPECT_DEATH(test_map->addIdleCallback([&test_map]() { test_map->clear(); }),
                ".*Details: A resource should only be entered once");
@@ -450,7 +449,7 @@ TEST_F(ConnPoolMapImplDeathTest, ReentryAddDrainedCallbackTripsAssert) {
 
   test_map->getPool(1, getBasicFactory());
   ON_CALL(*mock_pools_[0], addIdleCallback(_))
-      .WillByDefault(Invoke([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); }));
+      .WillByDefault([](Http::ConnectionPool::Instance::IdleCb cb) { cb(); });
 
   EXPECT_DEATH(test_map->addIdleCallback([&test_map]() { test_map->addIdleCallback([]() {}); }),
                ".*Details: A resource should only be entered once");

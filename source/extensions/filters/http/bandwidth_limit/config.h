@@ -14,17 +14,25 @@ namespace BandwidthLimitFilter {
  * Config registration for the bandwidth limit filter. @see NamedHttpFilterConfigFactory.
  */
 class BandwidthLimitFilterConfig
-    : public Common::FactoryBase<
+    : public Common::UnifiedFactoryBase<
           envoy::extensions::filters::http::bandwidth_limit::v3::BandwidthLimit> {
 public:
-  BandwidthLimitFilterConfig() : FactoryBase("envoy.filters.http.bandwidth_limit") {}
+  BandwidthLimitFilterConfig() : UnifiedFactoryBase("envoy.filters.http.bandwidth_limit") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::bandwidth_limit::v3::BandwidthLimit& proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  // Shared factory creation used by the listener/cluster and route/vhost-level paths. Stats are
+  // scoped to the given scope.
+  static absl::StatusOr<Http::FilterFactoryCb> createFilterFactory(
+      const envoy::extensions::filters::http::bandwidth_limit::v3::BandwidthLimit& proto_config,
+      Server::Configuration::ServerFactoryContext& context, Stats::Scope& scope);
+
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::bandwidth_limit::v3::BandwidthLimit& proto_config,
       Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) override;
 };

@@ -1,3 +1,5 @@
+#include <optional>
+
 #include "contrib/kafka/filters/network/source/request_codec.h"
 #include "contrib/kafka/filters/network/test/buffer_based_test.h"
 #include "gmock/gmock.h"
@@ -5,7 +7,6 @@
 
 using testing::_;
 using testing::AnyNumber;
-using testing::Invoke;
 using testing::Return;
 
 namespace Envoy {
@@ -28,7 +29,7 @@ using MockParserSharedPtr = std::shared_ptr<MockParser>;
 
 class MockRequestParserResolver : public RequestParserResolver {
 public:
-  MockRequestParserResolver() : RequestParserResolver({}){};
+  MockRequestParserResolver() : RequestParserResolver({}) {};
   MOCK_METHOD(RequestParserSharedPtr, createParser, (int16_t, int16_t, RequestContextSharedPtr),
               (const));
 };
@@ -44,7 +45,7 @@ using MockRequestCallbackSharedPtr = std::shared_ptr<MockRequestCallback>;
 class RequestCodecUnitTest : public testing::Test, public BufferBasedTest {
 protected:
   MockParserFactory initial_parser_factory_{};
-  MockRequestParserResolver parser_resolver_{};
+  MockRequestParserResolver parser_resolver_;
   MockRequestCallbackSharedPtr callback_{std::make_shared<MockRequestCallback>()};
 };
 
@@ -58,7 +59,7 @@ TEST_F(RequestCodecUnitTest, ShouldDoNothingIfParserReturnsWaiting) {
   putGarbageIntoBuffer();
 
   MockParserSharedPtr parser = std::make_shared<MockParser>();
-  EXPECT_CALL(*parser, parse(_)).Times(AnyNumber()).WillRepeatedly(Invoke(consumeOneByte));
+  EXPECT_CALL(*parser, parse(_)).Times(AnyNumber()).WillRepeatedly(consumeOneByte);
 
   EXPECT_CALL(initial_parser_factory_, create(_)).WillOnce(Return(parser));
 
@@ -83,7 +84,7 @@ TEST_F(RequestCodecUnitTest, ShouldUseNewParserAsResponse) {
   MockParserSharedPtr parser3 = std::make_shared<MockParser>();
   EXPECT_CALL(*parser1, parse(_)).WillOnce(Return(RequestParseResponse::nextParser(parser2)));
   EXPECT_CALL(*parser2, parse(_)).WillOnce(Return(RequestParseResponse::nextParser(parser3)));
-  EXPECT_CALL(*parser3, parse(_)).Times(AnyNumber()).WillRepeatedly(Invoke(consumeOneByte));
+  EXPECT_CALL(*parser3, parse(_)).Times(AnyNumber()).WillRepeatedly(consumeOneByte);
 
   EXPECT_CALL(initial_parser_factory_, create(_)).WillOnce(Return(parser1));
   EXPECT_CALL(parser_resolver_, createParser(_, _, _)).Times(0);
@@ -113,7 +114,7 @@ TEST_F(RequestCodecUnitTest, ShouldPassParsedMessageToCallback) {
     data = {data.data() + data.size(), 0};
     return RequestParseResponse::parsedMessage(parsed_message);
   };
-  EXPECT_CALL(*all_consuming_parser, parse(_)).WillOnce(Invoke(consume_and_return));
+  EXPECT_CALL(*all_consuming_parser, parse(_)).WillOnce(consume_and_return);
 
   EXPECT_CALL(initial_parser_factory_, create(_)).WillOnce(Return(all_consuming_parser));
   EXPECT_CALL(parser_resolver_, createParser(_, _, _)).Times(0);
@@ -136,14 +137,14 @@ TEST_F(RequestCodecUnitTest, ShouldPassParsedMessageToCallbackAndInitializeNextP
   putGarbageIntoBuffer();
 
   const AbstractRequestSharedPtr parsed_message =
-      std::make_shared<Request<int32_t>>(RequestHeader{0, 0, 0, absl::nullopt}, 0);
+      std::make_shared<Request<int32_t>>(RequestHeader{0, 0, 0, std::nullopt}, 0);
 
   MockParserSharedPtr parser1 = std::make_shared<MockParser>();
   EXPECT_CALL(*parser1, parse(_))
       .WillOnce(Return(RequestParseResponse::parsedMessage(parsed_message)));
 
   MockParserSharedPtr parser2 = std::make_shared<MockParser>();
-  EXPECT_CALL(*parser2, parse(_)).Times(AnyNumber()).WillRepeatedly(Invoke(consumeOneByte));
+  EXPECT_CALL(*parser2, parse(_)).Times(AnyNumber()).WillRepeatedly(consumeOneByte);
 
   EXPECT_CALL(initial_parser_factory_, create(_))
       .WillOnce(Return(parser1))
@@ -167,14 +168,14 @@ TEST_F(RequestCodecUnitTest, ShouldPassParseFailureDataToCallback) {
   putGarbageIntoBuffer();
 
   const RequestParseFailureSharedPtr failure_data =
-      std::make_shared<RequestParseFailure>(RequestHeader{0, 0, 0, absl::nullopt});
+      std::make_shared<RequestParseFailure>(RequestHeader{0, 0, 0, std::nullopt});
 
   MockParserSharedPtr parser = std::make_shared<MockParser>();
   auto consume_and_return = [&failure_data](absl::string_view& data) -> RequestParseResponse {
     data = {data.data() + data.size(), 0};
     return RequestParseResponse::parseFailure(failure_data);
   };
-  EXPECT_CALL(*parser, parse(_)).WillOnce(Invoke(consume_and_return));
+  EXPECT_CALL(*parser, parse(_)).WillOnce(consume_and_return);
 
   EXPECT_CALL(initial_parser_factory_, create(_)).WillOnce(Return(parser));
   EXPECT_CALL(parser_resolver_, createParser(_, _, _)).Times(0);

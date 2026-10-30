@@ -17,6 +17,8 @@ public:
 
   MOCK_METHOD(uint64_t, baseId, (), (const));
   MOCK_METHOD(bool, useDynamicBaseId, (), (const));
+  MOCK_METHOD(bool, skipHotRestartOnNoParent, (), (const));
+  MOCK_METHOD(bool, skipHotRestartParentStats, (), (const));
   MOCK_METHOD(const std::string&, baseIdPath, (), (const));
   MOCK_METHOD(uint32_t, concurrency, (), (const));
   MOCK_METHOD(const std::string&, configPath, (), (const));
@@ -25,6 +27,8 @@ public:
   MOCK_METHOD(bool, allowUnknownStaticFields, (), (const));
   MOCK_METHOD(bool, rejectUnknownDynamicFields, (), (const));
   MOCK_METHOD(bool, ignoreUnknownDynamicFields, (), (const));
+  MOCK_METHOD(bool, skipDeprecatedLogs, (), (const));
+  MOCK_METHOD(bool, logStacktraceSingleEntry, (), (const));
   MOCK_METHOD(const std::string&, adminAddressPath, (), (const));
   MOCK_METHOD(Network::Address::IpVersion, localAddressIpVersion, (), (const));
   MOCK_METHOD(std::chrono::seconds, drainTime, (), (const));
@@ -34,11 +38,13 @@ public:
   MOCK_METHOD((const std::vector<std::pair<std::string, spdlog::level::level_enum>>&),
               componentLogLevels, (), (const));
   MOCK_METHOD(const std::string&, logFormat, (), (const));
+  MOCK_METHOD(bool, logFormatSet, (), (const));
   MOCK_METHOD(bool, logFormatEscaped, (), (const));
   MOCK_METHOD(bool, enableFineGrainLogging, (), (const));
   MOCK_METHOD(const std::string&, logPath, (), (const));
   MOCK_METHOD(uint64_t, restartEpoch, (), (const));
   MOCK_METHOD(std::chrono::milliseconds, fileFlushIntervalMsec, (), (const));
+  MOCK_METHOD(uint64_t, fileFlushMinSizeKB, (), (const));
   MOCK_METHOD(Mode, mode, (), (const));
   MOCK_METHOD(const std::string&, serviceClusterName, (), (const));
   MOCK_METHOD(const std::string&, serviceNodeName, (), (const));
@@ -52,11 +58,12 @@ public:
   MOCK_METHOD(Server::CommandLineOptionsPtr, toCommandLineOptions, (), (const));
   MOCK_METHOD(const std::string&, socketPath, (), (const));
   MOCK_METHOD(mode_t, socketMode, (), (const));
+  MOCK_METHOD((const Stats::TagVector&), statsTags, (), (const));
 
   std::string config_path_;
   envoy::config::bootstrap::v3::Bootstrap config_proto_;
   std::string config_yaml_;
-  absl::optional<uint32_t> bootstrap_version_;
+  std::optional<uint32_t> bootstrap_version_;
   bool allow_unknown_static_fields_{};
   bool reject_unknown_dynamic_fields_{};
   bool ignore_unknown_dynamic_fields_{};
@@ -76,6 +83,7 @@ public:
   std::vector<std::string> disabled_extensions_;
   std::string socket_path_;
   mode_t socket_mode_;
+  Stats::TagVector stats_tags_;
 };
 } // namespace Server
 } // namespace Envoy

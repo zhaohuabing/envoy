@@ -5,15 +5,18 @@
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/endpoint/v3/endpoint.pb.h"
 #include "envoy/config/endpoint/v3/endpoint.pb.validate.h"
+#include "envoy/config/xds_config_tracker.h"
+#include "envoy/config/xds_resources_delegate.h"
 #include "envoy/service/discovery/v3/discovery.pb.h"
 
 #include "source/common/common/hash.h"
 #include "source/common/config/api_version.h"
-#include "source/common/config/grpc_mux_impl.h"
-#include "source/common/config/grpc_subscription_impl.h"
-#include "source/common/config/xds_mux/grpc_mux_impl.h"
+#include "source/extensions/config_subscription/grpc/grpc_mux_impl.h"
+#include "source/extensions/config_subscription/grpc/grpc_subscription_impl.h"
+#include "source/extensions/config_subscription/grpc/xds_mux/grpc_mux_impl.h"
 
 #include "test/common/config/subscription_test_harness.h"
+#include "test/mocks/config/custom_config_validators.h"
 #include "test/mocks/config/mocks.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/grpc/mocks.h"
@@ -43,6 +46,9 @@ public:
       : method_descriptor_(Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
             "envoy.service.endpoint.v3.EndpointDiscoveryService.StreamEndpoints")),
         async_client_(new NiceMock<Grpc::MockAsyncClient>()),
+        resource_decoder_(std::make_shared<TestUtility::TestOpaqueResourceDecoderImpl<
+                              envoy::config::endpoint::v3::ClusterLoadAssignment>>("cluster_name")),
+        config_validators_(std::make_unique<NiceMock<MockCustomConfigValidators>>()),
         should_use_unified_(legacy_or_unified == Envoy::Config::LegacyOrUnified::Unified) {
     node_.set_id("fo0");
     EXPECT_CALL(local_info_, node()).WillRepeatedly(testing::ReturnRef(node_));
@@ -50,18 +56,34 @@ public:
 
     timer_ = new Event::MockTimer(&dispatcher_);
 
+    auto backoff_strategy = std::make_unique<JitteredExponentialBackOffStrategy>(
+        SubscriptionFactory::RetryInitialDelayMs, SubscriptionFactory::RetryMaxDelayMs, random_);
+
+    GrpcMuxContext grpc_mux_context{
+        /*async_client_=*/std::unique_ptr<Grpc::MockAsyncClient>(async_client_),
+        /*failover_async_client_=*/nullptr,
+        /*dispatcher_=*/dispatcher_,
+        /*service_method_=*/*method_descriptor_,
+        /*local_info_=*/local_info_,
+        /*rate_limit_settings_=*/rate_limit_settings_,
+        /*scope_=*/*stats_store_.rootScope(),
+        /*config_validators_=*/std::move(config_validators_),
+        /*xds_resources_delegate_=*/XdsResourcesDelegateOptRef(),
+        /*xds_config_tracker_=*/XdsConfigTrackerOptRef(),
+        /*backoff_strategy_=*/std::move(backoff_strategy),
+        /*target_xds_authority_=*/"",
+        /*eds_resources_cache_=*/nullptr,
+        /*skip_subsequent_node_=*/true};
+
     if (should_use_unified_) {
-      mux_ = std::make_shared<Config::XdsMux::GrpcMuxSotw>(
-          std::unique_ptr<Grpc::MockAsyncClient>(async_client_), dispatcher_, *method_descriptor_,
-          random_, stats_store_, rate_limit_settings_, local_info_, true);
+      mux_ = std::make_shared<Config::XdsMux::GrpcMuxSotw>(grpc_mux_context);
     } else {
-      mux_ = std::make_shared<Config::GrpcMuxImpl>(
-          local_info_, std::unique_ptr<Grpc::MockAsyncClient>(async_client_), dispatcher_,
-          *method_descriptor_, random_, stats_store_, rate_limit_settings_, true);
+      mux_ = std::make_shared<Config::GrpcMuxImpl>(grpc_mux_context);
     }
     subscription_ = std::make_unique<GrpcSubscriptionImpl>(
-        mux_, callbacks_, resource_decoder_, stats_, Config::TypeUrl::get().ClusterLoadAssignment,
-        dispatcher_, init_fetch_timeout, false, SubscriptionOptions());
+        mux_, callbacks_, resource_decoder_, stats_,
+        Config::TestTypeUrl::get().ClusterLoadAssignment, dispatcher_, init_fetch_timeout, false,
+        SubscriptionOptions());
   }
 
   ~GrpcSubscriptionTestHarness() override {
@@ -91,7 +113,7 @@ public:
       expected_request.set_version_info(version);
     }
     expected_request.set_response_nonce(last_response_nonce_);
-    expected_request.set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    expected_request.set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
     if (error_code != Grpc::Status::WellKnownGrpcStatus::Ok) {
       ::google::rpc::Status* error_detail = expected_request.mutable_error_detail();
       error_detail->set_code(error_code);
@@ -139,7 +161,7 @@ public:
     response->set_version_info(version);
     last_response_nonce_ = std::to_string(HashUtil::xxHash64(version));
     response->set_nonce(last_response_nonce_);
-    response->set_type_url(Config::TypeUrl::get().ClusterLoadAssignment);
+    response->set_type_url(Config::TestTypeUrl::get().ClusterLoadAssignment);
     response->mutable_control_plane()->set_identifier("ground_control_foo123");
     Protobuf::RepeatedPtrField<envoy::config::endpoint::v3::ClusterLoadAssignment> typed_resources;
     for (const auto& cluster : cluster_names) {
@@ -147,7 +169,7 @@ public:
           last_cluster_names_.end()) {
         envoy::config::endpoint::v3::ClusterLoadAssignment* load_assignment = typed_resources.Add();
         load_assignment->set_cluster_name(cluster);
-        response->add_resources()->PackFrom(*load_assignment);
+        std::ignore = response->add_resources()->PackFrom(*load_assignment);
       }
     }
     const auto decoded_resources =
@@ -181,7 +203,7 @@ public:
       // is no longer internally used by GrpcSubscriptionImpl.
       std::set<std::string> both;
       for (const auto& n : cluster_names) {
-        if (last_cluster_names_.find(n) != last_cluster_names_.end()) {
+        if (last_cluster_names_.contains(n)) {
           both.insert(n);
         }
       }
@@ -217,9 +239,9 @@ public:
   Event::MockTimer* ttl_timer_;
   envoy::config::core::v3::Node node_;
   NiceMock<Config::MockSubscriptionCallbacks> callbacks_;
-  TestUtility::TestOpaqueResourceDecoderImpl<envoy::config::endpoint::v3::ClusterLoadAssignment>
-      resource_decoder_{"cluster_name"};
+  OpaqueResourceDecoderSharedPtr resource_decoder_;
   NiceMock<LocalInfo::MockLocalInfo> local_info_;
+  CustomConfigValidatorsPtr config_validators_;
   NiceMock<Grpc::MockAsyncStream> async_stream_;
   GrpcMuxSharedPtr mux_;
   GrpcSubscriptionImplPtr subscription_;

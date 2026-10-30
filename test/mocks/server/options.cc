@@ -2,13 +2,14 @@
 
 #include "envoy/admin/v3/server_info.pb.h"
 
+#include "source/common/config/well_known_names.h"
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
 namespace Server {
 
-using ::testing::Invoke;
 using ::testing::Return;
 using ::testing::ReturnPointee;
 using ::testing::ReturnRef;
@@ -18,15 +19,16 @@ MockOptions::MockOptions(const std::string& config_path) : config_path_(config_p
   ON_CALL(*this, configPath()).WillByDefault(ReturnRef(config_path_));
   ON_CALL(*this, configProto()).WillByDefault(ReturnRef(config_proto_));
   ON_CALL(*this, configYaml()).WillByDefault(ReturnRef(config_yaml_));
-  ON_CALL(*this, allowUnknownStaticFields()).WillByDefault(Invoke([this] {
+  ON_CALL(*this, allowUnknownStaticFields()).WillByDefault([this] {
     return allow_unknown_static_fields_;
-  }));
-  ON_CALL(*this, rejectUnknownDynamicFields()).WillByDefault(Invoke([this] {
+  });
+  ON_CALL(*this, rejectUnknownDynamicFields()).WillByDefault([this] {
     return reject_unknown_dynamic_fields_;
-  }));
-  ON_CALL(*this, ignoreUnknownDynamicFields()).WillByDefault(Invoke([this] {
+  });
+  ON_CALL(*this, ignoreUnknownDynamicFields()).WillByDefault([this] {
     return ignore_unknown_dynamic_fields_;
-  }));
+  });
+  ON_CALL(*this, skipDeprecatedLogs()).WillByDefault(Return(false));
   ON_CALL(*this, adminAddressPath()).WillByDefault(ReturnRef(admin_address_path_));
   ON_CALL(*this, serviceClusterName()).WillByDefault(ReturnRef(service_cluster_name_));
   ON_CALL(*this, serviceNodeName()).WillByDefault(ReturnRef(service_node_name_));
@@ -40,11 +42,12 @@ MockOptions::MockOptions(const std::string& config_path) : config_path_(config_p
   ON_CALL(*this, coreDumpEnabled()).WillByDefault(ReturnPointee(&core_dump_enabled_));
   ON_CALL(*this, cpusetThreadsEnabled()).WillByDefault(ReturnPointee(&cpuset_threads_enabled_));
   ON_CALL(*this, disabledExtensions()).WillByDefault(ReturnRef(disabled_extensions_));
-  ON_CALL(*this, toCommandLineOptions()).WillByDefault(Invoke([] {
+  ON_CALL(*this, toCommandLineOptions()).WillByDefault([] {
     return std::make_unique<envoy::admin::v3::CommandLineOptions>();
-  }));
+  });
   ON_CALL(*this, socketPath()).WillByDefault(ReturnRef(socket_path_));
   ON_CALL(*this, socketMode()).WillByDefault(ReturnPointee(&socket_mode_));
+  ON_CALL(*this, statsTags()).WillByDefault(ReturnRef(stats_tags_));
 }
 
 MockOptions::~MockOptions() = default;

@@ -11,57 +11,77 @@ namespace Formatter {
 
 namespace {
 
-void truncate(std::string& str, absl::optional<uint32_t> max_length) {
+absl::string_view truncate(absl::string_view str, std::optional<size_t> max_length) {
   if (!max_length) {
-    return;
+    return str;
   }
 
-  str = str.substr(0, max_length.value());
+  return str.substr(0, max_length.value());
 }
 
 } // namespace
 
-ReqWithoutQuery::ReqWithoutQuery(const std::string& main_header,
-                                 const std::string& alternative_header,
-                                 absl::optional<size_t> max_length)
+ReqWithoutQuery::ReqWithoutQuery(absl::string_view main_header,
+                                 absl::string_view alternative_header,
+                                 std::optional<size_t> max_length)
     : main_header_(main_header), alternative_header_(alternative_header), max_length_(max_length) {}
 
-absl::optional<std::string> ReqWithoutQuery::format(const Http::RequestHeaderMap& request,
-                                                    const Http::ResponseHeaderMap&,
-                                                    const Http::ResponseTrailerMap&,
-                                                    const StreamInfo::StreamInfo&,
-                                                    absl::string_view) const {
-  const Http::HeaderEntry* header = findHeader(request);
+std::optional<std::string> ReqWithoutQuery::format(const Envoy::Formatter::Context& context,
+                                                   const StreamInfo::StreamInfo&) const {
+  const Http::HeaderEntry* header = findHeader(context.requestHeaders());
   if (!header) {
-    return absl::nullopt;
+    return std::nullopt;
   }
 
-  std::string val = Http::Utility::stripQueryString(header->value());
-  truncate(val, max_length_);
+  absl::string_view val = Http::Utility::stripQueryStringView(header->value().getStringView());
+  val = truncate(val, max_length_);
 
-  return val;
+  return std::string(val);
 }
 
-ProtobufWkt::Value ReqWithoutQuery::formatValue(const Http::RequestHeaderMap& request,
-                                                const Http::ResponseHeaderMap&,
-                                                const Http::ResponseTrailerMap&,
-                                                const StreamInfo::StreamInfo&,
-                                                absl::string_view) const {
-  const Http::HeaderEntry* header = findHeader(request);
+Protobuf::Value ReqWithoutQuery::formatValue(const Envoy::Formatter::Context& context,
+                                             const StreamInfo::StreamInfo&) const {
+  const Http::HeaderEntry* header = findHeader(context.requestHeaders());
   if (!header) {
     return ValueUtil::nullValue();
   }
 
-  std::string val = Http::Utility::stripQueryString(header->value());
-  truncate(val, max_length_);
+  absl::string_view val = Http::Utility::stripQueryStringView(header->value().getStringView());
+  val = truncate(val, max_length_);
   return ValueUtil::stringValue(val);
 }
 
-const Http::HeaderEntry* ReqWithoutQuery::findHeader(const Http::HeaderMap& headers) const {
-  const auto header = headers.get(main_header_);
+bool ReqWithoutQuery::formatTo(std::string& sink, const Envoy::Formatter::Context& context,
+                               const StreamInfo::StreamInfo&) const {
+  const Http::HeaderEntry* header = findHeader(context.requestHeaders());
+  if (!header) {
+    return false;
+  }
+  absl::string_view val = Http::Utility::stripQueryStringView(header->value().getStringView());
+  sink.append(truncate(val, max_length_));
+  return true;
+}
+
+void ReqWithoutQuery::formatValueTo(Envoy::Formatter::ValueSink& sink,
+                                    const Envoy::Formatter::Context& context,
+                                    const StreamInfo::StreamInfo&) const {
+  const Http::HeaderEntry* header = findHeader(context.requestHeaders());
+  if (!header) {
+    // Keep the sink unmodified so the caller can decide how to handle the missing value.
+    return;
+  }
+  absl::string_view val = Http::Utility::stripQueryStringView(header->value().getStringView());
+  sink.addString(truncate(val, max_length_));
+}
+
+const Http::HeaderEntry* ReqWithoutQuery::findHeader(OptRef<const Http::HeaderMap> headers) const {
+  if (!headers.has_value()) {
+    return nullptr;
+  }
+  const auto header = headers->get(main_header_);
 
   if (header.empty() && !alternative_header_.get().empty()) {
-    const auto alternate_header = headers.get(alternative_header_);
+    const auto alternate_header = headers->get(alternative_header_);
     // TODO(https://github.com/envoyproxy/envoy/issues/13454): Potentially log all header values.
     return alternate_header.empty() ? nullptr : alternate_header[0];
   }
@@ -69,17 +89,15 @@ const Http::HeaderEntry* ReqWithoutQuery::findHeader(const Http::HeaderMap& head
   return header.empty() ? nullptr : header[0];
 }
 
-::Envoy::Formatter::FormatterProviderPtr
-ReqWithoutQueryCommandParser::parse(const std::string& token, size_t, size_t) const {
-  if (absl::StartsWith(token, "REQ_WITHOUT_QUERY(")) {
-    std::string main_header, alternative_header;
-    absl::optional<size_t> max_length;
-
-    Envoy::Formatter::SubstitutionFormatParser::parseCommandHeader(
-        token, ReqWithoutQueryParamStart, main_header, alternative_header, max_length);
-    return std::make_unique<ReqWithoutQuery>(main_header, alternative_header, max_length);
+absl::StatusOr<Envoy::Formatter::FormatterProviderPtr>
+ReqWithoutQueryCommandParser::parse(absl::string_view command, absl::string_view subcommand,
+                                    std::optional<size_t> max_length) const {
+  if (command == "REQ_WITHOUT_QUERY") {
+    auto status_or = Envoy::Formatter::SubstitutionFormatUtils::parseSubcommandHeaders(subcommand);
+    THROW_IF_NOT_OK_REF(status_or.status());
+    return std::make_unique<ReqWithoutQuery>(status_or.value().first, status_or.value().second,
+                                             max_length);
   }
-
   return nullptr;
 }
 

@@ -19,7 +19,7 @@ namespace ThriftProxy {
  */
 class AutoTransportImpl : public Transport {
 public:
-  AutoTransportImpl() : name_(TransportNames::get().AUTO){};
+  AutoTransportImpl() : name_(TransportNames::get().AUTO) {};
 
   // Transport
   const std::string& name() const override { return name_; }
@@ -44,7 +44,7 @@ public:
   }
 
 private:
-  TransportPtr transport_{};
+  TransportPtr transport_;
   std::string name_;
 };
 

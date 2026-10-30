@@ -6,7 +6,7 @@ Redis
 Envoy can act as a Redis proxy, partitioning commands among instances in a cluster.
 In this mode, the goals of Envoy are to maintain availability and partition tolerance
 over consistency. This is the key point when comparing Envoy to `Redis Cluster
-<https://redis.io/topics/cluster-spec>`_. Envoy is designed as a best-effort cache,
+<https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/>`_. Envoy is designed as a best-effort cache,
 meaning that it will not try to reconcile inconsistent data or keep a globally consistent
 view of cluster membership. It also supports routing commands from different workloads to
 different upstream clusters based on their access patterns, eviction, or isolation
@@ -14,12 +14,13 @@ requirements.
 
 The Redis project offers a thorough reference on partitioning as it relates to Redis. See
 "`Partitioning: how to split data among multiple Redis instances
-<https://redis.io/topics/partitioning>`_".
+<https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/>`_".
 
 **Features of Envoy Redis**:
 
-* `Redis protocol <https://redis.io/topics/protocol>`_ codec.
+* `Redis protocol <https://redis.io/docs/latest/develop/reference/protocol-spec/>`_ codec.
 * Hash-based partitioning.
+* Redis transaction support.
 * Ketama distribution.
 * Detailed command statistics.
 * Active and passive healthchecking.
@@ -62,16 +63,16 @@ close map to 5xx. All other responses from Redis are counted as a success.
 
 .. _arch_overview_redis_cluster_support:
 
-Redis Cluster Support (Experimental)
-----------------------------------------
+Redis Cluster Support
+---------------------
 
-Envoy currently offers experimental support for `Redis Cluster <https://redis.io/topics/cluster-spec>`_.
+Envoy offers support for `Redis Cluster <https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/>`_.
 
 When using Envoy as a sidecar proxy for a Redis Cluster, the service can use a non-cluster Redis client
 implemented in any language to connect to the proxy as if it's a single node Redis instance.
 The Envoy proxy will keep track of the cluster topology and send commands to the correct Redis node in the
-cluster according to the `spec <https://redis.io/topics/cluster-spec>`_. Advance features such as reading
-from replicas can also be added to the Envoy proxy instead of updating redis clients in each language.
+cluster according to the `spec <https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/>`_. Advance features such as reading
+from replicas can also be added to the Envoy proxy instead of updating Redis clients in each language.
 
 Envoy proxy tracks the topology of the cluster by sending periodic
 `cluster slots <https://redis.io/commands/cluster-slots>`_ commands to a random node in the cluster, and maintains the
@@ -80,6 +81,8 @@ following information:
 * List of known nodes.
 * The primaries for each shard.
 * Nodes entering or leaving the cluster.
+
+Envoy proxy supports identification of the nodes via both IP address and hostnames in the ``cluster slots`` command response. In case of failure to resolve a primary hostname, Envoy will retry resolution of all nodes periodically until success. Failure to resolve a replica simply skips that replica. On the other hand, if the :ref:`enable_redirection <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_redirection>` option is set and a MOVED or ASK response containing a hostname is received Envoy will not automatically do a DNS lookup and instead bubble the error to the client verbatim. To have Envoy do the DNS lookup and follow the redirection, you need to configure the DNS cache option :ref:`dns_cache_config <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.dns_cache_config>` under the connection pool settings. For a configuration example on how to enable DNS lookups for redirections, see the filter :ref:`configuration reference <config_network_filters_redis_proxy>`.
 
 For topology configuration details, see the Redis Cluster
 :ref:`v3 API reference <envoy_v3_api_msg_extensions.clusters.redis.v3.RedisClusterConfig>`.
@@ -92,6 +95,7 @@ Every Redis cluster has its own extra statistics tree rooted at *cluster.<name>.
 
   max_upstream_unknown_connections_reached, Counter, Total number of times that an upstream connection to an unknown host is not created after redirection having reached the connection pool's max_upstream_unknown_connections limit
   upstream_cx_drained, Counter, Total number of upstream connections drained of active requests before being closed
+  upstream_resp3_hello_failure, Counter, "Total number of upstream ``HELLO 3`` negotiations that did not result in a successful RESP3 handshake (error reply, wrong reply shape, connection error, or non-3 ``proto`` field). Incremented only when the listener's ``protocol_version`` is ``RESP3``."
   upstream_commands.upstream_rq_time, Histogram, Histogram of upstream request times for all types of requests
 
 .. _arch_overview_redis_cluster_command_stats:
@@ -107,19 +111,74 @@ Per-cluster command statistics can be enabled via the setting :ref:`enable_comma
   upstream_commands.[command].total, Counter, Total number of requests for a specific Redis command (sum of success and failure)
   upstream_commands.[command].latency, Histogram, Latency of requests for a specific Redis command
 
+Transactions
+------------
+
+Transactions (MULTI) are supported. Their use is no different from regular Redis: you start a transaction with MULTI,
+and you execute it with EXEC. Within the transaction, from the list of commands supported by Envoy (see below), only single-key
+commands (e.g. GET, SET), multi-key commands (e.g. DEL, MSET) and transaction commands (e.g. WATCH, UNWATCH, DISCARD, EXEC) are supported.
+Commands configured via :ref:`custom_commands
+<envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.custom_commands>` are also supported within
+transactions and are treated as single-key commands.
+
+
+When working in Redis Cluster mode, Envoy will relay all the commands in the transaction to the node handling the first
+key-based command in the transaction. If this command is multi-key, it will send it to the server corresponding to the first key
+in the command. It is the user's responsibility to ensure that all keys in the transaction are mapped to the same hashslot, as
+commands will not be redirected.
+
 Supported commands
 ------------------
 
-At the protocol level, pipelines are supported. MULTI (transaction block) is not.
+At the protocol level, pipelines are supported.
 Use pipelining wherever possible for the best performance.
 
-At the command level, Envoy only supports commands that can be reliably hashed to a server. AUTH and PING
-are the only exceptions. AUTH is processed locally by Envoy if a downstream password has been configured,
+At the command level, Envoy only supports commands that can be reliably hashed to a server. AUTH, PING, ECHO and INFO
+are exceptions, as are HELLO, QUIT, and the CLIENT SETNAME and CLIENT SETINFO subcommands that Envoy handles
+locally. AUTH is processed locally by Envoy if a downstream password has been configured,
 and no other commands will be processed until authentication is successful when a password has been
-configured. Envoy will transparently issue AUTH commands upon connecting to upstream servers, if upstream
-authentication passwords are configured for the cluster. Envoy responds to PING immediately with PONG.
-Arguments to PING are not allowed. All other supported commands must contain a key. Supported commands are
-functionally identical to the original Redis command except possibly in failure scenarios.
+configured. If an external authentication provider is set, Envoy will instead send the authentication arguments
+to an external service and act according to the authentication response. If a downstream password is set together
+with external authentication, the validation will be done still externally and the downstream password used for
+upstream authentication. Envoy will transparently issue AUTH commands upon connecting to upstream servers,
+if upstream authentication passwords are configured for the cluster. Envoy responds to PING immediately with PONG.
+Arguments to PING are not allowed. Envoy responds to ECHO immediately with the command argument.
+All other supported commands must contain a key. Supported commands are functionally identical to the
+original Redis command except possibly in failure scenarios.
+
+RESP Protocol
+^^^^^^^^^^^^^
+Envoy Redis proxy supports RESP2 and RESP3, selected by the listener's
+:ref:`RedisProxy.protocol_version
+<envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.protocol_version>`.
+This single knob governs both downstream connections and every routed upstream conn pool —
+there is no separate per-cluster RESP knob and no implicit floor across clusters.
+
+The listener pins one RESP version end-to-end rather than translating between them, because
+RESP2 and RESP3 diverge structurally: some replies have no transparent mapping (for example
+``ZRANGE WITHSCORES`` is a flat array under RESP2 but a nested array of pairs under RESP3).
+The proxy therefore does not cross-encode upstream responses — a reply is always emitted
+downstream in the RESP version it arrived in. The exception is cluster-scope aggregate commands such as
+``CONFIG GET`` and ``KEYS``, whose per-shard replies are combined into one flat array even when a shard
+answers with a RESP3 Map. Unsolicited RESP3 ``Push`` frames from upstream
+are dropped rather than forwarded downstream (the proxy routes no Push-producing feature on
+ordinary request/response connections, and forwarding one would desynchronize the reply FIFO).
+
+For the full ``HELLO 3`` negotiation, ``-NOPROTO`` gating of pre-handshake data commands,
+downstream ``HELLO N AUTH`` handling, the locally-synthesized ``HELLO`` reply, and the
+``upstream_resp3_hello_failure`` stat, see the :ref:`RESP protocol version
+<config_network_filters_redis_proxy_protocol_version>` section of the Redis proxy filter
+configuration.
+
+INFO command
+^^^^^^^^^^^^
+INFO command is handled by Envoy differently it aggregates metrics across all shards and returns consolidated cluster-wide statistics.
+An optional section parameter can be provided to filter the output (e.g., INFO memory).
+INFO.SHARD is an Envoy-specific command introduced for debugging purposes that queries a specific shard by index
+and returns that shard's complete INFO response (e.g., INFO.SHARD 0 memory).
+Shard numbering starts from 0 and shards are ordered from lowest to highest slot assignment.
+when using INFO.SHARD command, if the provided shard index is invalid, Envoy will return an error.
+when using INFO.SHARD command, via redis-cli, make sure to use --raw flag to get the proper output format.
 
 For details on each command's usage see the official
 `Redis command reference <https://redis.io/commands>`_.
@@ -129,29 +188,61 @@ For details on each command's usage see the official
   :widths: 1, 1
 
   AUTH, Authentication
+  CLIENT, Connection
+  ECHO, Connection
+  HELLO, Connection
   PING, Connection
+  QUIT, Connection
   DEL, Generic
+  DISCARD, Transaction
   DUMP, Generic
+  EXEC, Transaction
   EXISTS, Generic
   EXPIRE, Generic
   EXPIREAT, Generic
+  KEYS, String
   PERSIST, Generic
   PEXPIRE, Generic
   PEXPIREAT, Generic
   PTTL, Generic
   RESTORE, Generic
+  SELECT, Generic
   TOUCH, Generic
   TTL, Generic
   TYPE, Generic
   UNLINK, Generic
+  COPY, Generic
+  RENAME, Generic
+  RENAMENX, Generic
+  SORT, Generic
+  SORT_RO, Generic
+  SCRIPT, Generic
+  FLUSHALL, Generic
+  FLUSHDB, Generic
+  SLOWLOG, Generic
+  CONFIG, Generic
+  CLUSTER INFO, Generic
+  CLUSTER SLOTS, Generic
+  CLUSTER KEYSLOT, Generic
+  CLUSTER NODES, Generic
+  CLUSTER SHARDS, Generic
+  RANDOMKEY, Generic
+  OBJECT, Generic
   GEOADD, Geo
   GEODIST, Geo
   GEOHASH, Geo
   GEOPOS, Geo
   GEORADIUS_RO, Geo
   GEORADIUSBYMEMBER_RO, Geo
+  GEOSEARCH, Geo
+  GEOSEARCHSTORE, Geospatial
+  GEORADIUS, Geospatial
+  GEORADIUSBYMEMBER, Geospatial
   HDEL, Hash
   HEXISTS, Hash
+  HEXPIRE, Hash
+  HEXPIREAT, Hash
+  HEXPIRETIME, Hash
   HGET, Hash
   HGETALL, Hash
   HINCRBY, Hash
@@ -160,11 +251,21 @@ For details on each command's usage see the official
   HLEN, Hash
   HMGET, Hash
   HMSET, Hash
+  HPERSIST, Hash
+  HPEXPIRE, Hash
+  HPEXPIREAT, Hash
+  HPEXPIRETIME, Hash
+  HPTTL, Hash
+  HRANDFIELD, Hash
   HSCAN, Hash
   HSET, Hash
   HSETNX, Hash
   HSTRLEN, Hash
+  HTTL, Hash
   HVALS, Hash
+  PFADD, HyperLogLog
+  PFCOUNT, HyperLogLog
+  PFMERGE, HyperLogLog
   LINDEX, List
   LINSERT, List
   LLEN, List
@@ -175,9 +276,13 @@ For details on each command's usage see the official
   LREM, List
   LSET, List
   LTRIM, List
+  LPOS, List
+  RPOPLPUSH, List
+  MULTI, Transaction
   RPOP, List
   RPUSH, List
   RPUSHX, List
+  PUBLISH, Pubsub
   EVAL, Scripting
   EVALSHA, Scripting
   SADD, Set
@@ -187,7 +292,18 @@ For details on each command's usage see the official
   SPOP, Set
   SRANDMEMBER, Set
   SREM, Set
+  SCAN, Generic
   SSCAN, Set
+  SDIFF, Set
+  SDIFFSTORE, Set
+  SINTER, Set
+  SINTERSTORE, Set
+  SMISMEMBER, Set
+  SMOVE, Set
+  SUNION, Set
+  SUNIONSTORE, Set
+  WATCH, String
+  UNWATCH, String
   ZADD, Sorted Set
   ZCARD, Sorted Set
   ZCOUNT, Sorted Set
@@ -209,19 +325,34 @@ For details on each command's usage see the official
   ZPOPMAX, Sorted Set
   ZSCAN, Sorted Set
   ZSCORE, Sorted Set
+  ZDIFF, Sorted Set
+  ZDIFFSTORE, Sorted Set
+  ZINTER, Sorted Set
+  ZINTERSTORE, Sorted Set
+  ZMSCORE, Sorted Set
+  ZRANDMEMBER, Sorted Set
+  ZRANGESTORE, Sorted Set
+  ZUNION, Sorted Set
+  ZUNIONSTORE, Sorted Set
   APPEND, String
   BITCOUNT, String
   BITFIELD, String
+  BITFIELD_RO, String
   BITPOS, String
   DECR, String
   DECRBY, String
   GET, String
   GETBIT, String
+  GETDEL, String
+  GETEX, String
   GETRANGE, String
   GETSET, String
   INCR, String
   INCRBY, String
   INCRBYFLOAT, String
+  INFO, Server
+  INFO.SHARD, Server
+  ROLE, Server
   MGET, String
   MSET, String
   PSETEX, String
@@ -231,6 +362,29 @@ For details on each command's usage see the official
   SETNX, String
   SETRANGE, String
   STRLEN, String
+  MSETNX, String
+  SUBSTR, String
+  XACK, Stream
+  XADD, Stream
+  XAUTOCLAIM, Stream
+  XCLAIM, Stream
+  XDEL, Stream
+  XLEN, Stream
+  XPENDING, Stream
+  XRANGE, Stream
+  XREVRANGE, Stream
+  XTRIM, Stream
+  BF.ADD, Bloom
+  BF.CARD, Bloom
+  BF.EXISTS, Bloom
+  BF.INFO, Bloom
+  BF.INSERT, Bloom
+  BF.LOADCHUNK, Bloom
+  BF.MADD, Bloom
+  BF.MEXISTS, Bloom
+  BF.RESERVE, Bloom
+  BF.SCANDUMP, Bloom
+  BITOP, Bitmap
 
 Failure modes
 -------------
@@ -251,7 +405,7 @@ Envoy can also generate its own errors in response to the client.
   the connection."
   invalid request, "Command was rejected by the first stage of the command splitter due to
   datatype or length."
-  unsupported command, "The command was not recognized by Envoy and therefore cannot be serviced
+  ERR unknown command, "The command was not recognized by Envoy and therefore cannot be serviced
   because it cannot be hashed to a backend server."
   finished with n errors, "Fragmented commands which sum the response (e.g. DEL) will return the
   total number of errors received if any were received."
@@ -260,10 +414,12 @@ Envoy can also generate its own errors in response to the client.
   wrong number of arguments for command, "Certain commands check in Envoy that the number of
   arguments is correct."
   "NOAUTH Authentication required.", "The command was rejected because a downstream authentication
-  password has been set and the client has not successfully authenticated."
+  password or external authentication have been set and the client has not successfully authenticated."
   ERR invalid password, "The authentication command failed due to an invalid password."
+  ERR <external-message>, "The authentication command failed on the external auth provider."
   "ERR Client sent AUTH, but no password is set", "An authentication command was received, but no
-  downstream authentication password has been configured."
+  downstream authentication password or external authentication provider have been configured."
+  ERR invalid cursor, "The iteration command failed due to an invalid or unrecognized cursor."
 
 
 In the case of MGET, each individual key that cannot be fetched will generate an error response.
@@ -278,3 +434,9 @@ response for each in place of the value.
   3) (error) upstream failure
   4) (error) upstream failure
   5) "echo"
+
+Protocol
+--------
+
+Although `RESP <https://redis.io/docs/latest/develop/reference/protocol-spec/>`_ is recommended for production use,
+`inline commands <https://redis.io/docs/latest/develop/reference/protocol-spec/#inline-commands>`_ are also supported.

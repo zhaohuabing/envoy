@@ -23,6 +23,67 @@ endpoints in a locality, then a weighted round robin schedule is used, where
 higher weighted endpoints will appear more often in the rotation to achieve the
 effective weighting.
 
+.. _arch_overview_load_balancing_types_client_side_weighted_round_robin:
+
+Client-side weighted round robin
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Envoy also provides a client-side weighted round robin policy implemented as an
+extension: :ref:`ClientSideWeightedRoundRobin
+<envoy_v3_api_msg_extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin>`.
+Unlike classic round robin, endpoint weights are derived from load reports sent by
+upstreams via ORCA (Open Request Cost Aggregation), incorporating queries-per-second (QPS),
+errors-per-second (EPS) and utilization to adaptively balance load.
+
+Endpoint weights are recomputed periodically from each endpoint's most recent ORCA
+report as ``qps / (utilization + eps/qps * error_utilization_penalty)``, where
+``qps`` is the report's ``rps_fractional`` field. Both ``qps`` and the final
+``utilization`` (resolved utilization plus any error penalty) must be greater than 0;
+a report that fails either requirement is ignored. Utilization is resolved in the
+following order, taking the first source whose value is greater than 0 (precedence
+may be flipped by the ``envoy.reloadable_features.orca_weight_manager_use_named_metrics_first``
+runtime feature). By default:
+
+1. Named metrics via ``metric_names_for_computing_utilization`` -- max of present
+   values.
+2. ``application_utilization``.
+3. ``cpu_utilization`` -- final fallback.
+
+While an endpoint has no valid weight -- because its reports are being ignored, or
+during the initial ``blackout_period``, or after ``weight_expiration_period`` has
+elapsed -- it is assigned the median weight of the endpoints that currently have a
+valid weight (or 1 if none are valid).
+
+This policy supports:
+
+- :ref:`Slow start <arch_overview_load_balancing_slow_start>` via
+  :ref:`SlowStartConfig
+  <envoy_v3_api_msg_extensions.load_balancing_policies.common.v3.SlowStartConfig>`, allowing
+  new or recovered endpoints to ramp up traffic gradually.
+
+Note that ClientSideWeightedRoundRobin is intended to select endpoints only within a single
+locality. To use ClientSideWeightedRoundRobin across multiple localities, configure it as the
+child endpoint-picking policy under the :ref:`WrrLocality
+<envoy_v3_api_msg_extensions.load_balancing_policies.wrr_locality.v3.WrrLocality>` policy.
+
+Example configuration using WrrLocality with ClientSideWeightedRoundRobin as child:
+
+.. code-block:: yaml
+
+  load_balancing_policy:
+    policies:
+    - typed_extension_config:
+        name: envoy.load_balancing_policies.wrr_locality
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.wrr_locality.v3.WrrLocality
+          endpoint_picking_policy:
+            typed_extension_config:
+              name: envoy.load_balancing_policies.client_side_weighted_round_robin
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.client_side_weighted_round_robin.v3.ClientSideWeightedRoundRobin
+
+See the API reference above for full configuration details.
+
 .. _arch_overview_load_balancing_types_least_request:
 
 Weighted least request
@@ -36,9 +97,10 @@ same or different weights.
   host which has the fewest active requests (`Mitzenmacher et al.
   <https://www.eecs.harvard.edu/~michaelm/postscripts/handbook2001.pdf>`_ has shown that this
   approach is nearly as good as an O(N) full scan). This is also known as P2C (power of two
-  choices). The P2C load balancer has the property that a host with the highest number of active
-  requests in the cluster will never receive new requests. It will be allowed to drain until it is
-  less than or equal to all of the other hosts.
+  choices). The P2C load balancer has the property that host weights will decrease as the number of
+  active requests on those hosts increases. P2C selection is particularly useful for load
+  balancer implementations due to its resistance to
+  `herding behavior <https://en.wikipedia.org/wiki/Thundering_herd_problem>`_.
 * *all weights not equal*:  If two or more hosts in the cluster have different load balancing
   weights, the load balancer shifts into a mode where it uses a weighted round robin schedule in
   which weights are dynamically adjusted based on the host's request load at the time of selection.
@@ -138,10 +200,12 @@ are underrepresented or missing.
 
 In general, when compared to the ring hash ("ketama") algorithm, Maglev has substantially faster
 table lookup build times as well as host selection times (approximately 10x and 5x respectively
-when using a large ring size of 256K entries). The downside of Maglev is that it is not as stable
-as ring hash. More keys will move position when hosts are removed (simulations show approximately
-double the keys will move). With that said, for many applications including Redis, Maglev is very
-likely a superior drop in replacement for ring hash. The advanced reader can use
+when using a large ring size of 256K entries). While Maglev aims for minimal disruption, it is not
+as stable as ring hash when upstream hosts change. More keys will move position when hosts are removed
+(simulations show approximately double the keys will move). The amount of disruption can be minimized
+by increasing the :ref:`table_size<envoy_v3_api_field_config.cluster.v3.Cluster.MaglevLbConfig.table_size>`.
+With that said, for many applications
+including Redis, Maglev is very likely a superior drop in replacement for ring hash. The advanced reader can use
 :repo:`this benchmark </test/common/upstream/load_balancer_benchmark.cc>` to compare ring hash
 versus Maglev with different parameters.
 

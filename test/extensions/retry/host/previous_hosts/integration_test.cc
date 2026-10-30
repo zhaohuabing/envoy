@@ -1,3 +1,6 @@
+#include "envoy/config/route/v3/route_components.pb.h"
+#include "envoy/config/route/v3/route_components.pb.validate.h"
+
 #include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/utility.h"
 
@@ -32,6 +35,8 @@ routes:
       retry_on: 5xx
       retry_host_predicate:
       - name: envoy.retry_host_predicates.previous_hosts
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
 )EOF";
 
     envoy::config::route::v3::VirtualHost virtual_host;

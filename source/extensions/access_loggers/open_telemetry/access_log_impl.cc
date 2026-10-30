@@ -7,7 +7,6 @@
 #include "envoy/extensions/access_loggers/grpc/v3/als.pb.h"
 #include "envoy/extensions/access_loggers/open_telemetry/v3/logs_service.pb.h"
 
-#include "source/common/common/assert.h"
 #include "source/common/config/utility.h"
 #include "source/common/formatter/substitution_formatter.h"
 #include "source/common/http/headers.h"
@@ -15,6 +14,8 @@
 #include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/utility.h"
 #include "source/common/stream_info/utility.h"
+#include "source/extensions/access_loggers/open_telemetry/otlp_log_utils.h"
+#include "source/extensions/access_loggers/open_telemetry/substitution_formatter.h"
 
 #include "opentelemetry/proto/collector/logs/v1/logs_service.pb.h"
 #include "opentelemetry/proto/common/v1/common.pb.h"
@@ -35,43 +36,51 @@ AccessLog::ThreadLocalLogger::ThreadLocalLogger(GrpcAccessLoggerSharedPtr logger
 AccessLog::AccessLog(
     ::Envoy::AccessLog::FilterPtr&& filter,
     envoy::extensions::access_loggers::open_telemetry::v3::OpenTelemetryAccessLogConfig config,
-    ThreadLocal::SlotAllocator& tls, GrpcAccessLoggerCacheSharedPtr access_logger_cache)
+    ThreadLocal::SlotAllocator& tls, GrpcAccessLoggerCacheSharedPtr access_logger_cache,
+    const std::vector<Formatter::CommandParserPtr>& commands)
     : Common::ImplBase(std::move(filter)), tls_slot_(tls.allocateSlot()),
-      access_logger_cache_(std::move(access_logger_cache)) {
+      access_logger_cache_(std::move(access_logger_cache)),
+      filter_state_objects_to_log_(getFilterStateObjectsToLog(config)),
+      custom_tags_(getCustomTags(config, commands)) {
 
-  Envoy::Config::Utility::checkTransportVersion(config.common_config());
+  THROW_IF_NOT_OK(Envoy::Config::Utility::checkTransportVersion(config.common_config()));
   tls_slot_->set([this, config](Event::Dispatcher&) {
-    return std::make_shared<ThreadLocalLogger>(access_logger_cache_->getOrCreateLogger(
-        config.common_config(), Common::GrpcAccessLoggerType::HTTP));
+    return std::make_shared<ThreadLocalLogger>(
+        access_logger_cache_->getOrCreateLogger(config, Common::GrpcAccessLoggerType::HTTP));
   });
 
-  ProtobufWkt::Struct body_format;
-  MessageUtil::jsonConvert(config.body(), body_format);
-  body_formatter_ = std::make_unique<Formatter::StructFormatter>(body_format, false, false);
-  ProtobufWkt::Struct attributes_format;
-  MessageUtil::jsonConvert(config.attributes(), attributes_format);
-  attributes_formatter_ =
-      std::make_unique<Formatter::StructFormatter>(attributes_format, false, false);
+  // Packing the body "AnyValue" to a "KeyValueList" only if it's not empty, otherwise the
+  // formatter would fail to parse it.
+  if (config.body().value_case() != ::opentelemetry::proto::common::v1::AnyValue::VALUE_NOT_SET) {
+    body_formatter_ = std::make_unique<OpenTelemetryFormatter>(packBody(config.body()), commands);
+  }
+  attributes_formatter_ = std::make_unique<OpenTelemetryFormatter>(config.attributes(), commands);
 }
 
-void AccessLog::emitLog(const Http::RequestHeaderMap& request_headers,
-                        const Http::ResponseHeaderMap& response_headers,
-                        const Http::ResponseTrailerMap& response_trailers,
+void AccessLog::emitLog(const Formatter::Context& log_context,
                         const StreamInfo::StreamInfo& stream_info) {
   opentelemetry::proto::logs::v1::LogRecord log_entry;
   log_entry.set_time_unix_nano(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    stream_info.startTime().time_since_epoch())
                                    .count());
-  const auto formatted_body = body_formatter_->format(
-      request_headers, response_headers, response_trailers, stream_info, absl::string_view());
-  MessageUtil::jsonConvert(formatted_body, ProtobufMessage::getNullValidationVisitor(),
-                           *log_entry.mutable_body());
-  const auto formatted_attributes = attributes_formatter_->format(
-      request_headers, response_headers, response_trailers, stream_info, absl::string_view());
-  opentelemetry::proto::common::v1::KeyValueList attributes;
-  MessageUtil::jsonConvert(formatted_attributes, ProtobufMessage::getNullValidationVisitor(),
-                           attributes);
-  *log_entry.mutable_attributes() = attributes.values();
+
+  // Unpacks the body "KeyValueList" to "AnyValue".
+  if (body_formatter_) {
+    const auto formatted_body = unpackBody(body_formatter_->format(log_context, stream_info));
+    *log_entry.mutable_body() = formatted_body;
+  }
+  const auto formatted_attributes = attributes_formatter_->format(log_context, stream_info);
+  *log_entry.mutable_attributes() = formatted_attributes.values();
+
+  // Sets trace context (trace_id, span_id) if available.
+  const std::string trace_id_hex =
+      log_context.activeSpan().has_value() ? log_context.activeSpan()->getTraceId() : "";
+  const std::string span_id_hex =
+      log_context.activeSpan().has_value() ? log_context.activeSpan()->getSpanId() : "";
+  populateTraceContext(log_entry, trace_id_hex, span_id_hex);
+
+  addFilterStateToAttributes(stream_info, filter_state_objects_to_log_, log_entry);
+  addCustomTagsToAttributes(custom_tags_, log_context, stream_info, log_entry);
 
   tls_slot_->getTyped<ThreadLocalLogger>().logger_->log(std::move(log_entry));
 }

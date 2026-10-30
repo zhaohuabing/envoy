@@ -50,12 +50,18 @@ envoy_cc_extension(
         ":protocol_options_config_lib",
         ":twitter_protocol_lib",
         ":unframed_transport_lib",
+        "//envoy/access_log:access_log_interface",
         "//envoy/registry",
         "//source/common/config:utility_lib",
+        "//source/common/stats:utility_lib",
         "//source/extensions/filters/network:well_known_names",
         "//source/extensions/filters/network/common:factory_base_lib",
         "//source/extensions/filters/network/thrift_proxy/filters:filter_config_interface",
+        "//source/extensions/filters/network/thrift_proxy/router:rds_lib",
         "//source/extensions/filters/network/thrift_proxy/router:router_lib",
+        "@abseil-cpp//absl/strings",
+        "@envoy_api//envoy/config/accesslog/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/thrift_proxy/router/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/network/thrift_proxy/v3:pkg_cc_proto",
     ],
 )
@@ -64,10 +70,10 @@ envoy_cc_library(
     name = "conn_manager_lib",
     srcs = ["conn_manager.cc"],
     hdrs = ["conn_manager.h"],
-    external_deps = ["abseil_any"],
     deps = [
         ":app_exception_lib",
         ":decoder_lib",
+        ":filter_utils_lib",
         ":protocol_converter_lib",
         ":protocol_interface",
         ":stats_lib",
@@ -75,17 +81,23 @@ envoy_cc_library(
         "//envoy/event:deferred_deletable",
         "//envoy/event:dispatcher_interface",
         "//envoy/network:connection_interface",
+        "//envoy/network:drain_decision_interface",
         "//envoy/network:filter_interface",
+        "//envoy/server:factory_context_interface",
         "//envoy/stats:stats_interface",
         "//envoy/stats:timespan_interface",
+        "//source/common/access_log:access_log_lib",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:linked_object",
         "//source/common/common:logger_lib",
+        "//source/common/network:drain_close_util_lib",
         "//source/common/network:filter_lib",
+        "//source/common/runtime:runtime_features_lib",
         "//source/common/stats:timespan_lib",
         "//source/common/stream_info:stream_info_lib",
         "//source/extensions/filters/network/thrift_proxy/router:router_interface",
+        "@abseil-cpp//absl/types:any",
     ],
 )
 
@@ -95,6 +107,14 @@ envoy_cc_library(
     deps = [
         ":metadata_lib",
         ":thrift_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "passthrough_decoder_event_handler_lib",
+    hdrs = ["passthrough_decoder_event_handler.h"],
+    deps = [
+        ":decoder_events_lib",
     ],
 )
 
@@ -113,9 +133,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "filter_utils_lib",
+    srcs = ["filter_utils.cc"],
+    hdrs = ["filter_utils.h"],
+    deps = [
+        "//source/extensions/filters/network/thrift_proxy/filters:filter_interface",
+    ],
+)
+
+envoy_cc_library(
     name = "metadata_lib",
     hdrs = ["metadata.h"],
-    external_deps = ["abseil_optional"],
     deps = [
         ":thrift_lib",
         ":tracing_interface",
@@ -128,8 +156,6 @@ envoy_cc_library(
 envoy_cc_library(
     name = "tracing_interface",
     hdrs = ["tracing.h"],
-    external_deps = ["abseil_optional"],
-    deps = [],
 )
 
 envoy_cc_library(
@@ -149,7 +175,6 @@ envoy_cc_library(
     hdrs = [
         "protocol.h",
     ],
-    external_deps = ["abseil_optional"],
     deps = [
         ":conn_state_lib",
         ":decoder_events_lib",
@@ -182,6 +207,7 @@ envoy_cc_library(
         ":twitter_protocol_lib",
         "//source/common/common:macros",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -196,7 +222,9 @@ envoy_cc_library(
         ":buffer_helper_lib",
         ":protocol_interface",
         "//source/common/common:macros",
+        "//source/common/runtime:runtime_features_lib",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -207,12 +235,13 @@ envoy_cc_library(
     hdrs = [
         "compact_protocol_impl.h",
     ],
-    external_deps = ["abseil_optional"],
     deps = [
         ":buffer_helper_lib",
         ":protocol_interface",
         "//source/common/common:macros",
+        "//source/common/runtime:runtime_features_lib",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -230,6 +259,7 @@ envoy_cc_library(
         ":thrift_object_lib",
         "//source/common/common:macros",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -238,13 +268,14 @@ envoy_cc_library(
     deps = [
         "//envoy/stats:stats_interface",
         "//envoy/stats:stats_macros",
+        "//source/common/config:well_known_names",
+        "//source/common/stats:utility_lib",
     ],
 )
 
 envoy_cc_library(
     name = "transport_interface",
     hdrs = ["transport.h"],
-    external_deps = ["abseil_optional"],
     deps = [
         ":buffer_helper_lib",
         ":metadata_lib",
@@ -279,8 +310,10 @@ envoy_cc_library(
     name = "thrift_lib",
     hdrs = ["thrift.h"],
     deps = [
+        "//envoy/tcp:conn_pool_interface",
         "//source/common/common:assert_lib",
         "//source/common/singleton:const_singleton",
+        "@envoy_api//envoy/extensions/filters/network/thrift_proxy/v3:pkg_cc_proto",
     ],
 )
 
@@ -325,6 +358,7 @@ envoy_cc_library(
         ":unframed_transport_lib",
         "//source/common/common:assert_lib",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -340,6 +374,7 @@ envoy_cc_library(
         ":transport_interface",
         "//source/common/common:assert_lib",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -356,6 +391,7 @@ envoy_cc_library(
         ":transport_interface",
         "//source/common/common:assert_lib",
     ],
+    alwayslink = 1,
 )
 
 envoy_cc_library(
@@ -371,4 +407,5 @@ envoy_cc_library(
         ":transport_interface",
         "//source/common/common:assert_lib",
     ],
+    alwayslink = 1,
 )

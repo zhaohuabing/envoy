@@ -385,24 +385,25 @@ public:
       sampled_ = metadata.sampled().value();
     }
 
-    metadata.headers().iterate([this](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
-      absl::string_view key = header.key().getStringView();
-      if (key.empty()) {
-        return Http::HeaderMap::Iterate::Continue;
-      }
+    metadata.requestHeaders().iterate(
+        [this](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+          absl::string_view key = header.key().getStringView();
+          if (key.empty()) {
+            return Http::HeaderMap::Iterate::Continue;
+          }
 
-      if (key == Headers::get().ClientId.get()) {
-        client_id_ = ClientId(std::string(header.value().getStringView()));
-      } else if (key == Headers::get().Dest.get()) {
-        dest_ = std::string(header.value().getStringView());
-      } else if (key.find(":d:") == 0 && key.size() > 3) {
-        delegations_.emplace_back(std::string(key.substr(3)),
-                                  std::string(header.value().getStringView()));
-      } else if (key[0] != ':') {
-        contexts_.emplace_back(std::string(key), std::string(header.value().getStringView()));
-      }
-      return Http::HeaderMap::Iterate::Continue;
-    });
+          if (key == Headers::get().ClientId.get()) {
+            client_id_ = ClientId(std::string(header.value().getStringView()));
+          } else if (key == Headers::get().Dest.get()) {
+            dest_ = std::string(header.value().getStringView());
+          } else if (key.find(":d:") == 0 && key.size() > 3) {
+            delegations_.emplace_back(std::string(key.substr(3)),
+                                      std::string(header.value().getStringView()));
+          } else if (key[0] != ':') {
+            contexts_.emplace_back(std::string(key), std::string(header.value().getStringView()));
+          }
+          return Http::HeaderMap::Iterate::Continue;
+        });
   }
 
   void write(Buffer::Instance& buffer) {
@@ -499,16 +500,16 @@ public:
 
   int64_t traceId() const { return trace_id_; }
   int64_t spanId() const { return span_id_; }
-  absl::optional<int64_t> parentSpanId() const { return parent_span_id_; }
-  absl::optional<bool> sampled() const { return sampled_; }
-  absl::optional<ClientId> clientId() const { return client_id_; }
-  absl::optional<int64_t> flags() const { return flags_; }
+  std::optional<int64_t> parentSpanId() const { return parent_span_id_; }
+  std::optional<bool> sampled() const { return sampled_; }
+  std::optional<ClientId> clientId() const { return client_id_; }
+  std::optional<int64_t> flags() const { return flags_; }
   const RequestContextList& contexts() const { return contexts_; }
   RequestContextList* contexts() { return &contexts_; }
-  absl::optional<std::string> dest() { return dest_; }
+  std::optional<std::string> dest() { return dest_; }
   const DelegationList& delegations() const { return delegations_; }
   DelegationList* delegations() { return &delegations_; }
-  absl::optional<int64_t> traceIdHigh() const { return trace_id_high_; }
+  std::optional<int64_t> traceIdHigh() const { return trace_id_high_; }
 
 private:
   static constexpr int16_t TraceIdFieldId = 1;
@@ -540,14 +541,14 @@ private:
 
   int64_t trace_id_{0};
   int64_t span_id_{0};
-  absl::optional<int64_t> parent_span_id_;
-  absl::optional<bool> sampled_;
-  absl::optional<ClientId> client_id_;
-  absl::optional<int64_t> flags_;
+  std::optional<int64_t> parent_span_id_;
+  std::optional<bool> sampled_;
+  std::optional<ClientId> client_id_;
+  std::optional<int64_t> flags_;
   std::list<RequestContext> contexts_;
-  absl::optional<std::string> dest_;
+  std::optional<std::string> dest_;
   DelegationList delegations_;
-  absl::optional<int64_t> trace_id_high_;
+  std::optional<int64_t> trace_id_high_;
 };
 
 /**
@@ -572,13 +573,14 @@ public:
     }
   }
   ResponseHeader(const MessageMetadata& metadata) : spans_(metadata.spans()) {
-    metadata.headers().iterate([this](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
-      absl::string_view key = header.key().getStringView();
-      if (!key.empty() && key[0] != ':') {
-        contexts_.emplace_back(std::string(key), std::string(header.value().getStringView()));
-      }
-      return Http::HeaderMap::Iterate::Continue;
-    });
+    metadata.responseHeaders().iterate(
+        [this](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+          absl::string_view key = header.key().getStringView();
+          if (!key.empty() && key[0] != ':') {
+            contexts_.emplace_back(std::string(key), std::string(header.value().getStringView()));
+          }
+          return Http::HeaderMap::Iterate::Continue;
+        });
   }
 
   void write(Buffer::Instance& buffer) {
@@ -973,8 +975,6 @@ bool TwitterProtocolImpl::readMessageBegin(Buffer::Instance& buffer, MessageMeta
   case MessageType::Exception:
     updateMetadataWithResponseHeader(*header_, metadata);
     break;
-  default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
   }
 
   header_complete_ = false;
@@ -994,8 +994,6 @@ void TwitterProtocolImpl::writeMessageBegin(Buffer::Instance& buffer,
     case MessageType::Exception:
       writeResponseHeader(buffer, metadata);
       break;
-    default:
-      NOT_REACHED_GCOVR_EXCL_LINE;
     }
   }
 
@@ -1006,7 +1004,7 @@ void TwitterProtocolImpl::updateMetadataWithRequestHeader(const ThriftObject& he
                                                           MessageMetadata& metadata) {
   RequestHeader req_header(header_object);
 
-  Http::HeaderMap& headers = metadata.headers();
+  Http::HeaderMap& headers = metadata.requestHeaders();
 
   metadata.setTraceId(req_header.traceId());
   metadata.setSpanId(req_header.spanId());
@@ -1055,7 +1053,7 @@ void TwitterProtocolImpl::updateMetadataWithResponseHeader(const ThriftObject& h
                                                            MessageMetadata& metadata) {
   ResponseHeader resp_header(header_object);
 
-  Http::HeaderMap& headers = metadata.headers();
+  Http::HeaderMap& headers = metadata.responseHeaders();
   for (const auto& context : resp_header.contexts()) {
     // LowerCaseString doesn't allow '\0', '\n', and '\r'.
     const std::string key =

@@ -9,10 +9,28 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "map_matcher_lib",
+    hdrs = ["map_matcher.h"],
+    deps = [
+        "//envoy/matcher:matcher_interface",
+    ],
+)
+
+envoy_cc_library(
     name = "exact_map_matcher_lib",
     hdrs = ["exact_map_matcher.h"],
     deps = [
-        "//envoy/matcher:matcher_interface",
+        ":map_matcher_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "prefix_map_matcher_lib",
+    hdrs = ["prefix_map_matcher.h"],
+    deps = [
+        ":map_matcher_lib",
+        "//source/common/common:radix_tree_lib",
+        "//source/common/runtime:runtime_features_lib",
     ],
 )
 
@@ -58,6 +76,7 @@ envoy_cc_library(
         ":exact_map_matcher_lib",
         ":field_matcher_lib",
         ":list_matcher_lib",
+        ":prefix_map_matcher_lib",
         ":validation_visitor_lib",
         ":value_input_matcher_lib",
         "//envoy/config:typed_config_interface",
@@ -65,5 +84,27 @@ envoy_cc_library(
         "//source/common/config:utility_lib",
         "@envoy_api//envoy/config/common/matcher/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "address_matcher_lib",
+    srcs = ["address_matcher.cc"],
+    hdrs = ["address_matcher.h"],
+    deps = [
+        "//envoy/common:exception_lib",
+        "//source/common/network:cidr_range_lib",
+        "@abseil-cpp//absl/status:statusor",
+        "@envoy_api//envoy/type/matcher/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "regex_replace_lib",
+    srcs = ["regex_replace.cc"],
+    hdrs = ["regex_replace.h"],
+    deps = [
+        "//source/common/common:regex_lib",
+        "@envoy_api//envoy/type/matcher/v3:pkg_cc_proto",
     ],
 )

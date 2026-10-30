@@ -12,20 +12,10 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_extension_cc_test(
-    name = "config_test",
-    srcs = ["config_test.cc"],
-    extension_names = ["envoy.stat_sinks.metrics_service"],
-    deps = [
-        "//envoy/registry",
-        "//source/extensions/stat_sinks/metrics_service:config",
-        "//test/test_common:utility_lib",
-    ],
-)
-
-envoy_extension_cc_test(
     name = "metrics_service_test",
     srcs = ["grpc_metrics_service_impl_test.cc"],
     extension_names = ["envoy.stat_sinks.metrics_service"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/event:dispatcher_lib",
         "//source/common/upstream:upstream_includes",
@@ -34,17 +24,17 @@ envoy_extension_cc_test(
         "//test/common/upstream:utility_lib",
         "//test/mocks/grpc:grpc_mocks",
         "//test/mocks/local_info:local_info_mocks",
-        "//test/mocks/thread_local:thread_local_mocks",
         "//test/mocks/upstream:upstream_mocks",
-        "//test/test_common:simulated_time_system_lib",
         "@envoy_api//envoy/service/metrics/v3:pkg_cc_proto",
     ],
 )
 
 envoy_extension_cc_test(
     name = "metrics_service_integration_test",
+    size = "large",
     srcs = ["metrics_service_integration_test.cc"],
     extension_names = ["envoy.stat_sinks.metrics_service"],
+    rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/buffer:zero_copy_input_stream_lib",
         "//source/common/grpc:codec_lib",

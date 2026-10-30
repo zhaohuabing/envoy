@@ -17,37 +17,54 @@ namespace Extensions {
 namespace HttpFilters {
 namespace RateLimitFilter {
 
-Http::FilterFactoryCb RateLimitFilterConfig::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> RateLimitFilterConfig::createFilterFactory(
     const envoy::extensions::filters::http::ratelimit::v3::RateLimit& proto_config,
-    const std::string&, Server::Configuration::FactoryContext& context) {
+    Server::Configuration::ServerFactoryContext& context, Stats::Scope& scope) {
   ASSERT(!proto_config.domain().empty());
-  FilterConfigSharedPtr filter_config(new FilterConfig(proto_config, context.localInfo(),
-                                                       context.scope(), context.runtime(),
-                                                       context.httpContext()));
-  const std::chrono::milliseconds timeout =
-      std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(proto_config, timeout, 20));
+  absl::Status status = absl::OkStatus();
+  FilterConfigSharedPtr filter_config(new FilterConfig(proto_config, context.localInfo(), scope,
+                                                       context.runtime(), context, status));
+  RETURN_IF_NOT_OK_REF(status);
+  // A timeout of 0 means infinite (no timeout). Convert to nullopt in that case.
+  const uint64_t timeout_ms = PROTOBUF_GET_MS_OR_DEFAULT(proto_config, timeout, 20);
+  const std::optional<std::chrono::milliseconds> timeout =
+      timeout_ms == 0
+          ? std::nullopt
+          : std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(timeout_ms));
 
-  Config::Utility::checkTransportVersion(proto_config.rate_limit_service());
-  return [proto_config, &context, timeout,
+  RETURN_IF_NOT_OK(Config::Utility::checkTransportVersion(proto_config.rate_limit_service()));
+  Grpc::GrpcServiceConfigWithHashKey config_with_hash_key =
+      Grpc::GrpcServiceConfigWithHashKey(proto_config.rate_limit_service().grpc_service());
+  return [config_with_hash_key, &context, timeout,
           filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(std::make_shared<Filter>(
-        filter_config, Filters::Common::RateLimit::rateLimitClient(
-                           context, proto_config.rate_limit_service().grpc_service(), timeout)));
+        filter_config,
+        Filters::Common::RateLimit::rateLimitClient(context, config_with_hash_key, timeout)));
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Http::FilterFactoryCb> RateLimitFilterConfig::createHttpFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::http::ratelimit::v3::RateLimit& proto_config,
+    Server::Configuration::ServerFactoryContext& context,
+    Server::Configuration::ExtraFactoryContext& extra_context) {
+  return createFilterFactory(proto_config, context, extra_context.scopeOr(context));
+}
+
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 RateLimitFilterConfig::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::ratelimit::v3::RateLimitPerRoute& proto_config,
-    Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
-  return std::make_shared<FilterConfigPerRoute>(proto_config);
+    Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&) {
+  absl::Status status = absl::OkStatus();
+  auto route_config = std::make_shared<FilterConfigPerRoute>(context, proto_config, status);
+  RETURN_IF_NOT_OK_REF(status);
+  return route_config;
 }
 
 /**
  * Static registration for the rate limit filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(RateLimitFilterConfig,
-                 Server::Configuration::NamedHttpFilterConfigFactory){"envoy.rate_limit"};
+LEGACY_REGISTER_FACTORY(RateLimitFilterConfig, Server::Configuration::NamedHttpFilterConfigFactory,
+                        "envoy.rate_limit");
 
 } // namespace RateLimitFilter
 } // namespace HttpFilters

@@ -16,25 +16,25 @@ namespace Extensions {
 namespace Tracers {
 namespace SkyWalking {
 
-using cpp2sky::TracingContextPtr;
+using cpp2sky::TracingContextSharedPtr;
 
 class TraceSegmentReporter : public Logger::Loggable<Logger::Id::tracing>,
                              public Grpc::AsyncStreamCallbacks<skywalking::v3::Commands> {
 public:
   explicit TraceSegmentReporter(Grpc::AsyncClientFactoryPtr&& factory,
                                 Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
-                                SkyWalkingTracerStats& stats, uint32_t delayed_buffer_size,
+                                SkyWalkingTracerStatsSharedPtr stats, uint32_t delayed_buffer_size,
                                 const std::string& token);
   ~TraceSegmentReporter() override;
 
   // Grpc::AsyncStreamCallbacks
   void onCreateInitialMetadata(Http::RequestHeaderMap& metadata) override;
   void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&&) override {}
-  void onReceiveMessage(std::unique_ptr<skywalking::v3::Commands>&&) override {}
+  void onReceiveMessage(Grpc::ResponsePtr<skywalking::v3::Commands>&&) override {}
   void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&&) override {}
   void onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) override;
 
-  void report(TracingContextPtr tracing_context);
+  void report(TracingContextSharedPtr tracing_context);
 
 private:
   /*
@@ -46,9 +46,9 @@ private:
   void handleFailure();
   void setRetryTimer();
 
-  SkyWalkingTracerStats& tracing_stats_;
+  SkyWalkingTracerStatsSharedPtr tracing_stats_;
   Grpc::AsyncClient<skywalking::v3::SegmentObject, skywalking::v3::Commands> client_;
-  Grpc::AsyncStream<skywalking::v3::SegmentObject> stream_{};
+  Grpc::AsyncStream<skywalking::v3::SegmentObject> stream_;
   const Protobuf::MethodDescriptor& service_method_;
   Random::RandomGenerator& random_generator_;
   // If the connection is unavailable when reporting data, the created SegmentObject will be cached

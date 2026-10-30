@@ -22,8 +22,8 @@ template <typename StringList>
 void createLuaTableFromStringList(lua_State* state, const StringList& list) {
   lua_createtable(state, list.size(), 0);
   for (size_t i = 0; i < list.size(); i++) {
-    lua_pushstring(state, list[i].c_str());
-    // After the list[i].c_str() is pushed to the stack, we need to set the "current element" with
+    lua_pushlstring(state, list[i].data(), list[i].size());
+    // After the list[i].data() is pushed to the stack, we need to set the "current element" with
     // that value. The lua_rawseti(state, t, i) helps us to set the value of table t with key i.
     // Given the index of the current element/table in the stack is below the pushed value i.e. -2
     // and the key (refers to where the element is in the table) is i + 1 (note that in Lua index
@@ -36,7 +36,7 @@ void createLuaTableFromStringList(lua_State* state, const StringList& list) {
 // (https://github.com/LuaJIT/LuaJIT/blob/8271c643c21d1b2f344e339f559f2de6f3663191/src/luaconf.h#L104),
 // which is large enough to hold timestamp-since-epoch in seconds. Note: In Lua, we usually use
 // os.time(os.date("!*t")) to get current timestamp-since-epoch in seconds.
-int64_t timestampInSeconds(const absl::optional<SystemTime>& system_time) {
+int64_t timestampInSeconds(const std::optional<SystemTime>& system_time) {
   return system_time.has_value() ? std::chrono::duration_cast<std::chrono::seconds>(
                                        system_time.value().time_since_epoch())
                                        .count()
@@ -57,7 +57,8 @@ int BufferWrapper::luaGetBytes(lua_State* state) {
     luaL_error(state, "index/length must be >= 0 and (index + length) must be <= buffer size");
   }
 
-  // TODO(mattklein123): Reduce copies here by using Lua direct buffer builds.
+  // Note: Lua buffer API (`luaL_prepbuffsize`) could reduce copies here, but Envoy
+  // uses luajit which does not expose this function.
   std::unique_ptr<char[]> data(new char[length]);
   data_.copyOut(index, length, data.get());
   lua_pushlstring(state, data.get(), length);
@@ -66,29 +67,31 @@ int BufferWrapper::luaGetBytes(lua_State* state) {
 
 int BufferWrapper::luaSetBytes(lua_State* state) {
   data_.drain(data_.length());
+  ASSERT(data_.length() == 0); // Defensive check.
   absl::string_view bytes = getStringViewFromLuaString(state, 2);
+  headers_.setContentLength(bytes.size());
   data_.add(bytes);
   lua_pushnumber(state, data_.length());
   return 1;
 }
 
-void MetadataMapHelper::setValue(lua_State* state, const ProtobufWkt::Value& value) {
-  ProtobufWkt::Value::KindCase kind = value.kind_case();
+void MetadataMapHelper::setValue(lua_State* state, const Protobuf::Value& value) {
+  Protobuf::Value::KindCase kind = value.kind_case();
 
   switch (kind) {
-  case ProtobufWkt::Value::kNullValue:
+  case Protobuf::Value::kNullValue:
     return lua_pushnil(state);
-  case ProtobufWkt::Value::kNumberValue:
+  case Protobuf::Value::kNumberValue:
     return lua_pushnumber(state, value.number_value());
-  case ProtobufWkt::Value::kBoolValue:
+  case Protobuf::Value::kBoolValue:
     return lua_pushboolean(state, value.bool_value());
-  case ProtobufWkt::Value::kStructValue:
+  case Protobuf::Value::kStructValue:
     return createTable(state, value.struct_value().fields());
-  case ProtobufWkt::Value::kStringValue: {
+  case Protobuf::Value::kStringValue: {
     const auto& string_value = value.string_value();
-    return lua_pushstring(state, string_value.c_str());
+    return lua_pushlstring(state, string_value.data(), string_value.size());
   }
-  case ProtobufWkt::Value::kListValue: {
+  case Protobuf::Value::kListValue: {
     const auto& list = value.list_value();
     const int values_size = list.values_size();
 
@@ -110,35 +113,34 @@ void MetadataMapHelper::setValue(lua_State* state, const ProtobufWkt::Value& val
     }
     return;
   }
-
-  default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+  case Protobuf::Value::KIND_NOT_SET:
+    PANIC("not implemented");
   }
 }
 
 void MetadataMapHelper::createTable(lua_State* state,
-                                    const Protobuf::Map<std::string, ProtobufWkt::Value>& fields) {
+                                    const Protobuf::Map<std::string, Protobuf::Value>& fields) {
   lua_createtable(state, 0, fields.size());
   for (const auto& field : fields) {
     int top = lua_gettop(state);
-    lua_pushstring(state, field.first.c_str());
+    lua_pushlstring(state, field.first.data(), field.first.size());
     setValue(state, field.second);
     lua_settable(state, top);
   }
 }
 
 /**
- * Converts the value on top of the Lua stack into a ProtobufWkt::Value.
+ * Converts the value on top of the Lua stack into a Protobuf::Value.
  * Any Lua types that cannot be directly mapped to Value types will
  * yield an error.
  */
-ProtobufWkt::Value MetadataMapHelper::loadValue(lua_State* state) {
-  ProtobufWkt::Value value;
+Protobuf::Value MetadataMapHelper::loadValue(lua_State* state) {
+  Protobuf::Value value;
   int type = lua_type(state, -1);
 
   switch (type) {
   case LUA_TNIL:
-    value.set_null_value(ProtobufWkt::NullValue());
+    value.set_null_value(Protobuf::NullValue());
     break;
   case LUA_TNUMBER:
     value.set_number_value(static_cast<double>(lua_tonumber(state, -1)));
@@ -190,8 +192,8 @@ int MetadataMapHelper::tableLength(lua_State* state) {
   return static_cast<int>(max);
 }
 
-ProtobufWkt::ListValue MetadataMapHelper::loadList(lua_State* state, int length) {
-  ProtobufWkt::ListValue list;
+Protobuf::ListValue MetadataMapHelper::loadList(lua_State* state, int length) {
+  Protobuf::ListValue list;
 
   for (int i = 1; i <= length; i++) {
     lua_rawgeti(state, -1, i);
@@ -202,8 +204,8 @@ ProtobufWkt::ListValue MetadataMapHelper::loadList(lua_State* state, int length)
   return list;
 }
 
-ProtobufWkt::Struct MetadataMapHelper::loadStruct(lua_State* state) {
-  ProtobufWkt::Struct struct_obj;
+Protobuf::Struct MetadataMapHelper::loadStruct(lua_State* state) {
+  Protobuf::Struct struct_obj;
 
   lua_pushnil(state);
   while (lua_next(state, -2) != 0) {
@@ -229,7 +231,7 @@ int MetadataMapIterator::luaPairsIterator(lua_State* state) {
     return 0;
   }
 
-  lua_pushstring(state, current_->first.c_str());
+  lua_pushlstring(state, current_->first.data(), current_->first.size());
   MetadataMapHelper::setValue(state, current_->second);
 
   current_++;
@@ -257,6 +259,17 @@ int MetadataMapWrapper::luaPairs(lua_State* state) {
   return 1;
 }
 
+int ParsedX509NameWrapper::luaCommonName(lua_State* state) {
+  const std::string& commonName = parsed_name_.commonName_;
+  lua_pushlstring(state, commonName.data(), commonName.size());
+  return 1;
+}
+
+int ParsedX509NameWrapper::luaOrganizationName(lua_State* state) {
+  createLuaTableFromStringList(state, parsed_name_.organizationName_);
+  return 1;
+}
+
 int SslConnectionWrapper::luaPeerCertificatePresented(lua_State* state) {
   lua_pushboolean(state, connection_info_.peerCertificatePresented());
   return 1;
@@ -273,22 +286,53 @@ int SslConnectionWrapper::luaUriSanLocalCertificate(lua_State* state) {
 }
 
 int SslConnectionWrapper::luaSha256PeerCertificateDigest(lua_State* state) {
-  lua_pushstring(state, connection_info_.sha256PeerCertificateDigest().c_str());
+  const std::string& cert_digest = connection_info_.sha256PeerCertificateDigest();
+  lua_pushlstring(state, cert_digest.data(), cert_digest.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaSerialNumberPeerCertificate(lua_State* state) {
-  lua_pushstring(state, connection_info_.serialNumberPeerCertificate().c_str());
+  const std::string& peer_cert = connection_info_.serialNumberPeerCertificate();
+  lua_pushlstring(state, peer_cert.data(), peer_cert.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaIssuerPeerCertificate(lua_State* state) {
-  lua_pushstring(state, connection_info_.issuerPeerCertificate().c_str());
+  const std::string& peer_cert_serial = connection_info_.issuerPeerCertificate();
+  lua_pushlstring(state, peer_cert_serial.data(), peer_cert_serial.size());
+  return 1;
+}
+
+int SslConnectionWrapper::luaSha256PeerCertificateIssuerDigest(lua_State* state) {
+  const std::string& hash = connection_info_.sha256PeerCertificateIssuerDigest();
+  lua_pushlstring(state, hash.data(), hash.size());
+  return 1;
+}
+
+int SslConnectionWrapper::luaSerialNumberPeerCertificateIssuer(lua_State* state) {
+  const std::string& serial = connection_info_.serialNumberPeerCertificateIssuer();
+  lua_pushlstring(state, serial.data(), serial.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaSubjectPeerCertificate(lua_State* state) {
-  lua_pushstring(state, connection_info_.subjectPeerCertificate().c_str());
+  const std::string& peer_cert_subject = connection_info_.subjectPeerCertificate();
+  lua_pushlstring(state, peer_cert_subject.data(), peer_cert_subject.size());
+  return 1;
+}
+
+int SslConnectionWrapper::luaParsedSubjectPeerCertificate(lua_State* state) {
+  auto parsed_name = connection_info_.parsedSubjectPeerCertificate();
+  if (parsed_name.has_value()) {
+    if (parsed_subject_peer_certificate_.get() != nullptr) {
+      parsed_subject_peer_certificate_.pushStack();
+    } else {
+      parsed_subject_peer_certificate_.reset(
+          ParsedX509NameWrapper::create(state, parsed_name.ref()), true);
+    }
+  } else {
+    lua_pushnil(state);
+  }
   return 1;
 }
 
@@ -298,7 +342,8 @@ int SslConnectionWrapper::luaUriSanPeerCertificate(lua_State* state) {
 }
 
 int SslConnectionWrapper::luaSubjectLocalCertificate(lua_State* state) {
-  lua_pushstring(state, connection_info_.subjectLocalCertificate().c_str());
+  const std::string& subject_local_cert = connection_info_.subjectLocalCertificate();
+  lua_pushlstring(state, subject_local_cert.data(), subject_local_cert.size());
   return 1;
 }
 
@@ -309,6 +354,16 @@ int SslConnectionWrapper::luaDnsSansPeerCertificate(lua_State* state) {
 
 int SslConnectionWrapper::luaDnsSansLocalCertificate(lua_State* state) {
   createLuaTableFromStringList(state, connection_info_.dnsSansLocalCertificate());
+  return 1;
+}
+
+int SslConnectionWrapper::luaOidsPeerCertificate(lua_State* state) {
+  createLuaTableFromStringList(state, connection_info_.oidsPeerCertificate());
+  return 1;
+}
+
+int SslConnectionWrapper::luaOidsLocalCertificate(lua_State* state) {
+  createLuaTableFromStringList(state, connection_info_.oidsLocalCertificate());
   return 1;
 }
 
@@ -323,38 +378,48 @@ int SslConnectionWrapper::luaExpirationPeerCertificate(lua_State* state) {
 }
 
 int SslConnectionWrapper::luaSessionId(lua_State* state) {
-  lua_pushstring(state, connection_info_.sessionId().c_str());
+  const std::string& session_id = connection_info_.sessionId();
+  lua_pushlstring(state, session_id.data(), session_id.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaCiphersuiteId(lua_State* state) {
-  lua_pushstring(state,
-                 absl::StrCat("0x", Hex::uint16ToHex(connection_info_.ciphersuiteId())).c_str());
+  const std::string& cipher_suite_id =
+      absl::StrCat("0x", Hex::uint16ToHex(connection_info_.ciphersuiteId()));
+  lua_pushlstring(state, cipher_suite_id.data(), cipher_suite_id.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaCiphersuiteString(lua_State* state) {
-  lua_pushstring(state, connection_info_.ciphersuiteString().c_str());
+  const absl::string_view cipher_suite = connection_info_.ciphersuiteString();
+  lua_pushlstring(state, cipher_suite.data(), cipher_suite.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaUrlEncodedPemEncodedPeerCertificate(lua_State* state) {
-  lua_pushstring(state, connection_info_.urlEncodedPemEncodedPeerCertificate().c_str());
+  const std::string& peer_cert_pem = connection_info_.urlEncodedPemEncodedPeerCertificate();
+  lua_pushlstring(state, peer_cert_pem.data(), peer_cert_pem.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaUrlEncodedPemEncodedPeerCertificateChain(lua_State* state) {
-  lua_pushstring(state, connection_info_.urlEncodedPemEncodedPeerCertificateChain().c_str());
+  const std::string& peer_cert_chain_pem =
+      connection_info_.urlEncodedPemEncodedPeerCertificateChain();
+  lua_pushlstring(state, peer_cert_chain_pem.data(), peer_cert_chain_pem.size());
   return 1;
 }
 
 int SslConnectionWrapper::luaTlsVersion(lua_State* state) {
-  lua_pushstring(state, connection_info_.tlsVersion().c_str());
+  const std::string& tls_version = connection_info_.tlsVersion();
+  lua_pushlstring(state, tls_version.data(), tls_version.size());
   return 1;
 }
 
 int ConnectionWrapper::luaSsl(lua_State* state) {
-  const auto& ssl = connection_->ssl();
+  ENVOY_LOG_MISC(warn, "connection():ssl() is deprecated and will be removed in a future release. "
+                       "Use streamInfo():downstreamSslConnection() instead.");
+
+  const auto& ssl = stream_info_.downstreamAddressProvider().sslConnection();
   if (ssl != nullptr) {
     if (ssl_connection_wrapper_.get() != nullptr) {
       ssl_connection_wrapper_.pushStack();

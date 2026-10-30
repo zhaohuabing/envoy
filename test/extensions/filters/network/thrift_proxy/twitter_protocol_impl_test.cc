@@ -39,10 +39,12 @@ public:
 
 class TwitterProtocolTest : public testing::Test {
 public:
-  void clearMetadata() { metadata_ = std::make_shared<MessageMetadata>(); }
+  void clearMetadata(bool is_request = true) {
+    metadata_ = std::make_shared<MessageMetadata>(is_request);
+  }
 
-  void resetMetadata() {
-    clearMetadata();
+  void resetMetadata(bool is_request = true) {
+    clearMetadata(is_request);
     metadata_->setMethodName("-");
     metadata_->setMessageType(MessageType::Oneway);
     metadata_->setSequenceId(1);
@@ -61,7 +63,12 @@ public:
     EXPECT_FALSE(metadata_->hasFrameSize());
     EXPECT_FALSE(metadata_->hasProtocol());
     EXPECT_FALSE(metadata_->hasAppException());
-    EXPECT_EQ(metadata_->headers().size(), 0);
+
+    if (metadata_->isRequest()) {
+      EXPECT_EQ(metadata_->requestHeaders().size(), 0);
+    } else {
+      EXPECT_EQ(metadata_->responseHeaders().size(), 0);
+    }
   }
 
   void addMessageStart(Buffer::Instance& buffer, const std::string& name = "the_name",
@@ -83,7 +90,7 @@ public:
     TestTwitterProtocolImpl proto;
     metadata_->setTraceId(trace_id);
     metadata_->setSpanId(span_id);
-    metadata_->headers().addCopy(Http::LowerCaseString(":client-id"), client_id);
+    metadata_->requestHeaders().addCopy(Http::LowerCaseString(":client-id"), client_id);
 
     proto.writeRequestHeaderForTest(buffer, *metadata_);
     addMessageStart(buffer, name, msg_type, seq_id);
@@ -94,18 +101,18 @@ public:
   void addUpgradedReplyStart(Buffer::Instance& buffer, const std::string& name = "the_name",
                              MessageType msg_type = MessageType::Reply, int32_t seq_id = 101,
                              int64_t trace_id = 1, int64_t span_id = 2) {
-    clearMetadata();
+    clearMetadata(false);
 
     TestTwitterProtocolImpl proto;
 
-    metadata_->mutableSpans().emplace_back(trace_id, "", span_id, absl::optional<int64_t>(),
+    metadata_->mutableSpans().emplace_back(trace_id, "", span_id, std::optional<int64_t>(),
                                            AnnotationList(), BinaryAnnotationList(), false);
-    metadata_->headers().addCopy(Http::LowerCaseString("test-header"), "test-header-value");
+    metadata_->responseHeaders().addCopy(Http::LowerCaseString("test-header"), "test-header-value");
 
     proto.writeResponseHeaderForTest(buffer, *metadata_);
     addMessageStart(buffer, name, msg_type, seq_id);
 
-    clearMetadata();
+    clearMetadata(false);
   }
 
   void addUpgradeMessage(Buffer::Instance& buffer, int32_t seq_id = 100) {
@@ -156,7 +163,8 @@ public:
   void upgradeResponseProto(TwitterProtocolImpl& proto) {
     FramedTransportImpl transport;
     ThriftConnectionState conn_state;
-    clearMetadata();
+
+    clearMetadata(false);
 
     ThriftObjectPtr response_decoder;
     {
@@ -170,7 +178,10 @@ public:
       Buffer::OwnedImpl buffer;
       buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length() + 13);
       addSeq(buffer, {
-                         0x80, 0x01, 0x00, 0x02, // binary, reply
+                         0x80,
+                         0x01,
+                         0x00,
+                         0x02, // binary, reply
                      });
       buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length());
       buffer.add(TwitterProtocolImpl::upgradeMethodName());
@@ -314,8 +325,11 @@ TEST_F(TwitterProtocolTest, RequestUpgradeSequence) {
          });
   expected_buffer.add(TwitterProtocolImpl::upgradeMethodName());
   addSeq(expected_buffer, {
-                              0x00, 0x00, 0x00, 0x64, // sequence number
-                              0x00,                   // upgrade response stop field
+                              0x00,
+                              0x00,
+                              0x00,
+                              0x64, // sequence number
+                              0x00, // upgrade response stop field
                           });
   EXPECT_EQ(expected_buffer.toString(), response_buffer.toString());
 
@@ -341,7 +355,10 @@ TEST_F(TwitterProtocolTest, ResponseUpgradeSequence) {
   Buffer::OwnedImpl expected_buffer;
   expected_buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length() + 13);
   addSeq(expected_buffer, {
-                              0x80, 0x01, 0x00, 0x01, // binary, call
+                              0x80,
+                              0x01,
+                              0x00,
+                              0x01, // binary, call
                           });
   expected_buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length());
   expected_buffer.add(TwitterProtocolImpl::upgradeMethodName());
@@ -352,7 +369,10 @@ TEST_F(TwitterProtocolTest, ResponseUpgradeSequence) {
   Buffer::OwnedImpl response_buffer;
   response_buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length() + 13);
   addSeq(response_buffer, {
-                              0x80, 0x01, 0x00, 0x02, // binary, reply
+                              0x80,
+                              0x01,
+                              0x00,
+                              0x02, // binary, reply
                           });
   response_buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length());
   response_buffer.add(TwitterProtocolImpl::upgradeMethodName());
@@ -405,22 +425,31 @@ TEST_F(TwitterProtocolTest, ResponseUpgradeRejectedSequence) {
   response_buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length() +
                                       response_err.length() + 27);
   addSeq(response_buffer, {
-                              0x80, 0x01, 0x00, 0x03, // binary, exception
+                              0x80,
+                              0x01,
+                              0x00,
+                              0x03, // binary, exception
                           });
   response_buffer.writeBEInt<int32_t>(TwitterProtocolImpl::upgradeMethodName().length());
   response_buffer.add(TwitterProtocolImpl::upgradeMethodName());
   response_buffer.writeBEInt<int32_t>(0);
   addSeq(response_buffer, {
-                              0x0B, 0x00, 0x01, // string field 1
+                              0x0B,
+                              0x00,
+                              0x01, // string field 1
                           });
   response_buffer.writeBEInt<int32_t>(response_err.length());
   response_buffer.add(response_err);
-  addSeq(response_buffer,
-         {
-             0x08, 0x00, 0x02, // int field 2
-             0x00, 0x00, 0x00, static_cast<uint8_t>(AppExceptionType::UnknownMethod),
-             0x00, // stop field
-         });
+  addSeq(response_buffer, {
+                              0x08,
+                              0x00,
+                              0x02, // int field 2
+                              0x00,
+                              0x00,
+                              0x00,
+                              static_cast<uint8_t>(AppExceptionType::UnknownMethod),
+                              0x00, // stop field
+                          });
 
   EXPECT_TRUE(response_decoder->onData(response_buffer));
 
@@ -486,7 +515,7 @@ TEST_F(TwitterProtocolTest, ParseRequestHeader) {
   EXPECT_TRUE(metadata_->flags());
   EXPECT_EQ(5, *metadata_->flags());
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestRequestHeaderMapImpl test_headers(metadata_->requestHeaders());
   EXPECT_EQ(6, test_headers.size());
 
   EXPECT_EQ("thrift-client-id", test_headers.get_(":client-id"));
@@ -522,7 +551,7 @@ TEST_F(TwitterProtocolTest, ParseEmptyRequestHeader) {
   EXPECT_FALSE(metadata_->flags());
   EXPECT_TRUE(metadata_->spans().empty());
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestRequestHeaderMapImpl test_headers(metadata_->requestHeaders());
   EXPECT_EQ(0, test_headers.size());
 }
 
@@ -534,7 +563,7 @@ TEST_F(TwitterProtocolTest, WriteRequestHeader) {
   metadata_->setParentSpanId(10);
   metadata_->setSampled(true);
   metadata_->setFlags(5);
-  Http::HeaderMap& headers = metadata_->headers();
+  Http::HeaderMap& headers = metadata_->requestHeaders();
   headers.addCopy(Http::LowerCaseString(":client-id"), "thrift-client-id");
   headers.addCopy(Http::LowerCaseString(":dest"), "dest");
   headers.addCopy(Http::LowerCaseString(":d:s1"), "d1");
@@ -555,7 +584,7 @@ TEST_F(TwitterProtocolTest, WriteRequestHeader) {
   EXPECT_TRUE(*metadata_->sampled());
   EXPECT_EQ(5, *metadata_->flags());
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestRequestHeaderMapImpl test_headers(metadata_->requestHeaders());
   EXPECT_EQ(4, test_headers.size());
   EXPECT_EQ("thrift-client-id", test_headers.get_(":client-id"));
   EXPECT_EQ("dest", test_headers.get_(":dest"));
@@ -580,7 +609,7 @@ TEST_F(TwitterProtocolTest, WriteMostlyEmptyRequestHeader) {
   EXPECT_FALSE(metadata_->sampled());
   EXPECT_FALSE(metadata_->flags());
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestRequestHeaderMapImpl test_headers(metadata_->requestHeaders());
   EXPECT_EQ(0, test_headers.size());
 }
 
@@ -638,7 +667,7 @@ TEST_F(TwitterProtocolTest, ParseResponseHeader) {
              0x00,                                                             // stop span 2
          });
 
-  clearMetadata();
+  clearMetadata(false);
   proto.readResponseHeaderForTest(buffer, *metadata_);
 
   EXPECT_EQ(2, metadata_->spans().size());
@@ -695,7 +724,7 @@ TEST_F(TwitterProtocolTest, ParseResponseHeader) {
     EXPECT_FALSE(span.debug_);
   }
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestResponseHeaderMapImpl test_headers(metadata_->responseHeaders());
   EXPECT_EQ(2, test_headers.size());
   EXPECT_EQ("v1", test_headers.get_("k1"));
   EXPECT_EQ("v2", test_headers.get_("k2"));
@@ -709,22 +738,24 @@ TEST_F(TwitterProtocolTest, ParseEmptyResponseHeader) {
                      0x00,
                  });
 
+  clearMetadata(false);
   proto.readResponseHeaderForTest(buffer, *metadata_);
 
   EXPECT_TRUE(metadata_->spans().empty());
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestResponseHeaderMapImpl test_headers(metadata_->responseHeaders());
   EXPECT_EQ(0, test_headers.size());
 }
 
 // Test writing a ResponseHeader
 TEST_F(TwitterProtocolTest, WriteResponseHeader) {
-  Http::HeaderMap& headers = metadata_->headers();
+  clearMetadata(false);
+  Http::ResponseHeaderMap& headers = metadata_->responseHeaders();
   headers.addCopy(Http::LowerCaseString("key1"), "value1");
   headers.addCopy(Http::LowerCaseString("key2"), "value2");
 
   SpanList& spans = metadata_->mutableSpans();
-  spans.emplace_back(1, "s1", 100, absl::optional<int64_t>(10),
+  spans.emplace_back(1, "s1", 100, std::optional<int64_t>(10),
                      AnnotationList({
                          Annotation(100000, "a1", {Endpoint(0xC0A80001, 0, "")}),
                          Annotation(100001, "a2", {}),
@@ -737,13 +768,13 @@ TEST_F(TwitterProtocolTest, WriteResponseHeader) {
                          BinaryAnnotation("bak2", "bav2", AnnotationType::String, {}),
                      }),
                      true);
-  spans.emplace_back(2, "s2", 200, absl::optional<int64_t>(), AnnotationList(),
+  spans.emplace_back(2, "s2", 200, std::optional<int64_t>(), AnnotationList(),
                      BinaryAnnotationList(), false);
   TestTwitterProtocolImpl proto;
   Buffer::OwnedImpl buffer;
   proto.writeResponseHeaderForTest(buffer, *metadata_);
 
-  clearMetadata();
+  clearMetadata(false);
   proto.readResponseHeaderForTest(buffer, *metadata_);
 
   EXPECT_FALSE(metadata_->traceId());
@@ -797,19 +828,20 @@ TEST_F(TwitterProtocolTest, WriteResponseHeader) {
   EXPECT_TRUE(span2.binary_annotations_.empty());
   EXPECT_FALSE(span2.debug_);
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestResponseHeaderMapImpl test_headers(metadata_->responseHeaders());
   EXPECT_EQ("value1", test_headers.get_("key1"));
   EXPECT_EQ("value2", test_headers.get_("key2"));
 }
 
 // Test writing an empty ResponseHeader
 TEST_F(TwitterProtocolTest, WriteEmptyResponseHeader) {
-  MessageMetadata metadata;
   TestTwitterProtocolImpl proto;
   Buffer::OwnedImpl buffer;
+
+  clearMetadata(false);
   proto.writeResponseHeaderForTest(buffer, *metadata_);
 
-  clearMetadata();
+  clearMetadata(false);
   proto.readResponseHeaderForTest(buffer, *metadata_);
 
   EXPECT_FALSE(metadata_->traceId());
@@ -821,8 +853,7 @@ TEST_F(TwitterProtocolTest, WriteEmptyResponseHeader) {
 
   EXPECT_TRUE(metadata_->spans().empty());
 
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
-  EXPECT_EQ(0, test_headers.size());
+  EXPECT_EQ(0, metadata_->responseHeaders().size());
 }
 
 TEST_F(TwitterProtocolTest, TestUpgradedRequestMessageBegin) {
@@ -832,14 +863,14 @@ TEST_F(TwitterProtocolTest, TestUpgradedRequestMessageBegin) {
   Buffer::OwnedImpl buffer;
   addUpgradedMessageStart(buffer);
 
-  MessageMetadata metadata;
   EXPECT_TRUE(proto.readMessageBegin(buffer, *metadata_));
   EXPECT_EQ("the_name", metadata_->methodName());
   EXPECT_EQ(MessageType::Call, metadata_->messageType());
   EXPECT_EQ(101, metadata_->sequenceId());
   EXPECT_EQ(1, *metadata_->traceId());
   EXPECT_EQ(2, *metadata_->spanId());
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+
+  Http::TestRequestHeaderMapImpl test_headers(metadata_->requestHeaders());
   EXPECT_EQ("test_client", test_headers.get_(":client-id"));
 }
 
@@ -864,7 +895,7 @@ TEST_F(TwitterProtocolTest, TestUpgradedRequestMessageContinuation) {
     EXPECT_EQ(101, metadata_->sequenceId());
     EXPECT_EQ(1, *metadata_->traceId());
     EXPECT_EQ(2, *metadata_->spanId());
-    Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+    Http::TestRequestHeaderMapImpl test_headers(metadata_->requestHeaders());
     EXPECT_EQ("test_client", test_headers.get_(":client-id"));
   }
 }
@@ -876,6 +907,7 @@ TEST_F(TwitterProtocolTest, TestUpgradedReplyMessageBegin) {
   Buffer::OwnedImpl buffer;
   addUpgradedReplyStart(buffer);
 
+  clearMetadata(false);
   EXPECT_TRUE(proto.readMessageBegin(buffer, *metadata_));
   EXPECT_EQ("the_name", metadata_->methodName());
   EXPECT_EQ(MessageType::Reply, metadata_->messageType());
@@ -884,7 +916,7 @@ TEST_F(TwitterProtocolTest, TestUpgradedReplyMessageBegin) {
   EXPECT_EQ(1, metadata_->spans().size());
   EXPECT_EQ(1, metadata_->spans().front().trace_id_);
   EXPECT_EQ(2, metadata_->spans().front().span_id_);
-  Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+  Http::TestResponseHeaderMapImpl test_headers(metadata_->responseHeaders());
   EXPECT_EQ("test-header-value", test_headers.get_("test-header"));
 }
 
@@ -911,7 +943,7 @@ TEST_F(TwitterProtocolTest, TestUpgradedReplyMessageContinuation) {
     EXPECT_EQ(1, metadata_->spans().size());
     EXPECT_EQ(1, metadata_->spans().front().trace_id_);
     EXPECT_EQ(2, metadata_->spans().front().span_id_);
-    Http::TestRequestHeaderMapImpl test_headers(metadata_->headers());
+    Http::TestResponseHeaderMapImpl test_headers(metadata_->responseHeaders());
     EXPECT_EQ("test-header-value", test_headers.get_("test-header"));
   }
 }
@@ -923,7 +955,7 @@ TEST_F(TwitterProtocolTest, TestUpgradedWriteMessageBegin) {
   metadata_->setMethodName("message");
   metadata_->setSequenceId(1);
   metadata_->setTraceId(1);
-  metadata_->mutableSpans().emplace_back(100, "", 100, absl::optional<int64_t>(), AnnotationList(),
+  metadata_->mutableSpans().emplace_back(100, "", 100, std::optional<int64_t>(), AnnotationList(),
                                          BinaryAnnotationList(), false);
 
   {
@@ -939,6 +971,7 @@ TEST_F(TwitterProtocolTest, TestUpgradedWriteMessageBegin) {
                           42),
               buffer.toString());
   }
+
   {
     // Oneway
     Buffer::OwnedImpl buffer;
@@ -952,6 +985,14 @@ TEST_F(TwitterProtocolTest, TestUpgradedWriteMessageBegin) {
                           42),
               buffer.toString());
   }
+
+  clearMetadata(false);
+
+  metadata_->setMethodName("message");
+  metadata_->setSequenceId(1);
+  metadata_->setTraceId(1);
+  metadata_->mutableSpans().emplace_back(100, "", 100, std::optional<int64_t>(), AnnotationList(),
+                                         BinaryAnnotationList(), false);
 
   {
     // Reply

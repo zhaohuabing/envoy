@@ -21,32 +21,18 @@ public:
   using ProdClusterManagerFactory::ProdClusterManagerFactory;
 
   explicit ValidationClusterManagerFactory(
-      Server::Admin& admin, Runtime::Loader& runtime, Stats::Store& stats,
-      ThreadLocal::Instance& tls, Network::DnsResolverSharedPtr dns_resolver,
-      Ssl::ContextManager& ssl_context_manager, Event::Dispatcher& main_thread_dispatcher,
-      const LocalInfo::LocalInfo& local_info, Secret::SecretManager& secret_manager,
-      ProtobufMessage::ValidationContext& validation_context, Api::Api& api,
-      Http::Context& http_context, Grpc::Context& grpc_context, Router::Context& router_context,
-      AccessLog::AccessLogManager& log_manager, Singleton::Manager& singleton_manager,
-      const Server::Options& options, Quic::QuicStatNames& quic_stat_names)
-      : ProdClusterManagerFactory(
-            admin, runtime, stats, tls, dns_resolver, ssl_context_manager, main_thread_dispatcher,
-            local_info, secret_manager, validation_context, api, http_context, grpc_context,
-            router_context, log_manager, singleton_manager, options, quic_stat_names),
-        grpc_context_(grpc_context), router_context_(router_context) {}
+      Server::Configuration::ServerFactoryContext& server_context,
+      LazyCreateDnsResolver dns_resolver_fn, Quic::QuicStatNames& quic_stat_names)
+      : ProdClusterManagerFactory(server_context, dns_resolver_fn, quic_stat_names) {}
 
-  ClusterManagerPtr
+  absl::StatusOr<ClusterManagerPtr>
   clusterManagerFromProto(const envoy::config::bootstrap::v3::Bootstrap& bootstrap) override;
 
   // Delegates to ProdClusterManagerFactory::createCds, but discards the result and returns nullptr
   // unconditionally.
-  CdsApiPtr createCds(const envoy::config::core::v3::ConfigSource& cds_config,
-                      const xds::core::v3::ResourceLocator* cds_resources_locator,
-                      ClusterManager& cm) override;
-
-private:
-  Grpc::Context& grpc_context_;
-  Router::Context& router_context_;
+  absl::StatusOr<CdsApiPtr> createCds(const envoy::config::core::v3::ConfigSource& cds_config,
+                                      const xds::core::v3::ResourceLocator* cds_resources_locator,
+                                      ClusterManager& cm, bool support_multi_ads_sources) override;
 };
 
 /**
@@ -62,6 +48,9 @@ public:
     // any calling code creating real outbound networking during validation.
     return nullptr;
   }
+
+  // Gives access to the protected constructor.
+  friend ValidationClusterManagerFactory;
 };
 
 } // namespace Upstream

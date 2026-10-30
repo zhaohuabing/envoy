@@ -16,7 +16,6 @@
 #include "gtest/gtest.h"
 
 using testing::_;
-using testing::Invoke;
 using testing::Return;
 using testing::ReturnPointee;
 using testing::ReturnRef;
@@ -25,22 +24,29 @@ using testing::SaveArg;
 namespace Envoy {
 namespace Network {
 
-MockUdpListenerConfig::MockUdpListenerConfig()
-    : udp_listener_worker_router_(std::make_unique<UdpListenerWorkerRouterImpl>(1)) {
-  ON_CALL(*this, listenerWorkerRouter()).WillByDefault(ReturnRef(*udp_listener_worker_router_));
+MockUdpListenerConfig::MockUdpListenerConfig(uint32_t concurrency)
+    : udp_listener_worker_router_(std::make_unique<UdpListenerWorkerRouterImpl>(concurrency)) {
+  ON_CALL(*this, listenerWorkerRouter(_)).WillByDefault(ReturnRef(*udp_listener_worker_router_));
   ON_CALL(*this, config()).WillByDefault(ReturnRef(config_));
 }
 MockUdpListenerConfig::~MockUdpListenerConfig() = default;
 
 MockListenerConfig::MockListenerConfig()
-    : socket_(std::make_shared<testing::NiceMock<MockListenSocket>>()) {
+    : socket_(std::make_shared<testing::NiceMock<MockListenSocket>>()),
+      listener_info_(std::make_shared<testing::NiceMock<MockListenerInfo>>()) {
+  socket_factories_.emplace_back(std::make_unique<MockListenSocketFactory>());
   ON_CALL(*this, filterChainFactory()).WillByDefault(ReturnRef(filter_chain_factory_));
-  ON_CALL(*this, listenSocketFactory()).WillByDefault(ReturnRef(socket_factory_));
-  ON_CALL(socket_factory_, localAddress())
+  ON_CALL(*this, listenSocketFactories()).WillByDefault(ReturnRef(socket_factories_));
+  ON_CALL(*static_cast<MockListenSocketFactory*>(socket_factories_[0].get()), localAddress())
       .WillByDefault(ReturnRef(socket_->connectionInfoProvider().localAddress()));
-  ON_CALL(socket_factory_, getListenSocket(_)).WillByDefault(Return(socket_));
-  ON_CALL(*this, listenerScope()).WillByDefault(ReturnRef(scope_));
+  ON_CALL(*static_cast<MockListenSocketFactory*>(socket_factories_[0].get()), getListenSocket(_))
+      .WillByDefault(Return(socket_));
+  ON_CALL(*this, listenerScope()).WillByDefault(ReturnRef(*store_.rootScope()));
   ON_CALL(*this, name()).WillByDefault(ReturnRef(name_));
+  ON_CALL(*this, maxConnectionsToAcceptPerSocketEvent())
+      .WillByDefault(Return(Network::DefaultMaxConnectionsToAcceptPerSocketEvent));
+  ON_CALL(*this, ignoreGlobalConnLimit()).WillByDefault(Return(false));
+  ON_CALL(*this, bindToPort()).WillByDefault(Return(true));
 }
 MockListenerConfig::~MockListenerConfig() = default;
 
@@ -63,6 +69,7 @@ MockReadFilterCallbacks::MockReadFilterCallbacks() {
   ON_CALL(*this, connection()).WillByDefault(ReturnRef(connection_));
   ON_CALL(*this, upstreamHost()).WillByDefault(ReturnPointee(&host_));
   ON_CALL(*this, upstreamHost(_)).WillByDefault(SaveArg<0>(&host_));
+  ON_CALL(*this, socket()).WillByDefault(ReturnRef(socket_));
 }
 
 MockReadFilterCallbacks::~MockReadFilterCallbacks() = default;
@@ -70,32 +77,29 @@ MockReadFilterCallbacks::~MockReadFilterCallbacks() = default;
 MockReadFilter::MockReadFilter() {
   ON_CALL(*this, onData(_, _)).WillByDefault(Return(FilterStatus::StopIteration));
   EXPECT_CALL(*this, initializeReadFilterCallbacks(_))
-      .WillOnce(
-          Invoke([this](ReadFilterCallbacks& callbacks) -> void { callbacks_ = &callbacks; }));
+      .WillOnce([this](ReadFilterCallbacks& callbacks) -> void { callbacks_ = &callbacks; });
 }
 
 MockReadFilter::~MockReadFilter() = default;
 
 MockWriteFilterCallbacks::MockWriteFilterCallbacks() {
   ON_CALL(*this, connection()).WillByDefault(ReturnRef(connection_));
+  ON_CALL(*this, socket()).WillByDefault(ReturnRef(socket_));
 }
 
 MockWriteFilterCallbacks::~MockWriteFilterCallbacks() = default;
 
 MockWriteFilter::MockWriteFilter() {
   EXPECT_CALL(*this, initializeWriteFilterCallbacks(_))
-      .WillOnce(Invoke(
-          [this](WriteFilterCallbacks& callbacks) -> void { write_callbacks_ = &callbacks; }));
+      .WillOnce([this](WriteFilterCallbacks& callbacks) -> void { write_callbacks_ = &callbacks; });
 }
 MockWriteFilter::~MockWriteFilter() = default;
 
 MockFilter::MockFilter() {
   EXPECT_CALL(*this, initializeReadFilterCallbacks(_))
-      .WillOnce(
-          Invoke([this](ReadFilterCallbacks& callbacks) -> void { callbacks_ = &callbacks; }));
+      .WillOnce([this](ReadFilterCallbacks& callbacks) -> void { callbacks_ = &callbacks; });
   EXPECT_CALL(*this, initializeWriteFilterCallbacks(_))
-      .WillOnce(Invoke(
-          [this](WriteFilterCallbacks& callbacks) -> void { write_callbacks_ = &callbacks; }));
+      .WillOnce([this](WriteFilterCallbacks& callbacks) -> void { write_callbacks_ = &callbacks; });
 }
 
 MockFilter::~MockFilter() = default;
@@ -109,19 +113,27 @@ MockUdpListenerCallbacks::~MockUdpListenerCallbacks() = default;
 MockDrainDecision::MockDrainDecision() = default;
 MockDrainDecision::~MockDrainDecision() = default;
 
-MockListenerFilter::MockListenerFilter() = default;
 MockListenerFilter::~MockListenerFilter() { destroy_(); }
 
-MockListenerFilterCallbacks::MockListenerFilterCallbacks() {
+MockListenerFilterCallbacks::MockListenerFilterCallbacks()
+    : filter_state_(StreamInfo::FilterStateImpl(StreamInfo::FilterState::LifeSpan::FilterChain)) {
+  ON_CALL(*this, filterState()).WillByDefault(ReturnRef(filter_state_));
   ON_CALL(*this, socket()).WillByDefault(ReturnRef(socket_));
+  ON_CALL(*this, streamInfo()).WillByDefault(ReturnRef(stream_info_));
 }
 MockListenerFilterCallbacks::~MockListenerFilterCallbacks() = default;
 
 MockListenerFilterManager::MockListenerFilterManager() = default;
 MockListenerFilterManager::~MockListenerFilterManager() = default;
 
-MockFilterChain::MockFilterChain() = default;
+MockFilterChain::MockFilterChain() {
+  ON_CALL(*this, filterChainInfo()).WillByDefault(ReturnRef(filter_chain_info_));
+}
 MockFilterChain::~MockFilterChain() = default;
+
+MockFilterChainInfo::MockFilterChainInfo() {
+  ON_CALL(*this, name()).WillByDefault([this]() { return absl::string_view{filter_chain_name_}; });
+}
 
 MockFilterChainManager::MockFilterChainManager() = default;
 MockFilterChainManager::~MockFilterChainManager() = default;
@@ -138,15 +150,13 @@ MockListenSocket::MockListenSocket()
   ON_CALL(*this, options()).WillByDefault(ReturnRef(options_));
   ON_CALL(*this, ioHandle()).WillByDefault(ReturnRef(*io_handle_));
   ON_CALL(testing::Const(*this), ioHandle()).WillByDefault(ReturnRef(*io_handle_));
-  ON_CALL(*this, close()).WillByDefault(Invoke([this]() { socket_is_open_ = false; }));
-  ON_CALL(testing::Const(*this), isOpen()).WillByDefault(Invoke([this]() {
-    return socket_is_open_;
-  }));
+  ON_CALL(*this, close()).WillByDefault([this]() { socket_is_open_ = false; });
+  ON_CALL(testing::Const(*this), isOpen()).WillByDefault([this]() { return socket_is_open_; });
   ON_CALL(*this, ipVersion())
       .WillByDefault(Return(connection_info_provider_->localAddress()->ip()->version()));
-  ON_CALL(*this, duplicate()).WillByDefault(Invoke([]() {
+  ON_CALL(*this, duplicate()).WillByDefault([]() {
     return std::make_unique<NiceMock<MockListenSocket>>();
-  }));
+  });
 }
 
 MockSocketOption::MockSocketOption() {
@@ -173,17 +183,15 @@ MockListener::MockListener() = default;
 MockListener::~MockListener() { onDestroy(); }
 
 MockConnectionHandler::MockConnectionHandler() {
-  ON_CALL(*this, incNumConnections()).WillByDefault(Invoke([this]() {
-    ++num_handler_connections_;
-  }));
-  ON_CALL(*this, decNumConnections()).WillByDefault(Invoke([this]() {
-    --num_handler_connections_;
-  }));
-  ON_CALL(*this, numConnections()).WillByDefault(Invoke([this]() {
-    return num_handler_connections_;
-  }));
+  ON_CALL(*this, incNumConnections()).WillByDefault([this]() { ++num_handler_connections_; });
+  ON_CALL(*this, decNumConnections()).WillByDefault([this]() { --num_handler_connections_; });
+  ON_CALL(*this, numConnections()).WillByDefault([this]() { return num_handler_connections_; });
 }
 MockConnectionHandler::~MockConnectionHandler() = default;
+
+MockUdpListenerWorkerRouter::~MockUdpListenerWorkerRouter() = default;
+
+MockNonDispatchedUdpPacketHandler::~MockNonDispatchedUdpPacketHandler() = default;
 
 MockIp::MockIp() = default;
 MockIp::~MockIp() = default;

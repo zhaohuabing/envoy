@@ -1,16 +1,20 @@
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.validate.h"
+#include "envoy/network/address.h"
 
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/network/redis_proxy/config.h"
 
+#include "test/mocks/api/mocks.h"
 #include "test/mocks/server/factory_context.h"
-#include "test/test_common/test_runtime.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using testing::_;
+using testing::NiceMock;
+using testing::Return;
+using testing::ReturnRef;
 
 namespace Envoy {
 namespace Extensions {
@@ -19,8 +23,10 @@ namespace RedisProxy {
 
 TEST(RedisProxyFilterConfigFactoryTest, ValidateFail) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
-  EXPECT_THROW(RedisProxyFilterConfigFactory().createFilterFactoryFromProto(
-                   envoy::extensions::filters::network::redis_proxy::v3::RedisProxy(), context),
+  EXPECT_THROW(RedisProxyFilterConfigFactory()
+                   .createFilterFactoryFromProto(
+                       envoy::extensions::filters::network::redis_proxy::v3::RedisProxy(), context)
+                   .IgnoreError(),
                ProtoValidationException);
 }
 
@@ -35,8 +41,8 @@ TEST(RedisProxyFilterConfigFactoryTest, NoUpstreamDefined) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
   EXPECT_THROW_WITH_MESSAGE(
-      RedisProxyFilterConfigFactory().createFilterFactoryFromProto(config, context), EnvoyException,
-      "cannot configure a redis-proxy without any upstream");
+      RedisProxyFilterConfigFactory().createFilterFactoryFromProto(config, context).IgnoreError(),
+      EnvoyException, "cannot configure a redis-proxy without any upstream");
 }
 
 TEST(RedisProxyFilterConfigFactoryTest, RedisProxyNoSettings) {
@@ -72,6 +78,7 @@ prefix_routes:
   catch_all_route:
     cluster: fake_cluster
 stat_prefix: foo
+custom_commands: [example.parse]
 settings:
   op_timeout: 0.02s
   )EOF";
@@ -80,10 +87,11 @@ settings:
   TestUtility::loadFromYamlAndValidate(yaml, proto_config);
   NiceMock<Server::Configuration::MockFactoryContext> context;
   RedisProxyFilterConfigFactory factory;
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context);
-  EXPECT_TRUE(factory.isTerminalFilterByProto(proto_config, context));
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
+  EXPECT_TRUE(factory.isTerminalFilterByProto(proto_config, context.serverFactoryContext()));
   Network::MockConnection connection;
   EXPECT_CALL(connection, addReadFilter(_));
+  EXPECT_CALL(context.server_factory_context_.cluster_manager_, grpcAsyncClientManager()).Times(0);
   cb(connection);
 }
 
@@ -105,7 +113,7 @@ settings:
 
   TestUtility::loadFromYamlAndValidate(yaml, proto_config);
 
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context);
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
   Network::MockConnection connection;
   EXPECT_CALL(connection, addReadFilter(_));
   cb(connection);
@@ -141,23 +149,267 @@ settings:
   TestUtility::loadFromYamlAndValidate(yaml, proto_config);
   NiceMock<Server::Configuration::MockFactoryContext> context;
   RedisProxyFilterConfigFactory factory;
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context);
-  EXPECT_TRUE(factory.isTerminalFilterByProto(proto_config, context));
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
+  EXPECT_TRUE(factory.isTerminalFilterByProto(proto_config, context.serverFactoryContext()));
   Network::MockConnection connection;
   EXPECT_CALL(connection, addReadFilter(_));
   cb(connection);
 }
 
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(RedisProxyFilterConfigFactoryTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.redis_proxy";
+// Validates that a value of connection_rate_limit above 0 isn't rejected.
+TEST(RedisProxyFilterConfigFactoryTest, ValidConnectionRateLimit) {
+  const std::string yaml = R"EOF(
+prefix_routes:
+  catch_all_route:
+    cluster: fake_cluster
+stat_prefix: foo
+settings:
+  op_timeout: 0.02s
+  connection_rate_limit:
+   connection_rate_limit_per_sec: 1
+  )EOF";
 
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedNetworkFilterConfigFactory>::getFactory(
-          deprecated_name));
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProxy proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  RedisProxyFilterConfigFactory factory;
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
+  EXPECT_TRUE(factory.isTerminalFilterByProto(proto_config, context.serverFactoryContext()));
+  Network::MockConnection connection;
+  EXPECT_CALL(connection, addReadFilter(_));
+  cb(connection);
 }
+
+// Validates that a value of connection_rate_limit 0 is rejected.
+TEST(RedisProxyFilterConfigFactoryTest, InvalidConnectionRateLimit) {
+  const std::string yaml = R"EOF(
+prefix_routes:
+  catch_all_route:
+    cluster: fake_cluster
+stat_prefix: foo
+settings:
+  op_timeout: 0.02s
+  connection_rate_limit:
+   connection_rate_limit_per_sec: 0
+  )EOF";
+
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProxy proto_config;
+  EXPECT_THROW_WITH_REGEX(TestUtility::loadFromYamlAndValidate(yaml, proto_config),
+                          ProtoValidationException,
+                          "ConnectionRateLimitPerSec: value must be greater than 0");
+}
+
+// Verify async gRPC client is created if external auth is enabled.
+TEST(RedisProxyFilterConfigFactoryTest, ExternalAuthProvider) {
+  const std::string yaml = R"EOF(
+prefix_routes:
+  catch_all_route:
+    cluster: fake_cluster
+stat_prefix: foo
+settings:
+  op_timeout: 0.02s
+  connection_rate_limit:
+   connection_rate_limit_per_sec: 1
+external_auth_provider:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: "external_auth_cluster"
+      )EOF";
+
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProxy proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  RedisProxyFilterConfigFactory factory;
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
+  EXPECT_TRUE(factory.isTerminalFilterByProto(proto_config, context.serverFactoryContext()));
+  Network::MockConnection connection;
+  EXPECT_CALL(connection, addReadFilter(_));
+  EXPECT_CALL(context.server_factory_context_.cluster_manager_, grpcAsyncClientManager());
+  cb(connection);
+}
+
+TEST(RedisProxyFilterProtocolOptionsConfigImplTest, DefaultCredentials) {
+  const std::string yaml = R"EOF(
+auth_username:
+  inline_string: default_username
+auth_password:
+  inline_string: default_password
+credentials:
+  - address:
+      socket_address:
+        address: address1
+        port_value: 1234
+    auth_username:
+      inline_string: address1_username
+    auth_password:
+      inline_string: address1_password
+  )EOF";
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProtocolOptions proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+  const auto config = ProtocolOptionsConfigImpl(proto_config);
+  NiceMock<Api::MockApi> api;
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance =
+      *Network::Utility::resolveUrl("tcp://127.0.0.1:1234");
+  const std::string hostname = "address2";
+  ON_CALL(*host, hostname()).WillByDefault(ReturnRef(hostname));
+  ON_CALL(*host, address()).WillByDefault(Return(instance));
+  const auto credentials = config.authCredentials(api, host);
+  EXPECT_EQ("default_username", credentials.username);
+  EXPECT_EQ("default_password", credentials.password);
+}
+
+TEST(RedisProxyFilterProtocolOptionsConfigImplTest, CredentialsWithHostnames) {
+  const std::string yaml = R"EOF(
+auth_username:
+  inline_string: default_username
+auth_password:
+  inline_string: default_password
+credentials:
+  - address:
+      socket_address:
+        address: address1
+        port_value: 1234
+    auth_username:
+      inline_string: address1_username
+    auth_password:
+      inline_string: address1_password
+  - address:
+      socket_address:
+        address: address2
+        port_value: 1234
+    auth_username:
+      inline_string: address2_username
+    auth_password:
+      inline_string: address2_password
+  - address:
+      socket_address:
+        address: address2
+        port_value: 2345
+    auth_username:
+      inline_string: address2_2_username
+    auth_password:
+      inline_string: address2_2_password
+  )EOF";
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProtocolOptions proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+  const auto config = ProtocolOptionsConfigImpl(proto_config);
+  NiceMock<Api::MockApi> api;
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host1 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance1 =
+      *Network::Utility::resolveUrl("tcp://127.0.0.1:1234");
+  const std::string hostname1 = "address1";
+  ON_CALL(*host1, hostname()).WillByDefault(ReturnRef(hostname1));
+  ON_CALL(*host1, address()).WillByDefault(Return(instance1));
+  const auto credentials1 = config.authCredentials(api, host1);
+  EXPECT_EQ("address1_username", credentials1.username);
+  EXPECT_EQ("address1_password", credentials1.password);
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host2 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance2 =
+      *Network::Utility::resolveUrl("tcp://127.0.0.2:1234");
+  const std::string hostname2 = "address2";
+  ON_CALL(*host2, hostname()).WillByDefault(ReturnRef(hostname2));
+  ON_CALL(*host2, address()).WillByDefault(Return(instance2));
+  const auto credentials2 = config.authCredentials(api, host2);
+  EXPECT_EQ("address2_username", credentials2.username);
+  EXPECT_EQ("address2_password", credentials2.password);
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host3 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance3 =
+      *Network::Utility::resolveUrl("tcp://127.0.0.2:2345");
+  ON_CALL(*host3, hostname()).WillByDefault(ReturnRef(hostname2));
+  ON_CALL(*host3, address()).WillByDefault(Return(instance3));
+  const auto credentials3 = config.authCredentials(api, host3);
+  EXPECT_EQ("address2_2_username", credentials3.username);
+  EXPECT_EQ("address2_2_password", credentials3.password);
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host9 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance9 =
+      *Network::Utility::resolveUrl("tcp://127.0.0.9:1234");
+  const auto credentials9 = config.authCredentials(api, host9);
+  const std::string hostname9 = "address9";
+  ON_CALL(*host9, hostname()).WillByDefault(ReturnRef(hostname9));
+  ON_CALL(*host9, address()).WillByDefault(Return(instance9));
+
+  // Ensure that the defaults are used if the host is not found.
+  EXPECT_EQ("default_username", credentials9.username);
+  EXPECT_EQ("default_password", credentials9.password);
+}
+
+TEST(RedisProxyFilterProtocolOptionsConfigImplTest, CredentialsWithIpAddresses) {
+  const std::string yaml = R"EOF(
+auth_username:
+  inline_string: default_username
+auth_password:
+  inline_string: default_password
+credentials:
+  - address:
+      socket_address:
+        address: 127.0.0.1
+        port_value: 1234
+    auth_username:
+      inline_string: address1_username
+    auth_password:
+      inline_string: address1_password
+  - address:
+      socket_address:
+        address: ::1
+        port_value: 1234
+    auth_username:
+      inline_string: address2_username
+    auth_password:
+      inline_string: address2_password
+  )EOF";
+  envoy::extensions::filters::network::redis_proxy::v3::RedisProtocolOptions proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+  const auto config = ProtocolOptionsConfigImpl(proto_config);
+  NiceMock<Api::MockApi> api;
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host1 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance1 =
+      *Network::Utility::resolveUrl("tcp://127.0.0.1:1234");
+  ON_CALL(*host1, hostname()).WillByDefault(ReturnRef(EMPTY_STRING));
+  ON_CALL(*host1, address()).WillByDefault(Return(instance1));
+  const auto credentials1 = config.authCredentials(api, host1);
+  EXPECT_EQ("address1_username", credentials1.username);
+  EXPECT_EQ("address1_password", credentials1.password);
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host2 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance2 =
+      *Network::Utility::resolveUrl("tcp://[::1]:1234");
+  ON_CALL(*host2, hostname()).WillByDefault(ReturnRef(EMPTY_STRING));
+  ON_CALL(*host2, address()).WillByDefault(Return(instance2));
+  const auto credentials2 = config.authCredentials(api, host2);
+  EXPECT_EQ("address2_username", credentials2.username);
+  EXPECT_EQ("address2_password", credentials2.password);
+
+  const std::shared_ptr<NiceMock<Upstream::MockHost>> host9 =
+      std::make_shared<NiceMock<Upstream::MockHost>>();
+  const Network::Address::InstanceConstSharedPtr instance9 =
+      *Network::Utility::resolveUrl("tcp://127.0.0.9:1234");
+  ON_CALL(*host9, hostname()).WillByDefault(ReturnRef(EMPTY_STRING));
+  ON_CALL(*host9, address()).WillByDefault(Return(instance9));
+
+  // Ensure that the defaults are used if the host is not found.
+  const auto credentials9 = config.authCredentials(api, host9);
+  EXPECT_EQ("default_username", credentials9.username);
+  EXPECT_EQ("default_password", credentials9.password);
+}
+
+// The proto ``protocol_version`` → ``ProxyFilterConfig::protocolVersion()`` read (which
+// config.cc forwards to the conn pool) is unit-pinned by
+// RedisProxyFilterConfigTest.ProtocolVersionDefaultsToResp2 / .ProtocolVersionResp3IsHonored in
+// proxy_filter_test.cc; its observable RESP2 vs RESP3 effect is covered end-to-end by the
+// RESP2/RESP3 fixtures in proxy_filter_test.cc and redis_proxy_integration_test.cc.
 
 } // namespace RedisProxy
 } // namespace NetworkFilters

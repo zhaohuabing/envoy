@@ -8,7 +8,7 @@ load(
 licenses(["notice"])  # Apache 2
 
 # Connection limit L4 network filter
-# Public docs: docs/root/configuration/network_filters/connection_limit_filter.rst
+# Public docs: https://envoyproxy.io/docs/envoy/latest/configuration/listeners/network_filters/connection_limit_filter
 
 envoy_extension_package()
 
@@ -21,8 +21,11 @@ envoy_cc_library(
         "//envoy/network:filter_interface",
         "//envoy/runtime:runtime_interface",
         "//envoy/stats:stats_macros",
+        "//source/common/config:well_known_names",
         "//source/common/protobuf:utility_lib",
         "//source/common/runtime:runtime_lib",
+        "//source/common/stats:utility_lib",
+        "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/extensions/filters/network/connection_limit/v3:pkg_cc_proto",
     ],
 )

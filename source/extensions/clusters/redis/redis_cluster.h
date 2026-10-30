@@ -50,7 +50,7 @@
 #include "source/common/network/utility.h"
 #include "source/common/stats/isolated_store_impl.h"
 #include "source/common/upstream/cluster_factory_impl.h"
-#include "source/common/upstream/load_balancer_impl.h"
+#include "source/common/upstream/load_balancer_context_base.h"
 #include "source/common/upstream/outlier_detection_impl.h"
 #include "source/common/upstream/resource_manager_impl.h"
 #include "source/common/upstream/upstream_impl.h"
@@ -90,14 +90,13 @@ namespace Redis {
 
 class RedisCluster : public Upstream::BaseDynamicClusterImpl {
 public:
-  RedisCluster(const envoy::config::cluster::v3::Cluster& cluster,
-               const envoy::extensions::clusters::redis::v3::RedisClusterConfig& redis_cluster,
-               NetworkFilters::Common::Redis::Client::ClientFactory& client_factory,
-               Upstream::ClusterManager& cluster_manager, Runtime::Loader& runtime, Api::Api& api,
-               Network::DnsResolverSharedPtr dns_resolver,
-               Server::Configuration::TransportSocketFactoryContextImpl& factory_context,
-               Stats::ScopePtr&& stats_scope, bool added_via_api,
-               ClusterSlotUpdateCallBackSharedPtr factory);
+  ~RedisCluster() override;
+  static absl::StatusOr<std::unique_ptr<RedisCluster>>
+  create(const envoy::config::cluster::v3::Cluster& cluster,
+         const envoy::extensions::clusters::redis::v3::RedisClusterConfig& redis_cluster,
+         Upstream::ClusterFactoryContext& context,
+         NetworkFilters::Common::Redis::Client::ClientFactory& client_factory,
+         Network::DnsResolverSharedPtr dns_resolver, ClusterSlotUpdateCallBackSharedPtr factory);
 
   struct ClusterSlotsRequest : public Extensions::NetworkFilters::Common::Redis::RespValue {
   public:
@@ -114,11 +113,37 @@ public:
     static ClusterSlotsRequest instance_;
   };
 
+  // INFO command request for zone discovery
+  struct InfoRequest : public Extensions::NetworkFilters::Common::Redis::RespValue {
+  public:
+    InfoRequest() {
+      type(Extensions::NetworkFilters::Common::Redis::RespType::Array);
+      std::vector<NetworkFilters::Common::Redis::RespValue> values(1);
+      values[0].type(NetworkFilters::Common::Redis::RespType::BulkString);
+      values[0].asString() = "INFO";
+      asArray().swap(values);
+    }
+
+    static InfoRequest instance_;
+  };
+
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
 
-  TimeSource& timeSource() const { return time_source_; }
+  // Parse availability_zone from INFO response for zone discovery.
+  static const std::string parseAvailabilityZone(const std::string& info_response);
+
+  /// TimeSource& timeSource() const { return time_source_; }
+
+protected:
+  RedisCluster(const envoy::config::cluster::v3::Cluster& cluster,
+               const envoy::extensions::clusters::redis::v3::RedisClusterConfig& redis_cluster,
+               Upstream::ClusterFactoryContext& context,
+               NetworkFilters::Common::Redis::Client::ClientFactory& client_factory,
+               Network::DnsResolverSharedPtr dns_resolver,
+               ClusterSlotUpdateCallBackSharedPtr factory, absl::Status& creation_status);
 
 private:
+  friend class RedisClusterFactory;
   friend class RedisClusterTest;
 
   void startPreInit() override;
@@ -126,7 +151,7 @@ private:
   void updateAllHosts(const Upstream::HostVector& hosts_added,
                       const Upstream::HostVector& hosts_removed, uint32_t priority);
 
-  void onClusterSlotUpdate(ClusterSlotsPtr&&);
+  void onClusterSlotUpdate(ClusterSlotsSharedPtr&&, const HostZoneMap& host_zone_map = {});
 
   void reloadHealthyHostsHelper(const Upstream::HostSharedPtr& host) override;
 
@@ -143,23 +168,38 @@ private:
   // A redis node in the Redis cluster.
   class RedisHost : public Upstream::HostImpl {
   public:
+    // Factory method with optional zone parameter - sets locality.zone on the host if provided
+    static absl::StatusOr<std::unique_ptr<RedisHost>>
+    create(Upstream::ClusterInfoConstSharedPtr cluster, const std::string& hostname,
+           Network::Address::InstanceConstSharedPtr address, RedisCluster& parent, bool primary,
+           const std::optional<std::string>& zone = std::nullopt);
+
+    // Constructor with optional zone - creates locality with zone set if non-empty
     RedisHost(Upstream::ClusterInfoConstSharedPtr cluster, const std::string& hostname,
               Network::Address::InstanceConstSharedPtr address, RedisCluster& parent, bool primary,
-              TimeSource& time_source)
+              const std::optional<std::string>& zone, absl::Status& creation_status)
         : Upstream::HostImpl(
-              cluster, hostname, address,
+              creation_status, cluster, hostname, address,
               // TODO(zyfjeff): Created through metadata shared pool
               std::make_shared<envoy::config::core::v3::Metadata>(parent.lbEndpoint().metadata()),
+              std::make_shared<envoy::config::core::v3::Metadata>(
+                  parent.localityLbEndpoint().metadata()),
               parent.lbEndpoint().load_balancing_weight().value(),
-              parent.localityLbEndpoint().locality(),
+              // TODO(adisuissa): Convert to use a shared pool of localities.
+              makeLocalityWithZone(parent.localityLbEndpoint().locality(), zone),
               parent.lbEndpoint().endpoint().health_check_config(),
-              parent.localityLbEndpoint().priority(), parent.lbEndpoint().health_status(),
-              time_source),
+              parent.localityLbEndpoint().priority(), parent.lbEndpoint().health_status()),
           primary_(primary) {}
 
     bool isPrimary() const { return primary_; }
 
   private:
+    // Helper to create Locality proto with zone set if provided.
+    // Returns shared copy of base locality if zone is nullopt.
+    static std::shared_ptr<const envoy::config::core::v3::Locality>
+    makeLocalityWithZone(const envoy::config::core::v3::Locality& base_locality,
+                         const std::optional<std::string>& zone);
+
     const bool primary_;
   };
 
@@ -198,18 +238,58 @@ private:
 
   using RedisDiscoveryClientPtr = std::unique_ptr<RedisDiscoveryClient>;
 
+  // Callback handler for zone discovery INFO requests
+  struct ZoneDiscoveryCallback
+      : public Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks {
+    ZoneDiscoveryCallback(RedisDiscoverySession& parent, const std::string& address,
+                          bool is_primary)
+        : parent_(parent), address_(address), is_primary_(is_primary) {}
+
+    // Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks
+    void onResponse(NetworkFilters::Common::Redis::RespValuePtr&& value) override;
+    void onFailure() override;
+    void onRedirection(NetworkFilters::Common::Redis::RespValuePtr&&, const std::string&,
+                       bool) override {}
+
+    RedisDiscoverySession& parent_;
+    const std::string address_;
+    const bool is_primary_;
+  };
+
+  using ZoneDiscoveryCallbackPtr = std::unique_ptr<ZoneDiscoveryCallback>;
+
   struct RedisDiscoverySession
       : public Extensions::NetworkFilters::Common::Redis::Client::Config,
-        public Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks {
+        public Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks,
+        public std::enable_shared_from_this<RedisDiscoverySession> {
     RedisDiscoverySession(RedisCluster& parent,
                           NetworkFilters::Common::Redis::Client::ClientFactory& client_factory);
 
     ~RedisDiscoverySession() override;
 
+    // Cancels all in-flight discovery work (the CLUSTER SLOTS request, zone-discovery INFO
+    // requests, hostname resolutions), disables the resolve timer, and closes all discovery
+    // clients. ~RedisCluster() calls this before dropping its reference to the session: each
+    // discovery client holds a shared_ptr back to the session (as its client Config), so the
+    // session outlives the cluster until the deferred deletion of its closed clients runs.
+    // After shutdown() the session is inert; no callback can reach it or the destroyed cluster.
+    void shutdown();
+
     void registerDiscoveryAddress(std::list<Network::DnsResponse>&& response, const uint32_t port);
 
     // Start discovery against a random host from existing hosts
     void startResolveRedis();
+
+    // Re-arms the resolve timer to fire immediately. Requested by the cluster refresh manager;
+    // no-op once the session has been shut down.
+    void requestImmediateRefresh();
+
+    // Zone discovery methods
+    void startZoneDiscovery(ClusterSlotsSharedPtr slots);
+    void onZoneResponse(std::string address, bool is_primary,
+                        NetworkFilters::Common::Redis::RespValuePtr&& value);
+    void onZoneDiscoveryFailure(std::string address, bool is_primary);
+    void finishZoneDiscovery();
 
     // Extensions::NetworkFilters::Common::Redis::Client::Config
     bool disableOutlierEvents() const override { return true; }
@@ -222,7 +302,9 @@ private:
     uint32_t maxBufferSizeBeforeFlush() const override { return 0; }
     std::chrono::milliseconds bufferFlushTimeoutInMs() const override { return buffer_timeout_; }
     uint32_t maxUpstreamUnknownConnections() const override { return 0; }
-    bool enableCommandStats() const override { return false; }
+    bool enableCommandStats() const override { return true; }
+    bool connectionRateLimitEnabled() const override { return false; }
+    uint32_t connectionRateLimitPerSec() const override { return 0; }
     // For any readPolicy other than Primary, the RedisClientFactory will send a READONLY command
     // when establishing a new connection. Since we're only using this for making the "cluster
     // slots" commands, the READONLY command is not relevant in this context. We're setting it to
@@ -235,14 +317,19 @@ private:
     void onResponse(NetworkFilters::Common::Redis::RespValuePtr&& value) override;
     void onFailure() override;
     // Note: Below callback isn't used in topology updates
-    bool onRedirection(NetworkFilters::Common::Redis::RespValuePtr&&, const std::string&,
-                       bool) override {
-      return true;
-    }
+    void onRedirection(NetworkFilters::Common::Redis::RespValuePtr&&, const std::string&,
+                       bool) override {}
     void onUnexpectedResponse(const NetworkFilters::Common::Redis::RespValuePtr&);
 
     Network::Address::InstanceConstSharedPtr
-    ProcessCluster(const NetworkFilters::Common::Redis::RespValue& value);
+    ipAddressFromClusterEntry(const std::vector<NetworkFilters::Common::Redis::RespValue>& array);
+    bool validateCluster(const NetworkFilters::Common::Redis::RespValue& value);
+    void resolveClusterHostnames(ClusterSlotsSharedPtr&& slots,
+                                 std::shared_ptr<std::uint64_t> hostname_resolution_required_cnt);
+    void resolveReplicas(ClusterSlotsSharedPtr slots, std::size_t index,
+                         std::shared_ptr<std::uint64_t> hostname_resolution_required_cnt);
+    void finishClusterHostnameResolution(ClusterSlotsSharedPtr slots);
+    void updateDnsStats(Network::DnsResolver::ResolutionStatus status, bool empty_response);
 
     RedisCluster& parent_;
     Event::Dispatcher& dispatcher_;
@@ -256,6 +343,27 @@ private:
     NetworkFilters::Common::Redis::Client::ClientFactory& client_factory_;
     const std::chrono::milliseconds buffer_timeout_;
     NetworkFilters::Common::Redis::RedisCommandStatsSharedPtr redis_command_stats_;
+
+    // Zone discovery state
+    ClusterSlotsSharedPtr pending_zone_discovery_slots_;
+    std::atomic<uint32_t> pending_zone_requests_{0};
+    absl::node_hash_map<std::string, ZoneDiscoveryCallbackPtr> zone_callbacks_;
+    absl::node_hash_map<std::string,
+                        Extensions::NetworkFilters::Common::Redis::Client::PoolRequest*>
+        zone_requests_;
+    HostZoneMap discovered_zones_; // address -> zone mapping from INFO responses
+
+  private:
+    // In-flight hostname resolutions for CLUSTER SLOTS entries that returned hostnames instead
+    // of IP addresses (e.g. AWS ElastiCache). The resolve() handles are tracked so shutdown()
+    // can cancel them; completed queries unregister themselves by id.
+    absl::node_hash_map<uint64_t, Network::ActiveDnsQuery*> active_dns_queries_;
+    uint64_t next_dns_query_id_{0};
+
+    // Set once by shutdown(). All discovery work runs on the main thread and ~RedisCluster()
+    // calls shutdown() before tearing anything else down, so `!shutdown_` implies `parent_` is
+    // still valid.
+    bool shutdown_{false};
   };
 
   Upstream::ClusterManager& cluster_manager_;
@@ -272,7 +380,7 @@ private:
   const envoy::config::endpoint::v3::ClusterLoadAssignment load_assignment_;
   const LocalInfo::LocalInfo& local_info_;
   Random::RandomGenerator& random_;
-  RedisDiscoverySession redis_discovery_session_;
+  std::shared_ptr<RedisDiscoverySession> redis_discovery_session_;
   const ClusterSlotUpdateCallBackSharedPtr lb_factory_;
 
   Upstream::HostVector hosts_;
@@ -281,7 +389,8 @@ private:
   const std::string auth_password_;
   const std::string cluster_name_;
   const Common::Redis::ClusterRefreshManagerSharedPtr refresh_manager_;
-  const Common::Redis::ClusterRefreshManager::HandlePtr registration_handle_;
+  Common::Redis::ClusterRefreshManager::HandlePtr registration_handle_;
+  const bool enable_zone_discovery_;
 };
 
 class RedisClusterFactory : public Upstream::ConfigurableClusterFactoryBase<
@@ -292,13 +401,12 @@ public:
 private:
   friend class RedisClusterTest;
 
-  std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>
+  absl::StatusOr<
+      std::pair<Upstream::ClusterImplBaseSharedPtr, Upstream::ThreadAwareLoadBalancerPtr>>
   createClusterWithConfig(
       const envoy::config::cluster::v3::Cluster& cluster,
       const envoy::extensions::clusters::redis::v3::RedisClusterConfig& proto_config,
-      Upstream::ClusterFactoryContext& context,
-      Server::Configuration::TransportSocketFactoryContextImpl& socket_factory_context,
-      Stats::ScopePtr&& stats_scope) override;
+      Upstream::ClusterFactoryContext& context) override;
 };
 } // namespace Redis
 } // namespace Clusters

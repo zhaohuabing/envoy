@@ -15,34 +15,40 @@ InjectedResourceMonitor::InjectedResourceMonitor(
     const envoy::extensions::resource_monitors::injected_resource::v3::InjectedResourceConfig&
         config,
     Server::Configuration::ResourceMonitorFactoryContext& context)
-    : filename_(config.filename()), file_changed_(true),
-      watcher_(context.mainThreadDispatcher().createFilesystemWatcher()), api_(context.api()) {
-  watcher_->addWatch(filename_, Filesystem::Watcher::Events::MovedTo,
-                     [this](uint32_t) { onFileChanged(); });
+    : filename_(config.filename()),
+      watcher_(context.mainThreadDispatcher().createFilesystemWatcher()), api_(context.api()) {}
+
+absl::Status InjectedResourceMonitor::init() {
+  return watcher_->addWatch(filename_, Filesystem::Watcher::Events::MovedTo, [this](uint32_t) {
+    onFileChanged();
+    return absl::OkStatus();
+  });
 }
 
 void InjectedResourceMonitor::onFileChanged() { file_changed_ = true; }
 
-void InjectedResourceMonitor::updateResourceUsage(Server::ResourceMonitor::Callbacks& callbacks) {
+void InjectedResourceMonitor::updateResourceUsage(Server::ResourceUpdateCallbacks& callbacks) {
   if (file_changed_) {
     file_changed_ = false;
-    TRY_ASSERT_MAIN_THREAD {
-      const std::string contents = api_.fileSystem().fileReadToEnd(filename_);
+    auto file_or_error = api_.fileSystem().fileReadToEnd(filename_);
+    if (!file_or_error.ok()) {
+      error_ = file_or_error.status();
+      pressure_.reset();
+    } else {
+      const std::string contents = file_or_error.value();
       double pressure;
       if (absl::SimpleAtod(contents, &pressure)) {
         if (pressure < 0 || pressure > 1) {
-          throw EnvoyException("pressure out of range");
+          error_ = absl::InvalidArgumentError("pressure out of range");
+          pressure_.reset();
+        } else {
+          pressure_ = pressure;
+          error_.reset();
         }
-        pressure_ = pressure;
-        error_.reset();
       } else {
-        throw EnvoyException("failed to parse injected resource pressure");
+        error_ = absl::InvalidArgumentError("failed to parse injected resource pressure");
+        pressure_.reset();
       }
-    }
-    END_TRY
-    catch (const EnvoyException& error) {
-      error_ = error;
-      pressure_.reset();
     }
   }
 

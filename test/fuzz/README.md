@@ -8,7 +8,7 @@ page](https://github.com/google/oss-fuzz/blob/master/docs/ideal_integration.md).
 
 Tests should be unit test-like, fast and not require writable access to the filesystem (beyond
 temporary files), network (including loopback) or multiple processes. See the [ClusterFuzz
-environment](https://github.com/google/oss-fuzz/blob/master/docs/fuzzer_environment.md) for further
+environment](https://github.com/google/oss-fuzz/blob/master/docs/further-reading/fuzzer_environment.md) for further
 details.
 
 ## Corpus
@@ -95,8 +95,10 @@ your local machine vs. the fuzz cluster). The binary takes the location of the s
 directory. Fuzzing continues indefinitely until a bug is found or the number of iterations it should
 perform is specified with `-runs`. For example,
 
-`bazel run //test/common/common:base64_fuzz_test --config asan-fuzzer
---test/common/common/base64_corpus -runs=1000`
+```console
+bazel run //test/common/common:base64_fuzz_test --config asan-fuzzer \
+    -- test/common/common/base64_corpus -runs=1000
+```
 
 The fuzzer prints information to stderr:
 
@@ -162,13 +164,20 @@ understand the scope and efficacy of the Envoy fuzzers. You can generate fuzz co
 
 To generate fuzz coverage reports locally (see [Coverage builds](bazel/README.md), run
 ```
-FUZZ_COVERAGE=true test/run_envoy_bazel_coverage.sh
+bazel run @envoy_toolshed//coverage:run -- \
+  --fuzz \
+  --config=fuzz-coverage \
+  --validate-config=fuzz-coverage-config \
+  --validate-target=//tools/coverage:report.validate
 ```
+`test/run_envoy_bazel_coverage.sh` remains available as a compatibility wrapper and honours the
+`FUZZ_COVERAGE` and `VALIDATE_COVERAGE` environment variables.
+
 This generates a coverage report after running the fuzz targets for one minute against the fuzzing engine libfuzzer and using the checked-in corpus as an initial seed.
 
 Otherwise, you can generate reports from the
 ClusterFuzz corpus following the general ClusterFuzz [instructions for profiling
-setup](https://github.com/google/oss-fuzz/blob/master/docs/code_coverage.md).
+setup](https://google.github.io/oss-fuzz/advanced-topics/code-coverage/).
 
 To filter out unrelated artifacts (e.g. Bazel cache, libfuzzer src), the following profile command
 can be used:

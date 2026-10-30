@@ -4,9 +4,13 @@
 #include "source/extensions/filters/http/grpc_json_transcoder/config.h"
 
 #include "test/mocks/server/factory_context.h"
+#include "test/test_common/environment.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+
+using testing::_;
+using testing::NiceMock;
 
 namespace Envoy {
 namespace Extensions {
@@ -16,21 +20,67 @@ namespace {
 
 TEST(GrpcJsonTranscoderFilterConfigTest, ValidateFail) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
-  EXPECT_THROW(GrpcJsonTranscoderFilterConfig().createFilterFactoryFromProto(
-                   envoy::extensions::filters::http::grpc_json_transcoder::v3::GrpcJsonTranscoder(),
-                   "stats", context),
-               ProtoValidationException);
+  EXPECT_THROW(
+      GrpcJsonTranscoderFilterConfig()
+          .createFilterFactoryFromProto(
+              envoy::extensions::filters::http::grpc_json_transcoder::v3::GrpcJsonTranscoder(),
+              "stats", context)
+          .value(),
+      ProtoValidationException);
 }
 
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(GrpcJsonTranscoderFilterConfigTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.grpc_json_transcoder";
+TEST(GrpcJsonTranscoderFilterConfigTest, ValidateFailWithServerContext) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+  EXPECT_THROW(
+      GrpcJsonTranscoderFilterConfig()
+          .createHttpFilterFactoryFromProto(
+              envoy::extensions::filters::http::grpc_json_transcoder::v3::GrpcJsonTranscoder(),
+              context, extra_context)
+          .value(),
+      ProtoValidationException);
+}
 
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedHttpFilterConfigFactory>::getFactory(
-          deprecated_name));
+class GrpcJsonTranscoderFilterFactoryTest : public testing::Test {
+protected:
+  void SetUp() override {
+    api_ = Api::createApiForTest();
+    // Load the descriptor file content into the config
+    auto descriptor_bytes =
+        api_->fileSystem()
+            .fileReadToEnd(TestEnvironment::runfilesPath("test/proto/bookstore.descriptor"))
+            .value();
+    config_.set_proto_descriptor_bin(descriptor_bytes);
+    config_.add_services("bookstore.Bookstore");
+  }
+
+  Api::ApiPtr api_;
+  envoy::extensions::filters::http::grpc_json_transcoder::v3::GrpcJsonTranscoder config_;
+};
+
+TEST_F(GrpcJsonTranscoderFilterFactoryTest, CreateFilterFactoryFromProto) {
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  GrpcJsonTranscoderFilterConfig factory;
+
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(config_, "stats", context).value();
+  NiceMock<Http::MockFilterChainFactoryCallbacks> filter_callback;
+  EXPECT_CALL(filter_callback, addStreamFilter(_));
+  cb(filter_callback);
+}
+
+TEST_F(GrpcJsonTranscoderFilterFactoryTest, CreateFilterFactoryFromProtoWithServerContext) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  GrpcJsonTranscoderFilterConfig factory;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(config_, context, extra_context).value();
+  NiceMock<Http::MockFilterChainFactoryCallbacks> filter_callback;
+  EXPECT_CALL(filter_callback, addStreamFilter(_));
+  cb(filter_callback);
 }
 
 } // namespace

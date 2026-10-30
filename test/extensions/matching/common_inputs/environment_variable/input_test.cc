@@ -10,14 +10,14 @@ namespace EnvironmentVariable {
 
 TEST(InputTest, BasicUsage) {
   {
-    Input input("foo");
-    ASSERT_TRUE(input.get().has_value());
-    EXPECT_EQ(input.get().value(), "foo");
+    auto foo = "foo";
+    Input input(foo);
+    EXPECT_EQ(input.get().stringData().value(), "foo");
   }
 
-  Input input("foo");
-  ASSERT_TRUE(input.get().has_value());
-  EXPECT_EQ(input.get().value(), "foo");
+  auto foo = "foo";
+  Input input(foo);
+  EXPECT_EQ(input.get().stringData().value(), "foo");
 }
 } // namespace EnvironmentVariable
 } // namespace CommonInputs

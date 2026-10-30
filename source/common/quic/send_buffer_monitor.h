@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "quiche/quic/core/quic_stream.h"
 
 namespace Envoy {
@@ -29,7 +31,7 @@ public:
 
 protected:
   // Update the monitor with the new buffered bytes and check watermark threshold.
-  virtual void updateBytesBuffered(size_t old_buffered_bytes, size_t new_buffered_bytes) = 0;
+  virtual void updateBytesBuffered(uint64_t old_buffered_bytes, uint64_t new_buffered_bytes) = 0;
 
   bool isDoingWatermarkAccounting() const { return is_doing_watermark_accounting_; }
 

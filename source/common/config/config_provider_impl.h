@@ -149,7 +149,7 @@ public:
       std::function<ConfigProvider::ConfigConstSharedPtr(ConfigProvider::ConfigConstSharedPtr)>;
 
   struct LastConfigInfo {
-    absl::optional<uint64_t> last_config_hash_;
+    std::optional<uint64_t> last_config_hash_;
     std::string last_config_version_;
   };
 
@@ -164,7 +164,7 @@ public:
 
   const SystemTime& lastUpdated() const { return last_updated_; }
 
-  const absl::optional<LastConfigInfo>& configInfo() const { return config_info_; }
+  const std::optional<LastConfigInfo>& configInfo() const { return config_info_; }
 
   ConfigProvider::ConfigConstSharedPtr getConfig() { return tls_->config_; }
 
@@ -172,9 +172,10 @@ public:
    * Must be called by derived classes when the onConfigUpdate() callback associated with the
    * underlying subscription is issued.
    */
-  void onConfigUpdate() {
+  absl::Status onConfigUpdate() {
     setLastUpdated();
     local_init_target_.ready();
+    return absl::OkStatus();
   }
 
   /**
@@ -196,23 +197,7 @@ protected:
 
   ConfigSubscriptionCommonBase(const std::string& name, const uint64_t manager_identifier,
                                ConfigProviderManagerImplBase& config_provider_manager,
-                               Server::Configuration::ServerFactoryContext& factory_context)
-      : name_(name), tls_(factory_context.threadLocal()),
-        local_init_target_(
-            fmt::format("ConfigSubscriptionCommonBase local init target '{}'", name_),
-            [this]() { start(); }),
-        parent_init_target_(fmt::format("ConfigSubscriptionCommonBase init target '{}'", name_),
-                            [this]() { local_init_manager_.initialize(local_init_watcher_); }),
-        local_init_watcher_(fmt::format("ConfigSubscriptionCommonBase local watcher '{}'", name_),
-                            [this]() { parent_init_target_.ready(); }),
-        local_init_manager_(
-            fmt::format("ConfigSubscriptionCommonBase local init manager '{}'", name_)),
-        manager_identifier_(manager_identifier), config_provider_manager_(config_provider_manager),
-        time_source_(factory_context.timeSource()),
-        last_updated_(factory_context.timeSource().systemTime()) {
-    Envoy::Config::Utility::checkLocalInfo(name, factory_context.localInfo());
-    local_init_manager_.add(local_init_target_);
-  }
+                               Server::Configuration::ServerFactoryContext& factory_context);
 
   /**
    * Propagates a config update to worker threads.
@@ -224,12 +209,12 @@ protected:
 
   void setLastUpdated() { last_updated_ = time_source_.systemTime(); }
   Init::Manager& localInitManager() { return local_init_manager_; }
-  void setLastConfigInfo(absl::optional<LastConfigInfo>&& config_info) {
+  void setLastConfigInfo(std::optional<LastConfigInfo>&& config_info) {
     config_info_ = std::move(config_info);
   }
 
   const std::string name_;
-  absl::optional<LastConfigInfo> config_info_;
+  std::optional<LastConfigInfo> config_info_;
   // This slot holds a Config implementation in each thread, which is intended to be shared between
   // config providers from the same config source.
   ThreadLocal::TypedSlot<ThreadLocalConfig> tls_;
@@ -351,6 +336,7 @@ protected:
 
   // Envoy::Config::ConfigProvider
   ConfigConstSharedPtr getConfig() const override { return subscription_->getConfig(); }
+  ConfigProtoVector getConfigProtos() const override { return {}; }
 
   ConfigSubscriptionCommonBaseSharedPtr subscription_;
 
@@ -376,7 +362,7 @@ private:
  * This class can not be instantiated directly; instead, it provides the foundation for
  * dynamic config provider implementations which derive from it.
  */
-class ConfigProviderManagerImplBase : public ConfigProviderManager, public Singleton::Instance {
+class ConfigProviderManagerImplBase : public ConfigProviderManager {
 public:
   /**
    * This is invoked by the /config_dump admin handler.
@@ -394,7 +380,7 @@ protected:
   using ConfigSubscriptionMap =
       absl::node_hash_map<uint64_t, std::weak_ptr<ConfigSubscriptionCommonBase>>;
 
-  ConfigProviderManagerImplBase(Server::Admin& admin, const std::string& config_name);
+  ConfigProviderManagerImplBase(OptRef<Server::Admin> admin, const std::string& config_name);
 
   const ConfigSubscriptionMap& configSubscriptions() const { return config_subscriptions_; }
 

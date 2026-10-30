@@ -16,6 +16,7 @@
 #include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
 
+using testing::Ge;
 namespace Envoy {
 namespace {
 
@@ -119,9 +120,13 @@ void WebsocketWithCompressorIntegrationTest::validateUpgradeResponseHeaders(
   EXPECT_THAT(&proxied_response_headers, HeaderMapEqualIgnoreOrder(&original_response_headers));
 }
 
-INSTANTIATE_TEST_SUITE_P(Protocols, WebsocketWithCompressorIntegrationTest,
-                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
-                         HttpProtocolIntegrationTest::protocolTestParamsToString);
+// TODO(#26236): Fix test suite for HTTP/3.
+INSTANTIATE_TEST_SUITE_P(
+    Protocols, WebsocketWithCompressorIntegrationTest,
+    testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams(
+        /*downstream_protocols = */ {Envoy::Http::CodecType::HTTP1, Envoy::Http::CodecType::HTTP2},
+        /*upstream_protocols = */ {Envoy::Http::CodecType::HTTP1, Envoy::Http::CodecType::HTTP2})),
+    HttpProtocolIntegrationTest::protocolTestParamsToString);
 
 ConfigHelper::HttpModifierFunction setRouteUsingWebsocket() {
   return [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
@@ -159,8 +164,8 @@ void WebsocketWithCompressorIntegrationTest::performUpgrade(
   auto encoder_decoder = codec_client_->startRequest(upgrade_request_headers);
   request_encoder_ = &encoder_decoder.first;
   response_ = std::move(encoder_decoder.second);
-  test_server_->waitForCounterGe("http.config_test.downstream_cx_upgrades_total", 1);
-  test_server_->waitForGaugeGe("http.config_test.downstream_cx_upgrades_active", 1);
+  test_server_->waitForCounter("http.config_test.downstream_cx_upgrades_total", Ge(1));
+  test_server_->waitForGauge("http.config_test.downstream_cx_upgrades_active", Ge(1));
 
   // Verify the upgrade was received upstream.
   ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
@@ -239,9 +244,12 @@ TEST_P(WebsocketWithCompressorIntegrationTest, NonWebsocketUpgrade) {
   ASSERT_EQ(1, response_uncompressed_counter->value());
 }
 
-INSTANTIATE_TEST_SUITE_P(Protocols, CompressorProxyingConnectIntegrationTest,
-                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
-                         HttpProtocolIntegrationTest::protocolTestParamsToString);
+INSTANTIATE_TEST_SUITE_P(
+    Protocols, CompressorProxyingConnectIntegrationTest,
+    testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams(
+        /*downstream_protocols = */ {Envoy::Http::CodecType::HTTP1, Envoy::Http::CodecType::HTTP2},
+        /*upstream_protocols = */ {Envoy::Http::CodecType::HTTP1, Envoy::Http::CodecType::HTTP2})),
+    HttpProtocolIntegrationTest::protocolTestParamsToString);
 
 void CompressorProxyingConnectIntegrationTest::initialize() {
   config_helper_.addConfigModifier(
@@ -268,12 +276,7 @@ TEST_P(CompressorProxyingConnectIntegrationTest, ProxyConnect) {
   RELEASE_ASSERT(result, result.message());
   ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
   EXPECT_EQ(upstream_request_->headers().get(Http::Headers::get().Method)[0]->value(), "CONNECT");
-  if (upstreamProtocol() == Http::CodecType::HTTP1) {
-    EXPECT_TRUE(upstream_request_->headers().get(Http::Headers::get().Protocol).empty());
-  } else {
-    EXPECT_EQ(upstream_request_->headers().get(Http::Headers::get().Protocol)[0]->value(),
-              "bytestream");
-  }
+  EXPECT_TRUE(upstream_request_->headers().get(Http::Headers::get().Protocol).empty());
 
   // Send response headers
   upstream_request_->encodeHeaders(default_response_headers_, false);

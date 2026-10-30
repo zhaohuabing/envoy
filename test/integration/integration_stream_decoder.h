@@ -10,6 +10,7 @@
 #include "envoy/http/metadata_interface.h"
 
 #include "source/common/common/dump_state_utils.h"
+#include "source/common/http/response_decoder_impl_base.h"
 
 #include "test/test_common/utility.h"
 
@@ -21,21 +22,23 @@ namespace Envoy {
 /**
  * Stream decoder wrapper used during integration testing.
  */
-class IntegrationStreamDecoder : public Http::ResponseDecoder, public Http::StreamCallbacks {
+class IntegrationStreamDecoder : public Http::ResponseDecoderImplBase,
+                                 public Http::StreamCallbacks {
 public:
   IntegrationStreamDecoder(Event::Dispatcher& dispatcher);
+  ~IntegrationStreamDecoder() override;
 
   const std::string& body() { return body_; }
   bool complete() { return saw_end_stream_; }
   bool reset() { return saw_reset_; }
   Http::StreamResetReason resetReason() { return reset_reason_; }
-  const Http::ResponseHeaderMap* continueHeaders() { return continue_headers_.get(); }
+  const Http::ResponseHeaderMap* informationalHeaders() { return continue_headers_.get(); }
   const Http::ResponseHeaderMap& headers() { return *headers_; }
   const Http::ResponseTrailerMapPtr& trailers() { return trailers_; }
   const Http::MetadataMap& metadataMap() { return *metadata_map_; }
   uint64_t keyCount(std::string key) { return duplicated_metadata_key_count_[key]; }
   uint32_t metadataMapsDecodedCount() const { return metadata_maps_decoded_count_; }
-  void waitForContinueHeaders();
+  void waitFor1xxHeaders();
   void waitForHeaders();
   // This function waits until body_ has at least size bytes in it (it might have more). clearBody()
   // can be used if the previous body data is not relevant and the test wants to wait for a specific
@@ -45,6 +48,13 @@ public:
   waitForEndStream(std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);
   ABSL_MUST_USE_RESULT testing::AssertionResult
   waitForReset(std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);
+  ABSL_MUST_USE_RESULT testing::AssertionResult
+  waitForAnyTermination(std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);
+  ABSL_MUST_USE_RESULT testing::AssertionResult
+  waitForWithDispatcherRun(const std::function<bool()>& condition, absl::string_view description,
+                           std::chrono::milliseconds timeout);
+  std::string debugState() const;
+  bool isFinished() const { return saw_end_stream_ || saw_reset_; }
   void clearBody() { body_.clear(); }
 
   // Http::StreamDecoder
@@ -52,7 +62,7 @@ public:
   void decodeMetadata(Http::MetadataMapPtr&& metadata_map) override;
 
   // Http::ResponseDecoder
-  void decode100ContinueHeaders(Http::ResponseHeaderMapPtr&& headers) override;
+  void decode1xxHeaders(Http::ResponseHeaderMapPtr&& headers) override;
   void decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool end_stream) override;
   void decodeTrailers(Http::ResponseTrailerMapPtr&& trailers) override;
   void dumpState(std::ostream& os, int indent_level) const override {

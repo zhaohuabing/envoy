@@ -53,11 +53,9 @@ public:
 private:
   // Update the key's hash with the new fragment hash.
   void updateHash(const ScopeKeyFragmentBase& fragment) {
-    std::stringbuf buffer;
-    buffer.sputn(reinterpret_cast<const char*>(&hash_), sizeof(hash_));
-    const auto& fragment_hash = fragment.hash();
-    buffer.sputn(reinterpret_cast<const char*>(&fragment_hash), sizeof(fragment_hash));
-    hash_ = HashUtil::xxHash64(buffer.str());
+    const uint64_t hashes[2] = {hash_, fragment.hash()};
+    hash_ = HashUtil::xxHash64(
+        absl::string_view(reinterpret_cast<const char*>(hashes), sizeof(hashes)));
   }
 
   uint64_t hash_{0};
@@ -69,14 +67,27 @@ using ScopeKeyPtr = std::unique_ptr<ScopeKey>;
 // String fragment.
 class StringKeyFragment : public ScopeKeyFragmentBase {
 public:
-  explicit StringKeyFragment(absl::string_view value)
-      : value_(value), hash_(HashUtil::xxHash64(value_)) {}
+  explicit StringKeyFragment(absl::string_view value) : hash_(HashUtil::xxHash64(value)) {}
 
   uint64_t hash() const override { return hash_; }
 
 private:
-  const std::string value_;
   const uint64_t hash_;
+};
+
+/**
+ * The scoped key builder.
+ */
+class ScopeKeyBuilder {
+public:
+  virtual ~ScopeKeyBuilder() = default;
+
+  /**
+   * Based on the incoming HTTP request headers, returns the hash value of its scope key.
+   * @param headers the request headers to match the scoped routing configuration against.
+   * @return unique_ptr of the scope key computed from header.
+   */
+  virtual ScopeKeyPtr computeScopeKey(const Http::HeaderMap&) const PURE;
 };
 
 /**
@@ -87,22 +98,17 @@ public:
   ~ScopedConfig() override = default;
 
   /**
-   * Based on the incoming HTTP request headers, returns the configuration to use for selecting a
-   * target route.
-   * @param headers the request headers to match the scoped routing configuration against.
+   * Based on the scope key, returns the configuration to use for selecting a target route.
+   * The scope key can be got via ScopeKeyBuilder.
+   *
+   * @param scope_key the scope key. null config will be returned when null.
    * @return ConfigConstSharedPtr the router's Config matching the request headers.
    */
-  virtual ConfigConstSharedPtr getRouteConfig(const Http::HeaderMap& headers) const PURE;
-
-  /**
-   * Based on the incoming HTTP request headers, returns the hash value of its scope key.
-   * @param headers the request headers to match the scoped routing configuration against.
-   * @return unique_ptr of the scope key computed from header.
-   */
-  virtual ScopeKeyPtr computeScopeKey(const Http::HeaderMap&) const { return {}; }
+  virtual ConfigConstSharedPtr getRouteConfig(const ScopeKeyPtr& scope_key) const PURE;
 };
 
 using ScopedConfigConstSharedPtr = std::shared_ptr<const ScopedConfig>;
+using ScopeKeyBuilderPtr = std::unique_ptr<const ScopeKeyBuilder>;
 
 } // namespace Router
 } // namespace Envoy

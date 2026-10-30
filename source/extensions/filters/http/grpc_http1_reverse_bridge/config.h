@@ -12,19 +12,20 @@ namespace HttpFilters {
 namespace GrpcHttp1ReverseBridge {
 
 class Config
-    : public Common::FactoryBase<
+    : public Common::UnifiedFactoryBase<
           envoy::extensions::filters::http::grpc_http1_reverse_bridge::v3::FilterConfig,
           envoy::extensions::filters::http::grpc_http1_reverse_bridge::v3::FilterConfigPerRoute> {
 public:
-  Config() : FactoryBase("envoy.filters.http.grpc_http1_reverse_bridge") {}
+  Config() : UnifiedFactoryBase("envoy.filters.http.grpc_http1_reverse_bridge") {}
 
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::grpc_http1_reverse_bridge::v3::FilterConfig& config,
-      const std::string& stat_prefix,
-      Envoy::Server::Configuration::FactoryContext& context) override;
+      Envoy::Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 
 private:
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::grpc_http1_reverse_bridge::v3::FilterConfigPerRoute&
           proto_config,
       Server::Configuration::ServerFactoryContext& context,

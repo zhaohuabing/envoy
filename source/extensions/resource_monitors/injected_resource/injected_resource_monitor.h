@@ -24,18 +24,20 @@ public:
           config,
       Server::Configuration::ResourceMonitorFactoryContext& context);
 
+  absl::Status init();
+
   // Server::ResourceMonitor
-  void updateResourceUsage(Server::ResourceMonitor::Callbacks& callbacks) override;
+  void updateResourceUsage(Server::ResourceUpdateCallbacks& callbacks) override;
 
 protected:
   virtual void onFileChanged();
 
 private:
   const std::string filename_;
-  bool file_changed_;
+  bool file_changed_{true};
   Filesystem::WatcherPtr watcher_;
-  absl::optional<double> pressure_;
-  absl::optional<EnvoyException> error_;
+  std::optional<double> pressure_;
+  std::optional<absl::Status> error_;
   Api::Api& api_;
 };
 

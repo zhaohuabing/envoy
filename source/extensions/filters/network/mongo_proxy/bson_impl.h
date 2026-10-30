@@ -151,11 +151,7 @@ public:
   Type type() const override { return type_; }
 
 private:
-  void checkType(Type type) const {
-    if (type_ != type) {
-      ExceptionUtil::throwEnvoyException("invalid BSON field type cast");
-    }
-  }
+  void checkType(Type type) const;
 
   /**
    * All of the possible variadic values that a field can be.
@@ -182,9 +178,10 @@ class DocumentImpl : public Document,
                      public std::enable_shared_from_this<DocumentImpl> {
 public:
   static DocumentSharedPtr create() { return DocumentSharedPtr{new DocumentImpl()}; }
-  static DocumentSharedPtr create(Buffer::Instance& data) {
+  static DocumentSharedPtr create(Buffer::Instance& data, uint32_t max_depth,
+                                  uint32_t current_depth = 0) {
     std::shared_ptr<DocumentImpl> new_doc{new DocumentImpl()};
-    new_doc->fromBuffer(data);
+    new_doc->fromBuffer(data, max_depth, current_depth);
     return new_doc;
   }
 
@@ -270,7 +267,7 @@ public:
 private:
   DocumentImpl() = default;
 
-  void fromBuffer(Buffer::Instance& data);
+  void fromBuffer(Buffer::Instance& data, uint32_t max_depth, uint32_t current_depth);
 
   std::list<FieldPtr> fields_;
 };

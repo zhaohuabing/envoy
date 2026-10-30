@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 #include <vector>
 
 #include "envoy/api/api.h"
@@ -12,6 +13,7 @@
 #include "envoy/server/watchdog.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats.h"
+#include "envoy/stats/stats_macros.h"
 
 #include "source/common/common/lock_guard.h"
 #include "source/common/common/logger.h"
@@ -19,10 +21,22 @@
 #include "source/common/event/libevent.h"
 #include "source/server/watchdog_impl.h"
 
-#include "absl/types/optional.h"
-
 namespace Envoy {
 namespace Server {
+
+/**
+ * All per-thread watchdog stats. @see stats_macros.h
+ */
+#define ALL_WATCHDOG_STATS(COUNTER)                                                                \
+  COUNTER(watchdog_miss)                                                                           \
+  COUNTER(watchdog_mega_miss)
+
+/**
+ * Struct definition for all per-thread watchdog stats. @see stats_macros.h
+ */
+struct WatchDogStats {
+  ALL_WATCHDOG_STATS(GENERATE_COUNTER_STRUCT)
+};
 
 /**
  * This feature performs deadlock detection stats collection & enforcement.
@@ -118,11 +132,10 @@ private:
 
     const WatchDogImplSharedPtr dog_;
     MonotonicTime last_checkin_;
-    absl::optional<MonotonicTime> last_alert_time_;
+    std::optional<MonotonicTime> last_alert_time_;
     bool miss_alerted_{};
     bool megamiss_alerted_{};
-    Stats::Counter& miss_counter_;
-    Stats::Counter& megamiss_counter_;
+    WatchDogStats stats_;
   };
   using WatchedDogPtr = std::unique_ptr<WatchedDog>;
 

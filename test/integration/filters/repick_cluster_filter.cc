@@ -9,6 +9,7 @@
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/extensions/filters/http/common/empty_http_filter_config.h"
+#include "test/integration/filters/test_filters.pb.h"
 
 #include "absl/strings/str_format.h"
 
@@ -21,17 +22,21 @@ class RepickClusterFilter : public Http::PassThroughFilter {
 public:
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& request_header, bool) override {
     request_header.addCopy(Envoy::Http::LowerCaseString(ClusterHeaderName), ClusterName);
-    decoder_callbacks_->clearRouteCache();
+    decoder_callbacks_->downstreamCallbacks()->clearRouteCache();
     return Http::FilterHeadersStatus::Continue;
   }
 };
 
-class RepickClusterFilterConfig : public Extensions::HttpFilters::Common::EmptyHttpFilterConfig {
+class RepickClusterFilterConfig
+    : public Extensions::HttpFilters::Common::UniqueEmptyHttpFilterConfig<
+          test::integration::filters::RepickClusterFilterConfig> {
 public:
-  RepickClusterFilterConfig() : EmptyHttpFilterConfig("repick-cluster-filter") {}
+  RepickClusterFilterConfig()
+      : UniqueEmptyHttpFilterConfig<test::integration::filters::RepickClusterFilterConfig>(
+            "repick-cluster-filter") {}
 
-  Http::FilterFactoryCb createFilter(const std::string&,
-                                     Server::Configuration::FactoryContext&) override {
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilter(const std::string&, Server::Configuration::FactoryContext&) override {
     return [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       callbacks.addStreamFilter(
           std::make_shared<::Envoy::RepickClusterFilter::RepickClusterFilter>());

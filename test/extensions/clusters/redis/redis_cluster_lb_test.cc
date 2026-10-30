@@ -6,7 +6,9 @@
 #include "test/common/upstream/utility.h"
 #include "test/mocks/common.h"
 #include "test/mocks/upstream/cluster_info.h"
+#include "test/mocks/upstream/priority_set.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/status_utility.h"
 
 using testing::Return;
 
@@ -19,32 +21,43 @@ class TestLoadBalancerContext : public RedisLoadBalancerContext,
                                 public Upstream::LoadBalancerContextBase {
 public:
   TestLoadBalancerContext(uint64_t hash_key, bool is_read,
-                          NetworkFilters::Common::Redis::Client::ReadPolicy read_policy)
-      : hash_key_(hash_key), is_read_(is_read), read_policy_(read_policy) {}
+                          NetworkFilters::Common::Redis::Client::ReadPolicy read_policy,
+                          const std::string& client_zone = "")
+      : hash_key_(hash_key), is_read_(is_read), read_policy_(read_policy),
+        client_zone_(client_zone) {}
 
-  TestLoadBalancerContext(absl::optional<uint64_t> hash) : hash_key_(hash) {}
+  TestLoadBalancerContext(std::optional<uint64_t> hash) : hash_key_(hash) {}
 
   // Upstream::LoadBalancerContext
-  absl::optional<uint64_t> computeHashKey() override { return hash_key_; }
+  std::optional<uint64_t> computeHashKey() override { return hash_key_; }
 
   bool isReadCommand() const override { return is_read_; };
   NetworkFilters::Common::Redis::Client::ReadPolicy readPolicy() const override {
     return read_policy_;
   };
+  const std::string& clientZone() const override { return client_zone_; }
 
-  absl::optional<uint64_t> hash_key_;
-  bool is_read_;
-  NetworkFilters::Common::Redis::Client::ReadPolicy read_policy_;
+  std::optional<uint64_t> hash_key_;
+  bool is_read_{};
+  NetworkFilters::Common::Redis::Client::ReadPolicy read_policy_{};
+  std::string client_zone_;
 };
 
 class RedisClusterLoadBalancerTest : public Event::TestUsingSimulatedTime, public testing::Test {
 public:
   RedisClusterLoadBalancerTest() = default;
 
+  // Helper to create a host with locality zone set
+  Upstream::HostSharedPtr makeHostWithZone(const std::string& url, const std::string& zone) {
+    envoy::config::core::v3::Locality locality;
+    locality.set_zone(zone);
+    return Upstream::makeTestHost(info_, url, locality);
+  }
+
   void init() {
     factory_ = std::make_shared<RedisClusterLoadBalancerFactory>(random_);
     lb_ = std::make_unique<RedisClusterThreadAwareLoadBalancer>(factory_);
-    lb_->initialize();
+    EXPECT_OK(lb_->initialize());
     factory_->onHostHealthUpdate();
   }
 
@@ -52,19 +65,21 @@ public:
                           const std::vector<std::pair<uint32_t, uint32_t>>& expected_assignments,
                           bool read_command = false,
                           NetworkFilters::Common::Redis::Client::ReadPolicy read_policy =
-                              NetworkFilters::Common::Redis::Client::ReadPolicy::Primary) {
+                              NetworkFilters::Common::Redis::Client::ReadPolicy::Primary,
+                          const std::string& client_zone = "") {
 
-    Upstream::LoadBalancerPtr lb = lb_->factory()->create();
+    Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
     for (auto& assignment : expected_assignments) {
-      TestLoadBalancerContext context(assignment.first, read_command, read_policy);
-      auto host = lb->chooseHost(&context);
+      TestLoadBalancerContext context(assignment.first, read_command, read_policy, client_zone);
+      auto host = lb->chooseHost(&context).host;
       EXPECT_FALSE(host == nullptr);
       EXPECT_EQ(hosts[assignment.second]->address()->asString(), host->address()->asString());
     }
   }
 
-  static std::pair<std::string, Upstream::HostSharedPtr> makePair(Upstream::HostSharedPtr host) {
-    return std::make_pair(host->address()->asString(), std::move(host));
+  static std::pair<std::string, Upstream::HostSharedPtr>
+  makePair(const Upstream::HostSharedPtr& host) {
+    return {host->address()->asString(), host};
   }
 
   Upstream::HostMap generateHostMap(Upstream::HostVector& hosts) {
@@ -77,6 +92,10 @@ public:
   std::unique_ptr<RedisClusterThreadAwareLoadBalancer> lb_;
   std::shared_ptr<Upstream::MockClusterInfo> info_{new NiceMock<Upstream::MockClusterInfo>()};
   NiceMock<Random::MockRandomGenerator> random_;
+
+  // Just use this as parameters of create() method but thread aware load balancer will not use it.
+  NiceMock<Upstream::MockPrioritySet> worker_priority_set_;
+  Upstream::LoadBalancerParams lb_params_{worker_priority_set_, {}};
 };
 
 class RedisLoadBalancerContextImplTest : public testing::Test {
@@ -97,14 +116,36 @@ public:
 // Works correctly without any hosts.
 TEST_F(RedisClusterLoadBalancerTest, NoHost) {
   init();
-  EXPECT_EQ(nullptr, lb_->factory()->create()->chooseHost(nullptr));
+  EXPECT_EQ(nullptr, lb_->factory()->create(lb_params_)->chooseHost(nullptr).host);
 };
+
+// Verify stub LB interface methods return expected defaults.
+TEST_F(RedisClusterLoadBalancerTest, LoadBalancerStubMethods) {
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90")};
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(
+      std::vector<ClusterSlot>{ClusterSlot(0, 16383, hosts[0]->address())});
+  Upstream::HostMap all_hosts = generateHostMap(hosts);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+
+  // peekAnotherHost is not implemented and always returns nullptr.
+  EXPECT_EQ(nullptr, lb->peekAnotherHost(nullptr));
+
+  // selectExistingConnection is not implemented and always returns nullopt.
+  std::vector<uint8_t> hash_key;
+  EXPECT_EQ(std::nullopt, lb->selectExistingConnection(nullptr, *hosts[0], hash_key));
+
+  // lifetimeCallbacks is not implemented and returns empty OptRef.
+  EXPECT_FALSE(lb->lifetimeCallbacks().has_value());
+}
 
 // Works correctly with empty context
 TEST_F(RedisClusterLoadBalancerTest, NoHash) {
-  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92", simTime())};
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92")};
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
       ClusterSlot(0, 1000, hosts[0]->address()),
@@ -118,14 +159,14 @@ TEST_F(RedisClusterLoadBalancerTest, NoHash) {
   };
   init();
   factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
-  TestLoadBalancerContext context(absl::nullopt);
-  EXPECT_EQ(nullptr, lb_->factory()->create()->chooseHost(&context));
+  TestLoadBalancerContext context(std::nullopt);
+  EXPECT_EQ(nullptr, lb_->factory()->create(lb_params_)->chooseHost(&context).host);
 };
 
 TEST_F(RedisClusterLoadBalancerTest, Basic) {
-  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92", simTime())};
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92")};
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
       ClusterSlot(0, 1000, hosts[0]->address()),
@@ -147,12 +188,55 @@ TEST_F(RedisClusterLoadBalancerTest, Basic) {
   validateAssignment(hosts, expected_assignments);
 }
 
+TEST_F(RedisClusterLoadBalancerTest, Shard) {
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92")};
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 1000, hosts[0]->address()),
+      ClusterSlot(1001, 2000, hosts[1]->address()),
+      ClusterSlot(2001, 16383, hosts[2]->address()),
+  });
+  Upstream::HostMap all_hosts{
+      {hosts[0]->address()->asString(), hosts[0]},
+      {hosts[1]->address()->asString(), hosts[1]},
+      {hosts[2]->address()->asString(), hosts[2]},
+  };
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // A list of (hash: host_index) pair
+  // Simple read command
+  std::vector<NetworkFilters::Common::Redis::RespValue> get_foo(2);
+  get_foo[0].type(NetworkFilters::Common::Redis::RespType::BulkString);
+  get_foo[0].asString() = "get";
+  get_foo[1].type(NetworkFilters::Common::Redis::RespType::BulkString);
+  get_foo[1].asString() = "foo";
+
+  NetworkFilters::Common::Redis::RespValue get_request;
+  get_request.type(NetworkFilters::Common::Redis::RespType::Array);
+  get_request.asArray().swap(get_foo);
+
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+  for (uint16_t i = 0; i < 5; i++) {
+    RedisSpecifyShardContextImpl context(i, get_request);
+    auto host = lb->chooseHost(&context).host;
+    if (i < 3) {
+      EXPECT_FALSE(host == nullptr);
+      EXPECT_EQ(hosts[i]->address()->asString(), host->address()->asString());
+    } else {
+      EXPECT_TRUE(host == nullptr);
+    }
+  }
+}
+
 TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesHealthy) {
   Upstream::HostVector hosts{
-      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91", simTime()),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),
   };
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
@@ -191,10 +275,10 @@ TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesHealthy) {
 
 TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesUnhealthyPrimary) {
   Upstream::HostVector hosts{
-      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91", simTime()),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),
   };
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
@@ -238,10 +322,10 @@ TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesUnhealthyPrimary) {
 
 TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesUnhealthyReplica) {
   Upstream::HostVector hosts{
-      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90", simTime()),
-      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91", simTime()),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),
   };
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
@@ -284,8 +368,8 @@ TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesUnhealthyReplica) {
 }
 
 TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesNoReplica) {
-  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime())};
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91")};
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
       ClusterSlot(0, 2000, hosts[0]->address()),
@@ -308,16 +392,16 @@ TEST_F(RedisClusterLoadBalancerTest, ReadStrategiesNoReplica) {
   validateAssignment(hosts, primary_assignments, true,
                      NetworkFilters::Common::Redis::Client::ReadPolicy::PreferReplica);
 
-  Upstream::LoadBalancerPtr lb = lb_->factory()->create();
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
   TestLoadBalancerContext context(1100, true,
                                   NetworkFilters::Common::Redis::Client::ReadPolicy::Replica);
-  auto host = lb->chooseHost(&context);
+  auto host = lb->chooseHost(&context).host;
   EXPECT_TRUE(host == nullptr);
 }
 
 TEST_F(RedisClusterLoadBalancerTest, ClusterSlotUpdate) {
-  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime())};
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91")};
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
       ClusterSlot(0, 1000, hosts[0]->address()), ClusterSlot(1001, 16383, hosts[1]->address())});
   Upstream::HostMap all_hosts{{hosts[0]->address()->asString(), hosts[0]},
@@ -346,17 +430,72 @@ TEST_F(RedisClusterLoadBalancerTest, ClusterSlotUpdate) {
   validateAssignment(hosts, updated_assignments);
 }
 
+// Verifies that a worker-local LB instance refreshes its slot and shard
+// snapshot when the worker priority set fires its member update callback,
+// rather than relying on the cluster manager to recreate the LB.
+TEST_F(RedisClusterLoadBalancerTest, LoadBalancerRefreshesOnMemberUpdate) {
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91")};
+  Upstream::HostMap all_hosts{{hosts[0]->address()->asString(), hosts[0]},
+                              {hosts[1]->address()->asString(), hosts[1]}};
+  init();
+
+  // Install the initial slot assignment.
+  factory_->onClusterSlotUpdate(std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+                                    ClusterSlot(0, 1000, hosts[0]->address()),
+                                    ClusterSlot(1001, 16383, hosts[1]->address())}),
+                                all_hosts);
+
+  // Create a single LB *before* any further slot updates and exercise it.
+  Upstream::LoadBalancerPtr lb = lb_->factory()->create(lb_params_);
+  {
+    TestLoadBalancerContext context(100); // slot 100 → hosts[0]
+    EXPECT_EQ(hosts[0]->address()->asString(),
+              lb->chooseHost(&context).host->address()->asString());
+    TestLoadBalancerContext context2(2100); // slot 2100 → hosts[1]
+    EXPECT_EQ(hosts[1]->address()->asString(),
+              lb->chooseHost(&context2).host->address()->asString());
+  }
+
+  // Update slot assignment in the factory so that slot 2100 now maps to hosts[0].
+  factory_->onClusterSlotUpdate(
+      std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+          ClusterSlot(0, 1000, hosts[0]->address()), ClusterSlot(1001, 2000, hosts[1]->address()),
+          ClusterSlot(2001, 16383, hosts[0]->address())}),
+      all_hosts);
+
+  // Until the worker priority set fires its member update callback, the LB
+  // still holds the previous snapshot.
+  {
+    TestLoadBalancerContext context(2100);
+    EXPECT_EQ(hosts[1]->address()->asString(),
+              lb->chooseHost(&context).host->address()->asString());
+  }
+
+  // Simulate the worker host update broadcast: the cluster manager calls
+  // priority_set_.updateHosts on the worker, which fires every registered
+  // MemberUpdateCb -- including the one the LB installed in its constructor.
+  worker_priority_set_.runUpdateCallbacks(0, {}, {});
+
+  // The same LB instance now picks the updated assignment.
+  {
+    TestLoadBalancerContext context(2100);
+    EXPECT_EQ(hosts[0]->address()->asString(),
+              lb->chooseHost(&context).host->address()->asString());
+  }
+}
+
 TEST_F(RedisClusterLoadBalancerTest, ClusterSlotNoUpdate) {
-  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:90", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91", simTime()),
-                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92", simTime())};
-  Upstream::HostVector replicas{Upstream::makeTestHost(info_, "tcp://127.0.0.2:90", simTime()),
-                                Upstream::makeTestHost(info_, "tcp://127.0.0.2:91", simTime()),
-                                Upstream::makeTestHost(info_, "tcp://127.0.0.2:90", simTime()),
-                                Upstream::makeTestHost(info_, "tcp://127.0.0.2:91", simTime())};
+  Upstream::HostVector hosts{Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:91"),
+                             Upstream::makeTestHost(info_, "tcp://127.0.0.1:92")};
+  Upstream::HostVector replicas{Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+                                Upstream::makeTestHost(info_, "tcp://127.0.0.2:91"),
+                                Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"),
+                                Upstream::makeTestHost(info_, "tcp://127.0.0.2:91")};
 
   ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
       ClusterSlot(0, 1000, hosts[0]->address()),
@@ -410,7 +549,7 @@ TEST_F(RedisLoadBalancerContextImplTest, Basic) {
   RedisLoadBalancerContextImpl context1("foo", true, true, get_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context1.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context1.computeHashKey());
   EXPECT_EQ(true, context1.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context1.readPolicy());
 
@@ -430,7 +569,7 @@ TEST_F(RedisLoadBalancerContextImplTest, Basic) {
   RedisLoadBalancerContextImpl context2("foo", true, true, set_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context2.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context2.computeHashKey());
   EXPECT_EQ(false, context2.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context2.readPolicy());
 }
@@ -452,14 +591,14 @@ TEST_F(RedisLoadBalancerContextImplTest, CompositeArray) {
   RedisLoadBalancerContextImpl context1("foo", true, true, get_request1,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context1.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context1.computeHashKey());
   EXPECT_EQ(true, context1.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context1.readPolicy());
 
   RedisLoadBalancerContextImpl context2("bar", true, true, get_request2,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(37829), context2.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(37829), context2.computeHashKey());
   EXPECT_EQ(true, context2.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context2.readPolicy());
 
@@ -472,7 +611,7 @@ TEST_F(RedisLoadBalancerContextImplTest, CompositeArray) {
   RedisLoadBalancerContextImpl context3("foo", true, true, set_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context3.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context3.computeHashKey());
   EXPECT_EQ(false, context3.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context3.readPolicy());
 }
@@ -492,7 +631,7 @@ TEST_F(RedisLoadBalancerContextImplTest, UpperCaseCommand) {
   RedisLoadBalancerContextImpl context1("foo", true, true, get_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context1.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context1.computeHashKey());
   EXPECT_EQ(true, context1.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context1.readPolicy());
 
@@ -512,7 +651,7 @@ TEST_F(RedisLoadBalancerContextImplTest, UpperCaseCommand) {
   RedisLoadBalancerContextImpl context2("foo", true, true, set_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context2.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context2.computeHashKey());
   EXPECT_EQ(false, context2.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context2.readPolicy());
 }
@@ -528,7 +667,7 @@ TEST_F(RedisLoadBalancerContextImplTest, UnsupportedCommand) {
   RedisLoadBalancerContextImpl context3("foo", true, true, unknown_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context3.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context3.computeHashKey());
   EXPECT_EQ(false, context3.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context3.readPolicy());
 }
@@ -551,9 +690,318 @@ TEST_F(RedisLoadBalancerContextImplTest, EnforceHashTag) {
   RedisLoadBalancerContextImpl context2("{foo}bar", false, true, set_request,
                                         NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
-  EXPECT_EQ(absl::optional<uint64_t>(44950), context2.computeHashKey());
+  EXPECT_EQ(std::optional<uint64_t>(44950), context2.computeHashKey());
   EXPECT_EQ(false, context2.isReadCommand());
   EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::Primary, context2.readPolicy());
+}
+
+TEST_F(RedisLoadBalancerContextImplTest, ClientZone) {
+  std::vector<NetworkFilters::Common::Redis::RespValue> get_foo(2);
+  get_foo[0].type(NetworkFilters::Common::Redis::RespType::BulkString);
+  get_foo[0].asString() = "get";
+  get_foo[1].type(NetworkFilters::Common::Redis::RespType::BulkString);
+  get_foo[1].asString() = "foo";
+
+  NetworkFilters::Common::Redis::RespValue get_request;
+  get_request.type(NetworkFilters::Common::Redis::RespType::Array);
+  get_request.asArray().swap(get_foo);
+
+  // Test with client zone specified
+  RedisLoadBalancerContextImpl context1(
+      "foo", true, true, get_request,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity, "us-east-1a");
+
+  EXPECT_EQ("us-east-1a", context1.clientZone());
+  EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity,
+            context1.readPolicy());
+
+  // Test with empty client zone
+  RedisLoadBalancerContextImpl context2(
+      "foo", true, true, get_request,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary);
+
+  EXPECT_EQ("", context2.clientZone());
+  EXPECT_EQ(NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary,
+            context2.readPolicy());
+}
+
+// Tests for LOCAL_ZONE_AFFINITY read policy with replicas in the same zone
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityWithLocalReplica) {
+  // Setup: primary in zone-a, replica in zone-a (same as client)
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary, zone-a
+      makeHostWithZone("tcp://127.0.0.1:91", "zone-b"), // primary, zone-b
+      makeHostWithZone("tcp://127.0.0.2:90", "zone-a"), // replica for slot 0, zone-a
+      makeHostWithZone("tcp://127.0.0.2:91", "zone-b"), // replica for slot 1, zone-b
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 8000, hosts[0]->address()),
+      ClusterSlot(8001, 16383, hosts[1]->address()),
+  });
+  slots->at(0).addReplica(hosts[2]->address());
+  slots->at(1).addReplica(hosts[3]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Client is in zone-a, should prefer replica in zone-a for slot 0
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 2},    // slot 0: replica in zone-a
+      {8001, 3}, // slot 1: replica in zone-b (no local replica, fall back to any replica)
+  };
+  validateAssignment(hosts, expected_assignments, true,
+                     NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity,
+                     "zone-a");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY when no local replica exists - should fall back to any replica
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityNoLocalReplica) {
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary, zone-a
+      makeHostWithZone("tcp://127.0.0.2:90", "zone-b"), // replica, zone-b
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Client is in zone-c (no local replica), should fall back to any replica
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 1}, // falls back to replica in zone-b
+  };
+  validateAssignment(hosts, expected_assignments, true,
+                     NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity,
+                     "zone-c");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY when no replica exists - should fall back to primary
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityNoReplica) {
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary only
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // No replicas, should fall back to primary
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 0}, // falls back to primary
+  };
+  validateAssignment(hosts, expected_assignments, true,
+                     NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity,
+                     "zone-a");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY with local replica
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityReplicasAndPrimaryWithLocalReplica) {
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary, zone-a
+      makeHostWithZone("tcp://127.0.0.2:90", "zone-a"), // replica, zone-a (same as client)
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Client is in zone-a, should prefer replica in zone-a
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 1}, // replica in zone-a
+  };
+  validateAssignment(
+      hosts, expected_assignments, true,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary,
+      "zone-a");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY - prefer local primary when no local replica
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityReplicasAndPrimaryLocalPrimary) {
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary, zone-a (same as client)
+      makeHostWithZone("tcp://127.0.0.2:90", "zone-b"), // replica, zone-b
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Client is in zone-a, no local replica, but primary is in zone-a
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 0}, // primary in zone-a (no local replica, but local primary)
+  };
+  validateAssignment(
+      hosts, expected_assignments, true,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary,
+      "zone-a");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY - fall back to any replica when no local hosts
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityReplicasAndPrimaryFallbackToReplica) {
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary, zone-a
+      makeHostWithZone("tcp://127.0.0.2:90", "zone-b"), // replica, zone-b
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Client is in zone-c (no local hosts), should fall back to any replica
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 1}, // falls back to replica
+  };
+  validateAssignment(
+      hosts, expected_assignments, true,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary,
+      "zone-c");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY - fall back to primary when no replicas
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityReplicasAndPrimaryNoReplica) {
+  // Hosts must have locality zones set - RedisShard reads zone from host->locality().zone()
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary only, zone-a
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // No replicas, should fall back to primary
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 0}, // falls back to primary
+  };
+  validateAssignment(
+      hosts, expected_assignments, true,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary,
+      "zone-c");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY when zone discovery fails - hosts have no zones set
+// Should fall back to any-replica behavior (same as PreferReplica)
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityZoneDiscoveryFailure) {
+  // Hosts without zone set - simulates zone discovery failure scenario
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"), // primary, no zone
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"), // replica, no zone
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Client has a zone, but hosts don't - should fall back to any replica
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 1}, // falls back to any replica since no host zones match
+  };
+  validateAssignment(hosts, expected_assignments, true,
+                     NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity,
+                     "zone-a");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY - unhealthy local primary falls through
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityReplicasAndPrimaryUnhealthyLocalPrimary) {
+  Upstream::HostVector hosts{
+      makeHostWithZone("tcp://127.0.0.1:90", "zone-a"), // primary, zone-a (same as client)
+      makeHostWithZone("tcp://127.0.0.2:90", "zone-b"), // replica, zone-b
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Mark primary unhealthy - should skip local primary even though zone matches
+  hosts[0]->healthFlagSet(Upstream::Host::HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+
+  // Client is in zone-a, local primary is unhealthy, no local replica → fall back to any replica
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 1}, // falls back to replica in zone-b
+  };
+  validateAssignment(
+      hosts, expected_assignments, true,
+      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityReplicasAndPrimary,
+      "zone-a");
+}
+
+// Tests for LOCAL_ZONE_AFFINITY with empty client zone - should behave like PreferReplica
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityEmptyClientZone) {
+  Upstream::HostVector hosts{
+      Upstream::makeTestHost(info_, "tcp://127.0.0.1:90"), // primary
+      Upstream::makeTestHost(info_, "tcp://127.0.0.2:90"), // replica
+  };
+
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(std::vector<ClusterSlot>{
+      ClusterSlot(0, 16383, hosts[0]->address()),
+  });
+  slots->at(0).addReplica(hosts[1]->address());
+
+  Upstream::HostMap all_hosts;
+  std::transform(hosts.begin(), hosts.end(), std::inserter(all_hosts, all_hosts.end()), makePair);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+
+  // Empty client zone, should fall back to any replica
+  const std::vector<std::pair<uint32_t, uint32_t>> expected_assignments = {
+      {0, 1}, // any replica
+  };
+  validateAssignment(hosts, expected_assignments, true,
+                     NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity, "");
 }
 
 } // namespace Redis

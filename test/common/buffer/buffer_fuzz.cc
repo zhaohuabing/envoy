@@ -2,8 +2,11 @@
 
 #include <fcntl.h>
 
+#include <optional>
+
 #include "envoy/common/platform.h"
 
+#include "source/common/api/os_sys_calls_impl.h"
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
@@ -30,6 +33,9 @@ constexpr uint32_t BufferCount = 3;
 // deallocation, just keep them around until the fuzz run is over.
 struct Context {
   std::vector<std::unique_ptr<Buffer::BufferFragmentImpl>> fragments_;
+  // Bytes extracted the buffer by the current extract*FrontSlice action.
+  // Consumed by the linear buffer to stay in sync.
+  std::optional<uint64_t> extract_size_;
 };
 
 // Bound the maximum allocation size per action. We want this to be able to at
@@ -114,6 +120,22 @@ public:
     ::memcpy(data, this->start() + start, size);
   }
 
+  uint64_t copyOutToSlices(uint64_t length, Buffer::RawSlice* slices,
+                           uint64_t num_slices) const override {
+    uint64_t size_copied = 0;
+    uint64_t num_slices_copied = 0;
+    while (size_copied < length && num_slices_copied < num_slices) {
+      auto copy_length =
+          std::min((length - size_copied), static_cast<uint64_t>(slices[num_slices_copied].len_));
+      ::memcpy(slices[num_slices_copied].mem_, this->start(), copy_length);
+      size_copied += copy_length;
+      if (copy_length == slices[num_slices_copied].len_) {
+        num_slices_copied++;
+      }
+    }
+    return size_copied;
+  }
+
   void drain(uint64_t size) override {
     FUZZ_ASSERT(size <= size_);
     start_ += size;
@@ -121,7 +143,7 @@ public:
   }
 
   Buffer::RawSliceVector
-  getRawSlices(absl::optional<uint64_t> max_slices = absl::nullopt) const override {
+  getRawSlices(std::optional<uint64_t> max_slices = std::nullopt) const override {
     ASSERT(!max_slices.has_value() || max_slices.value() >= 1);
     return {{const_cast<char*>(start()), size_}};
   }
@@ -130,16 +152,28 @@ public:
 
   uint64_t length() const override { return size_; }
 
+  uint64_t sliceCount() const override { PANIC("not implemented"); }
+
   void* linearize(uint32_t /*size*/) override {
     // Sketchy, but probably will work for test purposes.
     return mutableStart();
   }
 
-  Buffer::SliceDataPtr extractMutableFrontSlice() override { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  Buffer::SliceDataPtr extractMutableFrontSlice() override {
+    // No concept of slices, kept in sync via drain
+    PANIC("not implemented");
+  }
+
+  Buffer::SliceDataPtr extractImmutableFrontSlice() override {
+    // No concept of slices, kept in sync via drain
+    PANIC("not implemented");
+  }
 
   void move(Buffer::Instance& rhs) override { move(rhs, rhs.length()); }
 
-  void move(Buffer::Instance& rhs, uint64_t length) override {
+  void move(Buffer::Instance& rhs, uint64_t length) override { move(rhs, length, false); }
+
+  void move(Buffer::Instance& rhs, uint64_t length, bool) override {
     StringBuffer& src = dynamic_cast<StringBuffer&>(rhs);
     add(src.start(), length);
     src.start_ += length;
@@ -185,16 +219,26 @@ public:
     return absl::StartsWith(asStringView(), data);
   }
 
-  std::string toString() const override { return std::string(data_.data() + start_, size_); }
+  std::string toString() const override { return {data_.data() + start_, size_}; }
 
-  void setWatermarks(uint32_t) override {
+  size_t addFragments(absl::Span<const absl::string_view> fragments) override {
+    size_t total_size_to_write = 0;
+
+    for (const auto& fragment : fragments) {
+      total_size_to_write += fragment.size();
+      add(fragment.data(), fragment.size());
+    }
+    return total_size_to_write;
+  }
+
+  void setWatermarks(uint64_t, uint32_t) override {
     // Not implemented.
     // TODO(antoniovicente) Implement and add fuzz coverage as we merge the Buffer::OwnedImpl and
     // WatermarkBuffer implementations.
     ASSERT(false);
   }
 
-  uint32_t highWatermark() const override { return 0; }
+  uint64_t highWatermark() const override { return 0; }
   bool highWatermarkTriggered() const override { return false; }
 
   absl::string_view asStringView() const { return {start(), size_}; }
@@ -290,8 +334,9 @@ uint32_t bufferAction(Context& ctxt, char insert_value, uint32_t max_alloc, Buff
       for (uint32_t i = 0; i < reservation.numSlices(); ++i) {
         ::memset(reservation.slices()[i].mem_, insert_value, reservation.slices()[i].len_);
       }
-      const uint32_t target_length =
-          std::min<uint32_t>(reservation.length(), action.reserve_commit().commit_length());
+      const uint32_t target_length = clampSize(
+          std::min<uint32_t>(reservation.length(), action.reserve_commit().commit_length()),
+          reserve_length);
       reservation.commit(target_length);
     }
     break;
@@ -306,6 +351,18 @@ uint32_t bufferAction(Context& ctxt, char insert_value, uint32_t max_alloc, Buff
     target_buffer.copyOut(start, length, copy_buffer);
     const std::string data = target_buffer.toString();
     FUZZ_ASSERT(::memcmp(copy_buffer, data.data() + start, length) == 0);
+    break;
+  }
+  case test::common::buffer::Action::kCopyOutToSlices: {
+    const uint32_t length =
+        std::min(static_cast<uint32_t>(target_buffer.length()), action.copy_out_to_slices());
+    Buffer::OwnedImpl buffer;
+    auto reservation = buffer.reserveForRead();
+    auto rc = target_buffer.copyOutToSlices(length, reservation.slices(), reservation.numSlices());
+    reservation.commit(rc);
+    const std::string data = buffer.toString();
+    const std::string target_data = target_buffer.toString();
+    FUZZ_ASSERT(::memcmp(data.data(), target_data.data(), reservation.length()) == 0);
     break;
   }
   case test::common::buffer::Action::kDrain: {
@@ -352,25 +409,27 @@ uint32_t bufferAction(Context& ctxt, char insert_value, uint32_t max_alloc, Buff
     if (max_length == 0) {
       break;
     }
-    int pipe_fds[2] = {0, 0};
-    FUZZ_ASSERT(::pipe(pipe_fds) == 0);
-    Network::IoSocketHandleImpl io_handle(pipe_fds[0]);
-    FUZZ_ASSERT(::fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK) == 0);
-    FUZZ_ASSERT(::fcntl(pipe_fds[1], F_SETFL, O_NONBLOCK) == 0);
+    int fds[2] = {0, 0};
+    auto& os_sys_calls = Api::OsSysCallsSingleton::get();
+    FUZZ_ASSERT(os_sys_calls.socketpair(AF_UNIX, SOCK_STREAM, 0, fds).return_value_ == 0);
+    Network::IoSocketHandleImpl io_handle(fds[0]);
+    FUZZ_ASSERT(::fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+    FUZZ_ASSERT(::fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
     std::string data(max_length, insert_value);
-    const ssize_t rc = ::write(pipe_fds[1], data.data(), max_length);
+    const ssize_t rc = ::write(fds[1], data.data(), max_length);
     FUZZ_ASSERT(rc > 0);
     Api::IoCallUint64Result result = io_handle.read(target_buffer, max_length);
     FUZZ_ASSERT(result.return_value_ == static_cast<uint64_t>(rc));
-    FUZZ_ASSERT(::close(pipe_fds[1]) == 0);
+    FUZZ_ASSERT(::close(fds[1]) == 0);
     break;
   }
   case test::common::buffer::Action::kWrite: {
-    int pipe_fds[2] = {0, 0};
-    FUZZ_ASSERT(::pipe(pipe_fds) == 0);
-    Network::IoSocketHandleImpl io_handle(pipe_fds[1]);
-    FUZZ_ASSERT(::fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK) == 0);
-    FUZZ_ASSERT(::fcntl(pipe_fds[1], F_SETFL, O_NONBLOCK) == 0);
+    int fds[2] = {0, 0};
+    auto& os_sys_calls = Api::OsSysCallsSingleton::get();
+    FUZZ_ASSERT(os_sys_calls.socketpair(AF_UNIX, SOCK_STREAM, 0, fds).return_value_ == 0);
+    Network::IoSocketHandleImpl io_handle(fds[1]);
+    FUZZ_ASSERT(::fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
+    FUZZ_ASSERT(::fcntl(fds[1], F_SETFL, O_NONBLOCK) == 0);
     uint64_t return_value;
     do {
       const bool empty = target_buffer.length() == 0;
@@ -384,12 +443,11 @@ uint32_t bufferAction(Context& ctxt, char insert_value, uint32_t max_alloc, Buff
         FUZZ_ASSERT(return_value == 0);
       } else {
         auto buf = std::make_unique<char[]>(return_value);
-        FUZZ_ASSERT(static_cast<uint64_t>(::read(pipe_fds[0], buf.get(), return_value)) ==
-                    return_value);
+        FUZZ_ASSERT(static_cast<uint64_t>(::read(fds[0], buf.get(), return_value)) == return_value);
         FUZZ_ASSERT(::memcmp(buf.get(), previous_data.data(), return_value) == 0);
       }
     } while (return_value > 0);
-    FUZZ_ASSERT(::close(pipe_fds[0]) == 0);
+    FUZZ_ASSERT(::close(fds[0]) == 0);
     break;
   }
   case test::common::buffer::Action::kGetRawSlices: {
@@ -423,6 +481,36 @@ uint32_t bufferAction(Context& ctxt, char insert_value, uint32_t max_alloc, Buff
     const std::string data = target_buffer.toString();
     FUZZ_ASSERT(target_buffer.startsWith(action.starts_with()) ==
                 (data.find(action.starts_with()) == 0));
+    break;
+  }
+  case test::common::buffer::Action::kExtractMutableFrontSlice:
+  case test::common::buffer::Action::kExtractImmutableFrontSlice: {
+    // Extracting from an empty buffer is undefined by the interface contract.
+    if (target_buffer.length() == 0) {
+      break;
+    }
+    // StringBuffer has no slices, drain as many bytes as OwnedImpl extracted to keep it in sync.
+    if (auto* linear_buffer = dynamic_cast<StringBuffer*>(&target_buffer)) {
+      FUZZ_ASSERT(ctxt.extract_size_.has_value());
+      linear_buffer->drain(*ctxt.extract_size_);
+      ctxt.extract_size_.reset();
+      break;
+    }
+    const bool extract_mutable =
+        action.action_selector_case() == test::common::buffer::Action::kExtractMutableFrontSlice;
+    const std::string before = target_buffer.toString();
+    const uint64_t front_size = target_buffer.frontSlice().len_;
+    const Buffer::SliceDataPtr slice = extract_mutable ? target_buffer.extractMutableFrontSlice()
+                                                       : target_buffer.extractImmutableFrontSlice();
+    const absl::Span<const uint8_t> data = slice->getImmutableData();
+    FUZZ_ASSERT(data.size() == front_size);
+    FUZZ_ASSERT(target_buffer.length() + data.size() == before.size());
+    FUZZ_ASSERT(::memcmp(data.data(), before.data(), data.size()) == 0);
+    ctxt.extract_size_ = data.size();
+    if (extract_mutable) {
+      // Check if an immutable fragment was extracted instead of copied.
+      std::ignore = slice->getMutableData();
+    }
     break;
   }
   default:

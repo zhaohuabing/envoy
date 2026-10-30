@@ -14,7 +14,7 @@ namespace HttpFilters {
 namespace GrpcWeb {
 
 /**
- * See docs/configuration/http_filters/grpc_web_filter.rst
+ * See https://envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/grpc_web_filter
  */
 class GrpcWebFilter : public Http::StreamFilter, NonCopyable {
 public:
@@ -35,8 +35,8 @@ public:
   }
 
   // Implements StreamEncoderFilter.
-  Http::FilterHeadersStatus encode100ContinueHeaders(Http::ResponseHeaderMap&) override {
-    return Http::FilterHeadersStatus::Continue;
+  Http::Filter1xxHeadersStatus encode1xxHeaders(Http::ResponseHeaderMap&) override {
+    return Http::Filter1xxHeadersStatus::Continue;
   }
   Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap&, bool) override;
   Http::FilterDataStatus encodeData(Buffer::Instance&, bool) override;
@@ -75,7 +75,7 @@ private:
   bool needs_transformation_for_non_proto_encoded_response_{};
   Buffer::OwnedImpl decoding_buffer_;
   Grpc::Decoder decoder_;
-  absl::optional<Grpc::Context::RequestStatNames> request_stat_names_;
+  std::optional<Grpc::Context::RequestStatNames> request_stat_names_;
   bool is_grpc_web_request_{};
   Grpc::Context& context_;
   Http::ResponseHeaderMap* response_headers_{nullptr};

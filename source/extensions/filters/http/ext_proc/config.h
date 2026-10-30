@@ -13,24 +13,30 @@ namespace HttpFilters {
 namespace ExternalProcessing {
 
 class ExternalProcessingFilterConfig
-    : public Common::FactoryBase<envoy::extensions::filters::http::ext_proc::v3::ExternalProcessor,
-                                 envoy::extensions::filters::http::ext_proc::v3::ExtProcPerRoute> {
+    : public Common::UnifiedFactoryBase<
+          envoy::extensions::filters::http::ext_proc::v3::ExternalProcessor,
+          envoy::extensions::filters::http::ext_proc::v3::ExtProcPerRoute> {
 
 public:
-  ExternalProcessingFilterConfig() : FactoryBase("envoy.filters.http.ext_proc") {}
+  ExternalProcessingFilterConfig() : UnifiedFactoryBase("envoy.filters.http.ext_proc") {}
 
 private:
   static constexpr uint64_t DefaultMessageTimeoutMs = 200;
+  static constexpr uint64_t DefaultMaxMessageTimeoutMs = 0;
 
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::http::ext_proc::v3::ExternalProcessor& proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
-
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::ext_proc::v3::ExtProcPerRoute& proto_config,
       Server::Configuration::ServerFactoryContext& context,
       ProtobufMessage::ValidationVisitor& validator) override;
+
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
+      const envoy::extensions::filters::http::ext_proc::v3::ExternalProcessor& proto_config,
+      Server::Configuration::ServerFactoryContext& server_context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 };
+
+using UpstreamExternalProcessingFilterConfig = ExternalProcessingFilterConfig;
 
 } // namespace ExternalProcessing
 } // namespace HttpFilters

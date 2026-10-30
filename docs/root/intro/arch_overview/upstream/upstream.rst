@@ -1,3 +1,5 @@
+.. _arch_overview_clusters:
+
 Upstream clusters
 =================
 
@@ -11,7 +13,10 @@ Upstream clusters
   connection_pooling
   load_balancing/load_balancing
   aggregate_cluster
+  composite_cluster
+  mcp_multicluster
   outlier
   circuit_breaking
   upstream_filters
   load_reporting_service
+  load_balancing_policies

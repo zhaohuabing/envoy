@@ -1,33 +1,44 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "envoy/api/api.h"
 #include "envoy/common/pure.h"
 #include "envoy/extensions/transport_sockets/tls/v3/cert.pb.h"
+#include "envoy/extensions/transport_sockets/tls/v3/common.pb.h"
 #include "envoy/type/matcher/v3/string.pb.h"
-
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Ssl {
 
+// SECURITY NOTE
+//
+// When adding or changing this interface, it is likely that a change is needed to
+// `DefaultCertValidator::updateDigestForSessionId` in
+// `source/common/tls/cert_validator/default_validator.cc`.
 class CertificateValidationContextConfig {
 public:
   virtual ~CertificateValidationContextConfig() = default;
 
   /**
-   * @return The CA certificate to use for peer validation.
+   * @return The CA certificate(s) to use for peer validation (PEM may contain multiple
+   * certificates).
    */
   virtual const std::string& caCert() const PURE;
 
   /**
-   * @return Path of the CA certificate to use for peer validation or "<inline>"
+   * @return Path of the CA certificate(s) to use for peer validation or "<inline>"
    * if the CA certificate was inlined.
    */
   virtual const std::string& caCertPath() const PURE;
+
+  /**
+   * @return the name of the CA certificate bundle.
+   */
+  virtual const std::string& caCertName() const PURE;
 
   /**
    * @return The CRL to check if a cert is revoked.
@@ -43,7 +54,7 @@ public:
   /**
    * @return The subject alt name matchers to be verified, if enabled.
    */
-  virtual const std::vector<envoy::type::matcher::v3::StringMatcher>&
+  virtual const std::vector<envoy::extensions::transport_sockets::tls::v3::SubjectAltNameMatcher>&
   subjectAltNameMatchers() const PURE;
 
   /**
@@ -71,13 +82,40 @@ public:
   /**
    * @return the configuration for the custom certificate validator if configured.
    */
-  virtual const absl::optional<envoy::config::core::v3::TypedExtensionConfig>&
+  virtual const std::optional<envoy::config::core::v3::TypedExtensionConfig>&
   customValidatorConfig() const PURE;
 
   /**
    * @return a reference to the api object.
    */
   virtual Api::Api& api() const PURE;
+
+  /**
+   * @return whether to validate certificate chain with all CRL or not.
+   */
+  virtual bool onlyVerifyLeafCertificateCrl() const PURE;
+
+  /**
+   * @return the max depth used when verifying the certificate-chain
+   */
+  virtual std::optional<uint32_t> maxVerifyDepth() const PURE;
+
+  /**
+   * @return true if the SAN validation rules should be replaced with a rule to validate that the
+   * certificate matches the transmitted SNI.
+   */
+  virtual bool autoSniSanMatch() const PURE;
+
+  /**
+   * @return whether to suppress sending CA certificate names to clients during handshake.
+   */
+  virtual bool suppressClientCaList() const PURE;
+
+  // SECURITY NOTE
+  //
+  // When adding or changing this interface, it is likely that a change is needed to
+  // `DefaultCertValidator::updateDigestForSessionId` in
+  // `source/common/tls/cert_validator/default_validator.cc`.
 };
 
 using CertificateValidationContextConfigPtr = std::unique_ptr<CertificateValidationContextConfig>;

@@ -74,9 +74,10 @@ protected:
   }
 };
 
-INSTANTIATE_TEST_SUITE_P(Protocols, CsrfFilterIntegrationTest,
-                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
-                         HttpProtocolIntegrationTest::protocolTestParamsToString);
+INSTANTIATE_TEST_SUITE_P(
+    Protocols, CsrfFilterIntegrationTest,
+    testing::ValuesIn(HttpProtocolIntegrationTest::getHttp1OnlyProtocolTestParams()),
+    HttpProtocolIntegrationTest::protocolTestParamsToString);
 
 TEST_P(CsrfFilterIntegrationTest, TestCsrfSuccess) {
   config_helper_.prependFilter(CSRF_FILTER_ENABLED_CONFIG);

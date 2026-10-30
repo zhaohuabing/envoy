@@ -7,6 +7,7 @@
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/extensions/filters/http/common/empty_http_filter_config.h"
+#include "test/integration/filters/test_filters.pb.h"
 
 namespace Envoy {
 
@@ -19,12 +20,16 @@ public:
   }
 };
 
-class ResetIdleTimerFilterConfig : public Extensions::HttpFilters::Common::EmptyHttpFilterConfig {
+class ResetIdleTimerFilterConfig
+    : public Extensions::HttpFilters::Common::UniqueEmptyHttpFilterConfig<
+          test::integration::filters::ResetIdleTimerFilterConfig> {
 public:
-  ResetIdleTimerFilterConfig() : EmptyHttpFilterConfig("reset-idle-timer-filter") {}
+  ResetIdleTimerFilterConfig()
+      : UniqueEmptyHttpFilterConfig<test::integration::filters::ResetIdleTimerFilterConfig>(
+            "reset-idle-timer-filter") {}
 
-  Http::FilterFactoryCb createFilter(const std::string&,
-                                     Server::Configuration::FactoryContext&) override {
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilter(const std::string&, Server::Configuration::FactoryContext&) override {
     return [](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       callbacks.addStreamFilter(std::make_shared<::Envoy::ResetIdleTimerFilter>());
     };

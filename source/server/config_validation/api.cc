@@ -9,8 +9,10 @@ namespace Api {
 ValidationImpl::ValidationImpl(Thread::ThreadFactory& thread_factory, Stats::Store& stats_store,
                                Event::TimeSystem& time_system, Filesystem::Instance& file_system,
                                Random::RandomGenerator& random_generator,
-                               const envoy::config::bootstrap::v3::Bootstrap& bootstrap)
-    : Impl(thread_factory, stats_store, time_system, file_system, random_generator, bootstrap),
+                               const envoy::config::bootstrap::v3::Bootstrap& bootstrap,
+                               const ProcessContextOptRef& process_context)
+    : Impl(thread_factory, stats_store, time_system, file_system, random_generator, bootstrap,
+           process_context),
       time_system_(time_system) {}
 
 Event::DispatcherPtr ValidationImpl::allocateDispatcher(const std::string& name) {
@@ -20,12 +22,12 @@ Event::DispatcherPtr ValidationImpl::allocateDispatcher(const std::string& name)
 Event::DispatcherPtr
 ValidationImpl::allocateDispatcher(const std::string&,
                                    const Event::ScaledRangeTimerManagerFactory&) {
-  NOT_REACHED_GCOVR_EXCL_LINE;
+  PANIC("not implemented");
 }
 
 Event::DispatcherPtr ValidationImpl::allocateDispatcher(const std::string&,
                                                         Buffer::WatermarkFactoryPtr&&) {
-  NOT_REACHED_GCOVR_EXCL_LINE;
+  PANIC("not implemented");
 }
 
 } // namespace Api

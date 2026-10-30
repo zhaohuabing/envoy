@@ -8,6 +8,7 @@ import "validate/validate.proto";
 option java_package = "io.envoyproxy.envoy.extensions.filters.common.dependency.v3";
 option java_outer_classname = "DependencyProto";
 option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/common/dependency/v3;dependencyv3";
 option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
 // [#protodoc-title: Filter dependency specification]
@@ -33,10 +34,10 @@ message FilterDependencies {
   // A list of dependencies required on the decode path.
   repeated Dependency decode_required = 1;
 
-  // A list of dependencies provided on the encode path.
+  // A list of dependencies provided on the decode path.
   repeated Dependency decode_provided = 2;
 
-  // A list of dependencies required on the decode path.
+  // A list of dependencies required on the encode path.
   repeated Dependency encode_required = 3;
 
   // A list of dependencies provided on the encode path.

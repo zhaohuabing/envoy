@@ -12,9 +12,10 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AdaptiveConcurrency {
 
-Http::FilterFactoryCb AdaptiveConcurrencyFilterFactory::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> AdaptiveConcurrencyFilterFactory::createFilterFactory(
     const envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency& config,
-    const std::string& stats_prefix, Server::Configuration::FactoryContext& context) {
+    const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& server_context,
+    Stats::Scope& scope) {
 
   auto acc_stats_prefix = stats_prefix + "adaptive_concurrency.";
 
@@ -22,16 +23,18 @@ Http::FilterFactoryCb AdaptiveConcurrencyFilterFactory::createFilterFactoryFromP
   using Proto = envoy::extensions::filters::http::adaptive_concurrency::v3::AdaptiveConcurrency;
   ASSERT(config.concurrency_controller_config_case() ==
          Proto::ConcurrencyControllerConfigCase::kGradientControllerConfig);
-  auto gradient_controller_config =
-      Controller::GradientControllerConfig(config.gradient_controller_config(), context.runtime());
+  absl::Status creation_status = absl::OkStatus();
+  auto gradient_controller_config = Controller::GradientControllerConfig(
+      config.gradient_controller_config(), server_context.runtime(), creation_status);
+  RETURN_IF_NOT_OK_REF(creation_status);
   controller = std::make_shared<Controller::GradientController>(
-      std::move(gradient_controller_config), context.mainThreadDispatcher(), context.runtime(),
-      acc_stats_prefix + "gradient_controller.", context.scope(), context.api().randomGenerator(),
-      context.timeSource());
+      std::move(gradient_controller_config), server_context.mainThreadDispatcher(),
+      server_context.runtime(), acc_stats_prefix + "gradient_controller.", scope,
+      server_context.api().randomGenerator(), server_context.timeSource());
 
-  AdaptiveConcurrencyFilterConfigSharedPtr filter_config(
-      new AdaptiveConcurrencyFilterConfig(config, context.runtime(), std::move(acc_stats_prefix),
-                                          context.scope(), context.timeSource()));
+  AdaptiveConcurrencyFilterConfigSharedPtr filter_config(new AdaptiveConcurrencyFilterConfig(
+      config, server_context.runtime(), std::move(acc_stats_prefix), scope,
+      server_context.timeSource()));
 
   return [filter_config, controller](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(

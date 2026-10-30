@@ -9,7 +9,7 @@ namespace Envoy {
 namespace Init {
 
 ManagerImpl::ManagerImpl(absl::string_view name)
-    : name_(fmt::format("init manager {}", name)), state_(State::Uninitialized), count_(0),
+    : name_(fmt::format("init manager {}", name)),
       watcher_(name_, [this](absl::string_view target_name) { onTargetReady(target_name); }) {}
 
 Manager::State ManagerImpl::state() const { return state_; }
@@ -63,6 +63,11 @@ void ManagerImpl::initialize(const Watcher& watcher) {
   }
 }
 
+void ManagerImpl::updateWatcher(const Watcher& watcher) {
+  ASSERT(state_ != State::Initialized, "attempted to update watcher on initialized manager");
+  watcher_handle_ = watcher.createHandle(name_);
+};
+
 void ManagerImpl::dumpUnreadyTargets(envoy::admin::v3::UnreadyTargetsDumps& unready_targets_dumps) {
   auto& message = *unready_targets_dumps.mutable_unready_targets_dumps()->Add();
   message.set_name(name_);
@@ -78,7 +83,7 @@ void ManagerImpl::onTargetReady(absl::string_view target_name) {
          fmt::format("{} called back by target after initialization complete", target_name));
 
   // Decrease target_name count by 1.
-  ASSERT(target_names_count_.find(target_name) != target_names_count_.end());
+  ASSERT(target_names_count_.contains(target_name));
   if (--target_names_count_[target_name] == 0) {
     target_names_count_.erase(target_name);
   }

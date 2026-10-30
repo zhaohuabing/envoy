@@ -23,7 +23,8 @@ UpstreamIpPortMatcher::UpstreamIpPortMatcher(
   }
 
   if (proto.has_upstream_ip()) {
-    cidr_ = Network::Address::CidrRange::create(proto.upstream_ip());
+    cidr_ = THROW_OR_RETURN_VALUE(Network::Address::CidrRange::create(proto.upstream_ip()),
+                                  Network::Address::CidrRange);
   }
   if (proto.has_upstream_port_range()) {
     port_ = proto.upstream_port_range();
@@ -33,8 +34,9 @@ UpstreamIpPortMatcher::UpstreamIpPortMatcher(
 bool UpstreamIpPortMatcher::matches(const Network::Connection&,
                                     const Envoy::Http::RequestHeaderMap&,
                                     const StreamInfo::StreamInfo& info) const {
-
-  if (!info.filterState().hasDataWithName(StreamInfo::UpstreamAddress::key())) {
+  auto address_obj = info.filterState().getDataReadOnly<StreamInfo::UpstreamAddress>(
+      StreamInfo::UpstreamAddress::key());
+  if (address_obj == nullptr) {
     ENVOY_LOG_EVERY_POW_2(
         warn,
         "Did not find filter state with key: {}. Do you have a filter in the filter chain "
@@ -44,12 +46,8 @@ bool UpstreamIpPortMatcher::matches(const Network::Connection&,
     return false;
   }
 
-  const StreamInfo::UpstreamAddress& address_obj =
-      info.filterState().getDataReadOnly<StreamInfo::UpstreamAddress>(
-          StreamInfo::UpstreamAddress::key());
-
   if (cidr_) {
-    if (cidr_->isInRange(*address_obj.address_)) {
+    if (cidr_->isInRange(*address_obj->getIp())) {
       ENVOY_LOG(debug, "UpstreamIpPort matcher for cidr range: {} evaluated to: true",
                 cidr_->asString());
 
@@ -61,12 +59,12 @@ bool UpstreamIpPortMatcher::matches(const Network::Connection&,
   }
 
   if (port_) {
-    const auto port = address_obj.address_->ip()->port();
+    const auto port = address_obj->getIp()->ip()->port();
     if (port >= port_->start() && port <= port_->end()) {
-      ENVOY_LOG(debug, "UpstreamIpPort matcher for port range: {{}, {}} evaluated to: true",
+      ENVOY_LOG(debug, "UpstreamIpPort matcher for port range: [{}, {}] evaluated to: true",
                 port_->start(), port_->end());
     } else {
-      ENVOY_LOG(debug, "UpstreamIpPort matcher for port range: {{}, {}} evaluated to: false",
+      ENVOY_LOG(debug, "UpstreamIpPort matcher for port range: [{}, {}] evaluated to: false",
                 port_->start(), port_->end());
       return false;
     }

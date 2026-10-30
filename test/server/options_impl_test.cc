@@ -16,15 +16,19 @@
 #include "source/common/common/utility.h"
 #include "source/extensions/filters/http/buffer/buffer_filter.h"
 #include "source/server/options_impl.h"
+#include "source/server/options_impl_platform.h"
+
+#include "absl/strings/ascii.h"
 
 #if defined(__linux__)
 #include <sched.h>
+
+#include "source/server/cgroup_cpu_util.h"
 #include "source/server/options_impl_platform_linux.h"
 #endif
 #include "test/mocks/api/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/logging.h"
-#include "test/test_common/registry.h"
 #include "test/test_common/threadsafe_singleton_injector.h"
 #include "test/test_common/utility.h"
 
@@ -61,6 +65,13 @@ TEST_F(OptionsImplTest, InvalidMode) {
   EXPECT_THROW_WITH_REGEX(createOptionsImpl("envoy --mode bogus"), MalformedArgvException, "bogus");
 }
 
+TEST_F(OptionsImplTest, InvalidComponentLogLevelWithFineGrainLogging) {
+  EXPECT_THROW_WITH_REGEX(
+      createOptionsImpl("envoy --enable-fine-grain-logging --component-log-level http:info"),
+      MalformedArgvException,
+      "--component-log-level will not work with --enable-fine-grain-logging");
+}
+
 TEST_F(OptionsImplTest, InvalidCommandLine) {
   EXPECT_THROW_WITH_REGEX(createOptionsImpl("envoy --blah"), MalformedArgvException,
                           "Couldn't find match for argument");
@@ -81,18 +92,30 @@ TEST_F(OptionsImplTest, V1Disallowed) {
   EXPECT_EQ(Server::Mode::Validate, options->mode());
 }
 
-TEST_F(OptionsImplTest, All) {
+TEST_F(OptionsImplTest, ConcurrencyZeroIsOne) {
+  std::unique_ptr<OptionsImpl> options =
+      createOptionsImpl("envoy --mode validate --concurrency 0 ");
+  EXPECT_EQ(1U, options->concurrency());
+
+  options = createOptionsImpl("envoy --mode init_only");
+  EXPECT_EQ(Server::Mode::InitOnly, options->mode());
+}
+
+TEST_F(OptionsImplTest, AllOptions) {
   std::unique_ptr<OptionsImpl> options = createOptionsImpl(
       "envoy --mode validate --concurrency 2 -c hello --admin-address-path path --restart-epoch 0 "
       "--local-address-ip-version v6 -l info --component-log-level upstream:debug,connection:trace "
       "--service-cluster cluster --service-node node --service-zone zone "
       "--file-flush-interval-msec 9000 "
-      "--drain-time-s 60 --log-format [%v] --enable-fine-grain-logging --parent-shutdown-time-s 90 "
+      "--skip-hot-restart-on-no-parent "
+      "--skip-hot-restart-parent-stats "
+      "--drain-time-s 60 --log-format [%v] --parent-shutdown-time-s 90 "
       "--log-path "
       "/foo/bar "
       "--disable-hot-restart --cpuset-threads --allow-unknown-static-fields "
       "--reject-unknown-dynamic-fields --base-id 5 "
       "--use-dynamic-base-id --base-id-path /foo/baz "
+      "--stats-tag foo:bar --stats-tag baz:bar "
       "--socket-path /foo/envoy_domain_socket --socket-mode 644");
   EXPECT_EQ(Server::Mode::Validate, options->mode());
   EXPECT_EQ(2U, options->concurrency());
@@ -103,8 +126,11 @@ TEST_F(OptionsImplTest, All) {
   EXPECT_EQ(spdlog::level::info, options->logLevel());
   EXPECT_EQ(2, options->componentLogLevels().size());
   EXPECT_EQ("[%v]", options->logFormat());
+  EXPECT_TRUE(options->logFormatSet());
+  EXPECT_TRUE(options->skipHotRestartParentStats());
+  EXPECT_TRUE(options->skipHotRestartOnNoParent());
   EXPECT_EQ("/foo/bar", options->logPath());
-  EXPECT_EQ(true, options->enableFineGrainLogging());
+  EXPECT_EQ(false, options->enableFineGrainLogging());
   EXPECT_EQ("cluster", options->serviceClusterName());
   EXPECT_EQ("node", options->serviceNodeName());
   EXPECT_EQ("zone", options->serviceZone());
@@ -120,9 +146,14 @@ TEST_F(OptionsImplTest, All) {
   EXPECT_EQ("/foo/baz", options->baseIdPath());
   EXPECT_EQ("/foo/envoy_domain_socket", options->socketPath());
   EXPECT_EQ(0644, options->socketMode());
+  EXPECT_EQ(2U, options->statsTags().size());
 
   options = createOptionsImpl("envoy --mode init_only");
   EXPECT_EQ(Server::Mode::InitOnly, options->mode());
+
+  // Tested separately because it's mutually exclusive with --component-log-level.
+  options = createOptionsImpl("envoy --enable-fine-grain-logging");
+  EXPECT_EQ(true, options->enableFineGrainLogging());
 }
 
 // Either variants of allow-unknown-[static-]-fields works.
@@ -165,11 +196,12 @@ TEST_F(OptionsImplTest, SetAll) {
   options->setDrainTime(std::chrono::seconds(42));
   options->setDrainStrategy(Server::DrainStrategy::Immediate);
   options->setParentShutdownTime(std::chrono::seconds(43));
-  options->setLogLevel(spdlog::level::trace);
+  options->setLogLevel(Logger::Levels::trace);
   options->setLogFormat("%L %n %v");
   options->setLogPath("/foo/bar");
   options->setRestartEpoch(44);
   options->setFileFlushIntervalMsec(std::chrono::milliseconds(45));
+  options->setFileFlushMinSizeKB(128);
   options->setMode(Server::Mode::Validate);
   options->setServiceClusterName("cluster_foo");
   options->setServiceNodeName("node_foo");
@@ -181,6 +213,7 @@ TEST_F(OptionsImplTest, SetAll) {
   options->setRejectUnknownFieldsDynamic(true);
   options->setSocketPath("/foo/envoy_domain_socket");
   options->setSocketMode(0644);
+  options->setStatsTags({{"foo", "bar"}});
 
   EXPECT_EQ(109876, options->baseId());
   EXPECT_EQ(true, options->useDynamicBaseId());
@@ -197,10 +230,12 @@ TEST_F(OptionsImplTest, SetAll) {
   EXPECT_EQ(Server::DrainStrategy::Immediate, options->drainStrategy());
   EXPECT_EQ(spdlog::level::trace, options->logLevel());
   EXPECT_EQ("%L %n %v", options->logFormat());
+  EXPECT_TRUE(options->logFormatSet());
   EXPECT_EQ("/foo/bar", options->logPath());
   EXPECT_EQ(std::chrono::seconds(43), options->parentShutdownTime());
   EXPECT_EQ(44, options->restartEpoch());
   EXPECT_EQ(std::chrono::milliseconds(45), options->fileFlushIntervalMsec());
+  EXPECT_EQ(128U, options->fileFlushMinSizeKB());
   EXPECT_EQ(Server::Mode::Validate, options->mode());
   EXPECT_EQ("cluster_foo", options->serviceClusterName());
   EXPECT_EQ("node_foo", options->serviceNodeName());
@@ -244,6 +279,8 @@ TEST_F(OptionsImplTest, SetAll) {
   EXPECT_EQ(options->cpusetThreadsEnabled(), command_line_options->cpuset_threads());
   EXPECT_EQ(options->socketPath(), command_line_options->socket_path());
   EXPECT_EQ(options->socketMode(), command_line_options->socket_mode());
+  EXPECT_EQ(1U, command_line_options->stats_tag().size());
+  EXPECT_EQ("foo:bar", command_line_options->stats_tag(0));
 }
 
 TEST_F(OptionsImplTest, DefaultParams) {
@@ -257,6 +294,7 @@ TEST_F(OptionsImplTest, DefaultParams) {
   EXPECT_EQ(spdlog::level::warn, options->logLevel());
   EXPECT_EQ("@envoy_domain_socket", options->socketPath());
   EXPECT_EQ(0, options->socketMode());
+  EXPECT_EQ(0U, options->statsTags().size());
   EXPECT_FALSE(options->hotRestartDisabled());
   EXPECT_FALSE(options->cpusetThreadsEnabled());
 
@@ -275,6 +313,37 @@ TEST_F(OptionsImplTest, DefaultParams) {
   EXPECT_FALSE(command_line_options->cpuset_threads());
   EXPECT_FALSE(command_line_options->allow_unknown_static_fields());
   EXPECT_FALSE(command_line_options->reject_unknown_dynamic_fields());
+  EXPECT_EQ(0, options->statsTags().size());
+}
+
+TEST_F(OptionsImplTest, DefaultParamsNoConstructorArgs) {
+  std::unique_ptr<OptionsImplBase> options = std::make_unique<OptionsImplBase>();
+  EXPECT_EQ(std::chrono::seconds(600), options->drainTime());
+  EXPECT_EQ(Server::DrainStrategy::Gradual, options->drainStrategy());
+  EXPECT_EQ(std::chrono::seconds(900), options->parentShutdownTime());
+  EXPECT_EQ("", options->adminAddressPath());
+  EXPECT_EQ(Network::Address::IpVersion::v4, options->localAddressIpVersion());
+  EXPECT_EQ(Server::Mode::Serve, options->mode());
+  EXPECT_EQ("@envoy_domain_socket", options->socketPath());
+  EXPECT_EQ(0, options->socketMode());
+  EXPECT_EQ(0U, options->statsTags().size());
+  EXPECT_FALSE(options->hotRestartDisabled());
+  EXPECT_FALSE(options->cpusetThreadsEnabled());
+
+  // Not supported for OptionsImplBase
+  EXPECT_EQ(nullptr, options->toCommandLineOptions());
+
+  // This is the only difference between this test and DefaultParams above, as
+  // the DefaultParams constructor explicitly sets log level to warn.
+  EXPECT_EQ(spdlog::level::info, options->logLevel());
+}
+
+TEST_F(OptionsImplTest, SetEnableFineGrainLogging) {
+  std::unique_ptr<OptionsImplBase> options = std::make_unique<OptionsImplBase>();
+
+  EXPECT_FALSE(options->enableFineGrainLogging());
+  options->setEnableFineGrainLogging(true);
+  EXPECT_TRUE(options->enableFineGrainLogging());
 }
 
 // Validates that the server_info proto is in sync with the options.
@@ -392,6 +461,38 @@ TEST_F(OptionsImplTest, AllowedLogLevels) {
             OptionsImpl::allowedLogLevels());
 }
 
+TEST_F(OptionsImplTest, InvalidStatsTags) {
+  EXPECT_THROW_WITH_REGEX(createOptionsImpl("envoy --stats-tag foo"), MalformedArgvException,
+                          "error: misformatted stats-tag 'foo'");
+}
+
+TEST_F(OptionsImplTest, InvalidCharsInStatsTags) {
+  EXPECT_THROW_WITH_REGEX(
+      createOptionsImpl("envoy --stats-tag foo:b.ar"), MalformedArgvException,
+      "error: misformatted stats-tag 'foo:b.ar' contains invalid char in 'b.ar'");
+  EXPECT_THROW_WITH_REGEX(
+      createOptionsImpl("envoy --stats-tag foo:b.a.r"), MalformedArgvException,
+      "error: misformatted stats-tag 'foo:b.a.r' contains invalid char in 'b.a.r'");
+  EXPECT_THROW_WITH_REGEX(createOptionsImpl("envoy --stats-tag f_o:bar"), MalformedArgvException,
+                          "error: misformatted stats-tag 'f_o:bar' contains invalid char in 'f_o'");
+}
+
+TEST_F(OptionsImplTest, ValidStatsTagsCharacters) {
+  Stats::TagVector test_tags{
+      Stats::Tag{"foo", "bar"},
+      Stats::Tag{"foo", "b:ar"},
+      Stats::Tag{"foo", "b_-ar"},
+  };
+
+  for (const auto& tag : test_tags) {
+    std::unique_ptr<OptionsImpl> options =
+        createOptionsImpl(fmt::format("envoy --stats-tag {}:{}", tag.name_, tag.value_));
+    EXPECT_EQ(options->statsTags().size(), 1);
+    EXPECT_EQ(options->statsTags()[0].name_, tag.name_);
+    EXPECT_EQ(options->statsTags()[0].value_, tag.value_);
+  }
+}
+
 // Test that the test constructor comes up with the same default values as the main constructor.
 TEST_F(OptionsImplTest, SaneTestConstructor) {
   std::unique_ptr<OptionsImpl> regular_options_impl(createOptionsImpl("envoy"));
@@ -441,21 +542,48 @@ TEST_F(OptionsImplTest, SetCpusetOnly) {
   EXPECT_NE(options->concurrency(), 0);
 }
 
+TEST_F(OptionsImplTest, CpusetThreadsRedundantWarning) {
+  // --cpuset-threads is now the default; warn that the flag is no longer required.
+  EXPECT_LOG_CONTAINS("warning",
+                      "--cpuset-threads is now the default behavior and no longer required.",
+                      createOptionsImpl("envoy -c hello --cpuset-threads"));
+}
+
 TEST_F(OptionsImplTest, LogFormatDefault) {
   std::unique_ptr<OptionsImpl> options = createOptionsImpl({"envoy", "-c", "hello"});
   EXPECT_EQ(options->logFormat(), "[%Y-%m-%d %T.%e][%t][%l][%n] [%g:%#] %v");
+  EXPECT_FALSE(options->logFormatSet());
+}
+
+TEST_F(OptionsImplTest, SkipHotRestartDefaults) {
+  std::unique_ptr<OptionsImpl> options = createOptionsImpl({"envoy", "-c", "hello"});
+  EXPECT_FALSE(options->skipHotRestartOnNoParent());
+  EXPECT_FALSE(options->skipHotRestartParentStats());
+}
+
+TEST_F(OptionsImplTest, LogStacktraceSingleEntryDefault) {
+  std::unique_ptr<OptionsImpl> options = createOptionsImpl({"envoy", "-c", "hello"});
+  EXPECT_FALSE(options->logStacktraceSingleEntry());
+}
+
+TEST_F(OptionsImplTest, LogStacktraceSingleEntryEnabled) {
+  std::unique_ptr<OptionsImpl> options =
+      createOptionsImpl({"envoy", "-c", "hello", "--log-stacktrace-single-entry"});
+  EXPECT_TRUE(options->logStacktraceSingleEntry());
 }
 
 TEST_F(OptionsImplTest, LogFormatOverride) {
   std::unique_ptr<OptionsImpl> options =
       createOptionsImpl({"envoy", "-c", "hello", "--log-format", "%%v %v %t %v"});
   EXPECT_EQ(options->logFormat(), "%%v %v %t %v");
+  EXPECT_TRUE(options->logFormatSet());
 }
 
 TEST_F(OptionsImplTest, LogFormatOverrideNoPrefix) {
   std::unique_ptr<OptionsImpl> options =
       createOptionsImpl({"envoy", "-c", "hello", "--log-format", "%%v %v %t %v"});
   EXPECT_EQ(options->logFormat(), "%%v %v %t %v");
+  EXPECT_TRUE(options->logFormatSet());
 }
 
 // Test that --base-id and --restart-epoch with non-default values are accepted.
@@ -478,6 +606,11 @@ TEST_F(OptionsImplTest, SetUseDynamicBaseIdAndRestartEpoch) {
 using testing::DoAll;
 using testing::Return;
 using testing::SetArgPointee;
+
+class MockCgroupDetector : public CgroupDetectorImpl {
+public:
+  MOCK_METHOD(std::optional<uint32_t>, getCpuLimit, (Filesystem::Instance & fs), (override));
+};
 
 class OptionsImplPlatformLinuxTest : public testing::Test {
 public:
@@ -555,15 +688,179 @@ TEST_F(OptionsImplPlatformLinuxTest, AffinityTest4) {
   EXPECT_EQ(OptionsImplPlatformLinux::getCpuAffinityCount(fake_hw_threads), fake_hw_threads);
 }
 
+// Mock-based tests for getCpuCount environment variable control
+
+TEST_F(OptionsImplPlatformLinuxTest, EnvVarDisablesCgroupDetectionMocked) {
+  // Test that ENVOY_CGROUP_CPU_DETECTION=false prevents getCpuLimit calls
+  setenv("ENVOY_CGROUP_CPU_DETECTION", "false", 1);
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Verify getCpuLimit is NOT called when env var disables detection
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).Times(0);
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  EXPECT_GE(result, 1U); // Should return hardware thread count
+
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION");
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, EnvVarAllowsCgroupDetectionMocked) {
+  // Test that default behavior (enabled) calls getCpuLimit
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Default: enabled
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock successful cgroup detection returning 2 CPUs
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(2)));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  // Result should be influenced by the mocked cgroup limit of 2
+  EXPECT_GE(result, 1U);
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, EnvVarTrueAllowsCgroupDetectionMocked) {
+  // Test that ENVOY_CGROUP_CPU_DETECTION=true enables detection
+  setenv("ENVOY_CGROUP_CPU_DETECTION", "true", 1);
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning no limit (unlimited)
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::nullopt));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  EXPECT_GE(result, 1U); // Should fallback to hardware thread count
+
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION");
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, CgroupLimitConstrainsResult) {
+  // Test that cgroup limit is used in min() calculation when it's the smallest value
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Enable detection
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning 2 CPUs (lower than typical hardware)
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(2)));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  // Result should be constrained by cgroup limit
+  // Since we can't easily mock hardware threads and affinity in this test,
+  // we verify the cgroup limit is considered (result influenced by mock)
+  EXPECT_GE(result, 1U);
+  EXPECT_LE(result, 2U); // Should not exceed the mocked cgroup limit
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, CgroupDetectionReturnsNullopt) {
+  // Test graceful fallback when cgroup detection returns no limit (unlimited)
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Enable detection
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning nullopt (no limit/unlimited)
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::nullopt));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  // Should fall back to hardware thread count when no cgroup limit
+  EXPECT_GE(result, 1U);
+  // Without cgroup constraint, should get at least hardware thread count
+  // (limited by affinity in practice, but we can't easily mock that here)
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, CgroupLimitVeryLow) {
+  // Test that very low cgroup limits are respected (heavy constraint scenario)
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Enable detection
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning 1 CPU (very constrained)
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(1)));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  // Even with very low cgroup limit, Envoy guarantees at least 1 CPU
+  EXPECT_EQ(result, 1U); // Should be exactly 1 due to cgroup constraint
+}
+
+TEST_F(OptionsImplTest, CgroupLimitAppliedByDefaultWithoutCpusetFlag) {
+  // Regression test for #45410: the cgroup CPU limit must constrain the default worker
+  // thread count even when --cpuset-threads is NOT passed.
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Enable detection (default).
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning 1 CPU; the smallest input wins min().
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(1)));
+
+  std::unique_ptr<OptionsImpl> options = createOptionsImpl("envoy -c hello");
+  EXPECT_FALSE(options->cpusetThreadsEnabled());
+  EXPECT_EQ(1U, options->concurrency());
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, CgroupLimitHigherThanTypicalHardware) {
+  // Test when cgroup allows more CPUs than typical hardware might have
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Enable detection
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning high CPU count
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(32)));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  // Result should be constrained by hardware/affinity, not the high cgroup limit
+  EXPECT_GE(result, 1U);
+  // In practice, hardware thread count or affinity will be the constraint
+  EXPECT_LE(result, 32U); // Sanity check - shouldn't exceed the mock value
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, EnvoyMinimumOneCPUGuarantee) {
+  // Test Envoy's guarantee of at least 1 CPU even with theoretical edge cases
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION"); // Enable detection
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock cgroup detection returning 0 (theoretical edge case)
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(0)));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  // Envoy's max(1U, effective_count) should ensure at least 1 CPU
+  EXPECT_GE(result, 1U); // Must honor Envoy's minimum guarantee
+}
+
+TEST_F(OptionsImplPlatformLinuxTest, CombinedEnvVarAndCgroupScenarios) {
+  // Test various environment variable states with different cgroup responses
+
+  // Scenario 1: Explicitly enabled with successful detection
+  setenv("ENVOY_CGROUP_CPU_DETECTION", "true", 1);
+
+  MockCgroupDetector mock_detector;
+  TestThreadsafeSingletonInjector<CgroupDetectorImpl> injector(&mock_detector);
+
+  // Mock successful cgroup detection
+  EXPECT_CALL(mock_detector, getCpuLimit(_)).WillOnce(Return(std::optional<uint32_t>(4)));
+
+  uint32_t result = OptionsImplPlatform::getCpuCount();
+  EXPECT_GE(result, 1U);
+  EXPECT_LE(result, 4U); // Should consider the cgroup limit
+
+  unsetenv("ENVOY_CGROUP_CPU_DETECTION");
+}
 #endif
 
 class TestFactory : public Config::TypedFactory {
 public:
   ~TestFactory() override = default;
   std::string category() const override { return "test"; }
-  std::string configType() override { return "google.protobuf.StringValue"; }
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::StringValue>();
+    return std::make_unique<Protobuf::StringValue>();
   }
 };
 
@@ -576,63 +873,24 @@ class TestingFactory : public Config::TypedFactory {
 public:
   ~TestingFactory() override = default;
   std::string category() const override { return "testing"; }
-  std::string configType() override { return "google.protobuf.StringValue"; }
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::make_unique<ProtobufWkt::StringValue>();
+    return std::make_unique<Protobuf::StringValue>();
   }
 };
 
-class TestTestingFactory : public TestingFactory {
-public:
-  std::string name() const override { return "test"; }
-};
+// Test that deprecated --allow-unknown-fields warning is logged when skip_deprecated_logs is false
+TEST_F(OptionsImplTest, DeprecatedAllowUnknownFieldsWarningWhenNotSkipped) {
+  EXPECT_LOG_CONTAINS(
+      "warn", "--allow-unknown-fields is deprecated, use --allow-unknown-static-fields instead.",
+      createOptionsImpl("envoy --allow-unknown-fields"));
+}
 
-TEST(DisableExtensions, DEPRECATED_FEATURE_TEST(IsDisabled)) {
-  TestTestFactory testTestFactory;
-  Registry::InjectFactoryCategory<TestFactory> testTestCategory(testTestFactory);
-  Registry::InjectFactory<TestFactory> testTestRegistration(testTestFactory, {"test-1", "test-2"});
-
-  TestTestingFactory testTestingFactory;
-  Registry::InjectFactoryCategory<TestingFactory> testTestingCategory(testTestingFactory);
-  Registry::InjectFactory<TestingFactory> testTestingRegistration(testTestingFactory,
-                                                                  {"test-1", "test-2"});
-
-  EXPECT_LOG_CONTAINS("warning", "failed to disable invalid extension name 'not.a.factory'",
-                      OptionsImpl::disableExtensions({"not.a.factory"}));
-
-  EXPECT_LOG_CONTAINS("warning", "failed to disable unknown extension 'no/such.factory'",
-                      OptionsImpl::disableExtensions({"no/such.factory"}));
-
-  EXPECT_NE(Registry::FactoryRegistry<TestFactory>::getFactory("test"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestFactory>::getFactory("test-1"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestFactory>::getFactory("test-2"), nullptr);
-  EXPECT_NE(Registry::FactoryRegistry<TestFactory>::getFactoryByType("google.protobuf.StringValue"),
-            nullptr);
-
-  EXPECT_NE(Registry::FactoryRegistry<TestingFactory>::getFactory("test"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestingFactory>::getFactory("test-1"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestingFactory>::getFactory("test-2"), nullptr);
-
-  OptionsImpl::disableExtensions({"test/test", "testing/test-2"});
-
-  // Simulate the initial construction of the type mappings.
-  testTestRegistration.resetTypeMappings();
-  testTestingRegistration.resetTypeMappings();
-
-  // When we disable an extension, all its aliases should also be disabled.
-  EXPECT_EQ(Registry::FactoryRegistry<TestFactory>::getFactory("test"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestFactory>::getFactory("test-1"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestFactory>::getFactory("test-2"), nullptr);
-
-  // When we disable an extension, all its aliases should also be disabled.
-  EXPECT_EQ(Registry::FactoryRegistry<TestingFactory>::getFactory("test"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestingFactory>::getFactory("test-1"), nullptr);
-  EXPECT_EQ(Registry::FactoryRegistry<TestingFactory>::getFactory("test-2"), nullptr);
-
-  // Typing map for TestingFactory should be constructed here after disabling
-  EXPECT_EQ(
-      Registry::FactoryRegistry<TestingFactory>::getFactoryByType("google.protobuf.StringValue"),
-      nullptr);
+// Test that deprecated --allow-unknown-fields warning is suppressed when skip_deprecated_logs is
+// true
+TEST_F(OptionsImplTest, DeprecatedAllowUnknownFieldsWarningWhenSkipped) {
+  EXPECT_LOG_NOT_CONTAINS(
+      "warn", "--allow-unknown-fields is deprecated, use --allow-unknown-static-fields instead.",
+      createOptionsImpl("envoy --allow-unknown-fields --skip-deprecated-logs"));
 }
 
 } // namespace

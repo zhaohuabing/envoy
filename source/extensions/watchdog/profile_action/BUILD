@@ -13,9 +13,6 @@ envoy_cc_library(
     name = "profile_action_lib",
     srcs = ["profile_action.cc"],
     hdrs = ["profile_action.h"],
-    external_deps = [
-        "abseil_optional",
-    ],
     deps = [
         "//envoy/api:api_interface",
         "//envoy/common:time_interface",

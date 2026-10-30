@@ -3,6 +3,7 @@
 #include "envoy/buffer/buffer.h"
 #include "envoy/network/connection.h"
 
+#include "source/common/common/assert.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
 #include "contrib/postgres_proxy/filters/network/source/postgres_decoder.h"
@@ -15,12 +16,16 @@ namespace PostgresProxy {
 PostgresFilterConfig::PostgresFilterConfig(const PostgresFilterConfigOptions& config_options,
                                            Stats::Scope& scope)
     : enable_sql_parsing_(config_options.enable_sql_parsing_),
-      terminate_ssl_(config_options.terminate_ssl_), scope_{scope},
+      terminate_ssl_(config_options.terminate_ssl_), upstream_ssl_(config_options.upstream_ssl_),
+      downstream_ssl_(config_options.downstream_ssl_), scope_{scope},
       stats_{generateStats(config_options.stats_prefix_, scope)} {}
 
 PostgresFilter::PostgresFilter(PostgresFilterConfigSharedPtr config) : config_{config} {
   if (!decoder_) {
     decoder_ = createDecoder(this);
+  }
+  if (!encoder_) {
+    encoder_ = createEncoder();
   }
 }
 
@@ -33,7 +38,6 @@ Network::FilterStatus PostgresFilter::onData(Buffer::Instance& data, bool) {
   frontend_buffer_.add(data);
   Network::FilterStatus result = doDecode(frontend_buffer_, true);
   if (result == Network::FilterStatus::StopIteration) {
-    ASSERT(frontend_buffer_.length() == 0);
     data.drain(data.length());
   }
   return result;
@@ -45,17 +49,28 @@ void PostgresFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks&
   read_callbacks_ = &callbacks;
 }
 
+void PostgresFilter::initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) {
+  write_callbacks_ = &callbacks;
+}
+
 // Network::WriteFilter
 Network::FilterStatus PostgresFilter::onWrite(Buffer::Instance& data, bool) {
 
   // Backend Buffer
   backend_buffer_.add(data);
-  return doDecode(backend_buffer_, false);
+  Network::FilterStatus result = doDecode(backend_buffer_, false);
+  if (result == Network::FilterStatus::StopIteration) {
+    ASSERT(backend_buffer_.length() == 0);
+    data.drain(data.length());
+  }
+  return result;
 }
 
 DecoderPtr PostgresFilter::createDecoder(DecoderCallbacks* callbacks) {
   return std::make_unique<DecoderImpl>(callbacks);
 }
+
+EncoderPtr PostgresFilter::createEncoder() { return std::make_unique<Encoder>(); }
 
 void PostgresFilter::incMessagesBackend() {
   config_->stats_.messages_.inc();
@@ -168,7 +183,7 @@ void PostgresFilter::incStatements(StatementType type) {
 
 void PostgresFilter::processQuery(const std::string& sql) {
   if (config_->enable_sql_parsing_) {
-    ProtobufWkt::Struct metadata;
+    Protobuf::Struct metadata;
 
     auto result = Common::SQLUtils::SQLUtils::setMetadata(sql, decoder_->getAttributes(), metadata);
 
@@ -190,7 +205,9 @@ void PostgresFilter::processQuery(const std::string& sql) {
 }
 
 bool PostgresFilter::onSSLRequest() {
-  if (!config_->terminate_ssl_) {
+  if (config_->downstream_ssl_ ==
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE &&
+      !config_->terminate_ssl_) {
     // Signal to the decoder to continue.
     return true;
   }
@@ -201,18 +218,20 @@ bool PostgresFilter::onSSLRequest() {
   buf.add("S");
   // Add callback to be notified when the reply message has been
   // transmitted.
-  read_callbacks_->connection().addBytesSentCallback([=](uint64_t bytes) -> bool {
+  read_callbacks_->connection().addBytesSentCallback([=, this](uint64_t bytes) -> bool {
     // Wait until 'S' has been transmitted.
     if (bytes >= 1) {
       if (!read_callbacks_->connection().startSecureTransport()) {
-        ENVOY_CONN_LOG(info, "postgres_proxy: cannot enable secure transport. Check configuration.",
-                       read_callbacks_->connection());
+        ENVOY_CONN_LOG(
+            info, "postgres_proxy: cannot enable downstream secure transport. Check configuration.",
+            read_callbacks_->connection());
         read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
       } else {
         // Unsubscribe the callback.
         config_->stats_.sessions_terminated_ssl_.inc();
         ENVOY_CONN_LOG(trace, "postgres_proxy: enabled SSL termination.",
                        read_callbacks_->connection());
+        switched_to_tls_ = true;
         // Switch to TLS has been completed.
         // Signal to the decoder to stop processing the current message (SSLRequest).
         // Because Envoy terminates SSL, the message was consumed and should not be
@@ -222,9 +241,73 @@ bool PostgresFilter::onSSLRequest() {
     }
     return true;
   });
-  read_callbacks_->connection().write(buf, false);
+  write_callbacks_->injectWriteDataToFilterChain(buf, false);
 
   return false;
+}
+
+bool PostgresFilter::shouldEncryptUpstream() const {
+  return (config_->upstream_ssl_ ==
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::REQUIRE);
+}
+
+void PostgresFilter::sendUpstream(Buffer::Instance& data) {
+  read_callbacks_->injectReadDataToFilterChain(data, false);
+}
+
+bool PostgresFilter::encryptUpstream(bool upstream_agreed, Buffer::Instance& data) {
+  bool encrypted = false;
+  RELEASE_ASSERT(
+      config_->upstream_ssl_ !=
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE,
+      "encryptUpstream should not be called when upstream SSL is disabled.");
+  if (!upstream_agreed) {
+    ENVOY_CONN_LOG(info,
+                   "postgres_proxy: upstream server rejected request to establish SSL connection. "
+                   "Terminating.",
+                   read_callbacks_->connection());
+    read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+
+    config_->stats_.sessions_upstream_ssl_failed_.inc();
+  } else {
+    // Try to switch upstream connection to use a secure channel.
+    if (read_callbacks_->startUpstreamSecureTransport()) {
+      config_->stats_.sessions_upstream_ssl_success_.inc();
+      read_callbacks_->injectReadDataToFilterChain(data, false);
+      encrypted = true;
+      ENVOY_CONN_LOG(trace, "postgres_proxy: upstream SSL enabled.", read_callbacks_->connection());
+    } else {
+      ENVOY_CONN_LOG(info,
+                     "postgres_proxy: cannot enable upstream secure transport. Check "
+                     "configuration. Terminating.",
+                     read_callbacks_->connection());
+      read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+      config_->stats_.sessions_upstream_ssl_failed_.inc();
+    }
+  }
+
+  return encrypted;
+}
+
+void PostgresFilter::verifyDownstreamSSL() {
+  if (config_->downstream_ssl_ ==
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::REQUIRE &&
+      (!switched_to_tls_)) {
+    ENVOY_LOG(debug, "postgres_proxy: closing connection because downstream ssl is required but "
+                     "downstream client did not start SSL handshake.");
+    closeConn();
+  }
+}
+
+void PostgresFilter::closeConn() {
+  Buffer::OwnedImpl rbac_error_response = encoder_->buildErrorResponse(
+      "FATAL", "connection denied by Envoy proxy: downstream ssl required.",
+      "28000" // return invalid_authorization_specification
+  );
+
+  // send error response to downstream client
+  write_callbacks_->injectWriteDataToFilterChain(rbac_error_response, false);
+  read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
 }
 
 Network::FilterStatus PostgresFilter::doDecode(Buffer::Instance& data, bool frontend) {

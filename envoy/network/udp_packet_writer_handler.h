@@ -5,6 +5,10 @@
 
 #include "envoy/api/io_error.h"
 #include "envoy/buffer/buffer.h"
+#include "envoy/common/optref.h"
+#include "envoy/config/core/v3/extension.pb.h"
+#include "envoy/config/typed_config.h"
+#include "envoy/config/typed_metadata.h"
 #include "envoy/network/address.h"
 #include "envoy/network/socket.h"
 #include "envoy/stats/scope.h"
@@ -106,11 +110,17 @@ public:
 
   /**
    * Creates an UdpPacketWriter object for the given Udp Socket
-   * @param socket UDP socket used to send packets.
+   * @param io_handle The udp socket used for network I/O operations.
+   * @param scope Recording statistics associated with the writer.
+   * @param dispatcher Envoy dispatcher to schedule write block events.
+   * @param on_can_write_cb Callback to signal when the underlying socket
+   * becomes writable.
    * @return the UdpPacketWriter created.
    */
-  virtual UdpPacketWriterPtr createUdpPacketWriter(Network::IoHandle& io_handle,
-                                                   Stats::Scope& scope) PURE;
+  virtual UdpPacketWriterPtr
+  createUdpPacketWriter(Network::IoHandle& io_handle, Stats::Scope& scope,
+                        Envoy::Event::Dispatcher& dispatcher,
+                        absl::AnyInvocable<void() &&> on_can_write_cb) PURE;
 };
 
 using UdpPacketWriterFactoryPtr = std::unique_ptr<UdpPacketWriterFactory>;

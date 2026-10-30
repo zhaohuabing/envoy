@@ -14,14 +14,16 @@ namespace Decompressor {
  * Config registration for the decompressor filter. @see NamedHttpFilterConfigFactory.
  */
 class DecompressorFilterFactory
-    : public Common::FactoryBase<envoy::extensions::filters::http::decompressor::v3::Decompressor> {
+    : public Common::UnifiedFactoryBase<
+          envoy::extensions::filters::http::decompressor::v3::Decompressor> {
 public:
-  DecompressorFilterFactory() : FactoryBase("envoy.filters.http.decompressor") {}
+  DecompressorFilterFactory() : UnifiedFactoryBase("envoy.filters.http.decompressor") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
       const envoy::extensions::filters::http::decompressor::v3::Decompressor& config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 };
 
 DECLARE_FACTORY(DecompressorFilterFactory);

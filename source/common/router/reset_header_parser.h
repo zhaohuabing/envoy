@@ -2,16 +2,15 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "envoy/common/time.h"
 #include "envoy/config/route/v3/route_components.pb.h"
 #include "envoy/http/header_map.h"
-#include "envoy/router/router.h"
+#include "envoy/router/retry.h"
 
 #include "source/common/protobuf/protobuf.h"
-
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Router {
@@ -47,7 +46,7 @@ public:
    * Iterate over the headers, choose the first one that matches by name, and try to parse its
    * value.
    */
-  absl::optional<std::chrono::milliseconds>
+  std::optional<std::chrono::milliseconds>
   parseInterval(TimeSource& time_source, const Http::HeaderMap& headers) const override;
 
 private:

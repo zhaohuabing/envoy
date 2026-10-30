@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include "envoy/common/exception.h"
 
@@ -32,7 +33,7 @@ struct RequestContext {
   /**
    * Request header that gets filled in during the parse.
    */
-  RequestHeader request_header_{-1, -1, -1, absl::nullopt};
+  RequestHeader request_header_{-1, -1, -1, std::nullopt};
 
   /**
    * Bytes left to consume.
@@ -144,8 +145,8 @@ public:
   // Constructor visible for testing (allows for initial parser injection).
   RequestHeaderParser(const RequestParserResolver& parser_resolver, RequestContextSharedPtr context,
                       RequestHeaderDeserializerPtr deserializer)
-      : parser_resolver_{parser_resolver}, context_{context}, deserializer_{
-                                                                  std::move(deserializer)} {};
+      : parser_resolver_{parser_resolver}, context_{context},
+        deserializer_{std::move(deserializer)} {};
 
   /**
    * Uses data provided to compute request header.

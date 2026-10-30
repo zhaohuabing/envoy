@@ -24,8 +24,8 @@ bool ConsumerGroupMember::expired() const {
          connection_manager_->config().transientObjectLifeSpan().count();
 }
 
-ConnectionManager::ConnectionManager(Config& config, TimeSource& time_source)
-    : config_(config), time_source_(time_source), stats_(config.stats()) {}
+ConnectionManager::ConnectionManager(const ConfigSharedPtr& config, TimeSource& time_source)
+    : config_(config), time_source_(time_source), stats_(config_->stats()) {}
 
 Envoy::Network::FilterStatus ConnectionManager::onData(Envoy::Buffer::Instance& data,
                                                        bool end_stream) {
@@ -137,7 +137,7 @@ void ConnectionManager::purgeDirectiveTable() {
   for (auto it = ack_directive_table_.begin(); it != ack_directive_table_.end();) {
     auto duration = current - it->second.creation_time_;
     if (std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() >
-        config_.transientObjectLifeSpan().count()) {
+        config_->transientObjectLifeSpan().count()) {
       ack_directive_table_.erase(it++);
     } else {
       it++;
@@ -168,7 +168,7 @@ void ConnectionManager::onHeartbeat(RemotingCommandPtr request) {
 
   purgeDirectiveTable();
 
-  ProtobufWkt::Struct body_struct;
+  Protobuf::Struct body_struct;
   try {
     MessageUtil::loadFromJson(body, body_struct);
   } catch (std::exception& e) {
@@ -198,7 +198,7 @@ void ConnectionManager::onHeartbeat(RemotingCommandPtr request) {
 void ConnectionManager::addOrUpdateGroupMember(absl::string_view group,
                                                absl::string_view client_id) {
   ENVOY_LOG(trace, "#addOrUpdateGroupMember. Group: {}, client ID: {}", group, client_id);
-  auto search = group_members_.find(std::string(group.data(), group.length()));
+  auto search = group_members_.find(group);
   if (search == group_members_.end()) {
     std::vector<ConsumerGroupMember> members;
     members.emplace_back(ConsumerGroupMember(client_id, *this));
@@ -223,8 +223,12 @@ void ConnectionManager::addOrUpdateGroupMember(absl::string_view group,
 
 void ConnectionManager::onUnregisterClient(RemotingCommandPtr request) {
   auto header = request->typedCustomHeader<UnregisterClientRequestHeader>();
-  ASSERT(header != nullptr);
-  ASSERT(!header->clientId().empty());
+  if (header == nullptr || header->clientId().empty()) {
+    ENVOY_CONN_LOG(error, "rocketmq_proxy: unregister client request without a valid header",
+                   read_callbacks_->connection());
+    onError(request, "Malformed unregister client request");
+    return;
+  }
   ENVOY_LOG(trace, "Unregister client ID: {}, producer group: {}, consumer group: {}",
             header->clientId(), header->producerGroup(), header->consumerGroup());
 
@@ -269,6 +273,12 @@ void ConnectionManager::onSendMessage(RemotingCommandPtr request) {
   ENVOY_CONN_LOG(trace, "#onSendMessage, opaque: {}", read_callbacks_->connection(),
                  request->opaque());
   auto header = request->typedCustomHeader<SendMessageRequestHeader>();
+  if (header == nullptr) {
+    ENVOY_CONN_LOG(error, "rocketmq_proxy: send message request without a valid header",
+                   read_callbacks_->connection());
+    onError(request, "Malformed send message request");
+    return;
+  }
   header->queueId(-1);
   createActiveMessage(request).sendRequestToUpstream();
 }
@@ -276,8 +286,12 @@ void ConnectionManager::onSendMessage(RemotingCommandPtr request) {
 void ConnectionManager::onGetConsumerListByGroup(RemotingCommandPtr request) {
   auto requestExtHeader = request->typedCustomHeader<GetConsumerListByGroupRequestHeader>();
 
-  ASSERT(requestExtHeader != nullptr);
-  ASSERT(!requestExtHeader->consumerGroup().empty());
+  if (requestExtHeader == nullptr || requestExtHeader->consumerGroup().empty()) {
+    ENVOY_CONN_LOG(error, "rocketmq_proxy: get consumer list request without a valid header",
+                   read_callbacks_->connection());
+    onError(request, "Malformed get consumer list request");
+    return;
+  }
 
   ENVOY_LOG(trace, "#onGetConsumerListByGroup, consumer group: {}",
             requestExtHeader->consumerGroup());
@@ -294,14 +308,14 @@ void ConnectionManager::onGetConsumerListByGroup(RemotingCommandPtr request) {
     ENVOY_LOG(warn, "There is no consumer belongs to consumer_group: {}",
               requestExtHeader->consumerGroup());
   }
-  ProtobufWkt::Struct body_struct;
+  Protobuf::Struct body_struct;
 
   getConsumerListByGroupResponseBody.encode(body_struct);
 
   RemotingCommandPtr response = std::make_unique<RemotingCommand>(
       enumToSignedInt(ResponseCode::Success), request->version(), request->opaque());
   response->markAsResponse();
-  std::string json = MessageUtil::getJsonStringFromMessageOrDie(body_struct);
+  std::string json = MessageUtil::getJsonStringFromMessageOrError(body_struct);
   response->body().add(json);
   ENVOY_LOG(trace, "GetConsumerListByGroup respond with body: {}", json);
 
@@ -311,7 +325,12 @@ void ConnectionManager::onGetConsumerListByGroup(RemotingCommandPtr request) {
 
 void ConnectionManager::onPopMessage(RemotingCommandPtr request) {
   auto header = request->typedCustomHeader<PopMessageRequestHeader>();
-  ASSERT(header != nullptr);
+  if (header == nullptr) {
+    ENVOY_CONN_LOG(error, "rocketmq_proxy: pop message request without a valid header",
+                   read_callbacks_->connection());
+    onError(request, "Malformed pop message request");
+    return;
+  }
   ENVOY_LOG(trace, "#onPopMessage. Consumer group: {}, topic: {}", header->consumerGroup(),
             header->topic());
   createActiveMessage(request).sendRequestToUpstream();
@@ -319,7 +338,12 @@ void ConnectionManager::onPopMessage(RemotingCommandPtr request) {
 
 void ConnectionManager::onAckMessage(RemotingCommandPtr request) {
   auto header = request->typedCustomHeader<AckMessageRequestHeader>();
-  ASSERT(header != nullptr);
+  if (header == nullptr) {
+    ENVOY_CONN_LOG(error, "rocketmq_proxy: ack message request without a valid header",
+                   read_callbacks_->connection());
+    onError(request, "Malformed ack message request");
+    return;
+  }
   ENVOY_LOG(
       trace,
       "#onAckMessage. Consumer group: {}, topic: {}, queue Id: {}, offset: {}, extra-info: {}",

@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package envoy.extensions.filters.udp.dns_filter.v3;
 
+import "envoy/config/accesslog/v3/accesslog.proto";
 import "envoy/config/core/v3/address.proto";
 import "envoy/config/core/v3/base.proto";
 import "envoy/config/core/v3/extension.proto";
@@ -17,13 +18,15 @@ import "validate/validate.proto";
 option java_package = "io.envoyproxy.envoy.extensions.filters.udp.dns_filter.v3";
 option java_outer_classname = "DnsFilterProto";
 option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/udp/dns_filter/v3;dns_filterv3";
 option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
 // [#protodoc-title: DNS Filter]
 // DNS Filter :ref:`configuration overview <config_udp_listener_filters_dns_filter>`.
-// [#extension: envoy.filters.udp_listener.dns_filter]
+// [#extension: envoy.filters.udp.dns_filter]
 
 // Configuration for the DNS filter.
+// [#next-free-field: 6]
 message DnsFilterConfig {
   // This message contains the configuration for the DNS Filter operating
   // in a server context. This message will contain the virtual hosts and
@@ -77,12 +80,12 @@ message DnsFilterConfig {
     // or any other DNS resolver types and the related parameters.
     // For example, an object of
     // :ref:`CaresDnsResolverConfig <envoy_v3_api_msg_extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig>`
-    // can be packed into this *typed_dns_resolver_config*. This configuration replaces the
+    // can be packed into this ``typed_dns_resolver_config``. This configuration replaces the
     // :ref:`dns_resolution_config <envoy_v3_api_field_extensions.filters.udp.dns_filter.v3.DnsFilterConfig.ClientContextConfig.dns_resolution_config>`
     // configuration.
-    // During the transition period when both *dns_resolution_config* and *typed_dns_resolver_config* exists,
-    // when *typed_dns_resolver_config* is in place, Envoy will use it and ignore *dns_resolution_config*.
-    // When *typed_dns_resolver_config* is missing, the default behavior is in place.
+    // During the transition period when both ``dns_resolution_config`` and ``typed_dns_resolver_config`` exists,
+    // when ``typed_dns_resolver_config`` is in place, Envoy will use it and ignore ``dns_resolution_config``.
+    // When ``typed_dns_resolver_config`` is missing, the default behavior is in place.
     // [#extension-category: envoy.network.dns_resolver]
     config.core.v3.TypedExtensionConfig typed_dns_resolver_config = 4;
 
@@ -101,6 +104,28 @@ message DnsFilterConfig {
 
   // Client context configuration controls Envoy's behavior when it must use external
   // resolvers to answer a query. This object is optional and if omitted instructs
-  // the filter to resolve queries from the data in the server_config
+  // the filter to resolve queries from the data in the server_config.
+  // Also, if ``client_config`` is omitted, here is the Envoy's behavior to create DNS resolver:
+  //
+  // 1. If :ref:`typed_dns_resolver_config <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.typed_dns_resolver_config>`
+  // is not empty, uses it.
+  //
+  // 2. Otherwise, uses the default c-ares DNS resolver.
+  //
   ClientContextConfig client_config = 3;
+
+  // Configuration for :ref:`access logs <arch_overview_access_logs>`
+  // emitted by the DNS filter for each DNS query received.
+  // Supports custom format commands for DNS-specific attributes:
+  // - ``QUERY_NAME``: The DNS query name being resolved
+  // - ``QUERY_TYPE``: The DNS query type (A, AAAA, SRV, etc.)
+  // - ``QUERY_CLASS``: The DNS query class
+  // - ``ANSWER_COUNT``: Number of answers in the response
+  // - ``RESPONSE_CODE``: DNS response code
+  // - ``PARSE_STATUS``: Whether the query was successfully parsed
+  repeated config.accesslog.v3.AccessLog access_log = 4;
+
+  // When true, virtual domain names are matched case-insensitively. The response echoes the
+  // client's original query-name case. Defaults to false.
+  bool case_insensitive = 5;
 }

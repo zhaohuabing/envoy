@@ -1,11 +1,11 @@
+load("@base_pip3//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_binary")
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_test",
     "envoy_cc_test_library",
     "envoy_contrib_package",
 )
-load("@rules_python//python:defs.bzl", "py_binary")
-load("@base_pip3//:requirements.bzl", "requirement")
 
 licenses(["notice"])  # Apache 2
 
@@ -141,7 +141,7 @@ envoy_cc_test(
 genrule(
     name = "request_generated_tests",
     srcs = [
-        "@kafka_source//:request_protocol_files",
+        "@kafka//:request_protocol_files",
     ],
     outs = [
         "external/requests_test.cc",
@@ -211,7 +211,7 @@ envoy_cc_test(
 genrule(
     name = "response_generated_tests",
     srcs = [
-        "@kafka_source//:response_protocol_files",
+        "@kafka//:response_protocol_files",
     ],
     outs = [
         "external/responses_test.cc",
@@ -247,7 +247,7 @@ envoy_cc_test(
     srcs = ["metrics_integration_test.cc"],
     deps = [
         ":message_utilities",
-        "//contrib/kafka/filters/network/source:kafka_broker_filter_lib",
+        "//contrib/kafka/filters/network/source:kafka_metrics_lib",
         "//test/common/stats:stat_test_utility_lib",
     ],
 )

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "envoy/network/address.h"
+#include <optional>
 
-#include "absl/types/optional.h"
+#include "envoy/network/connection.h"
 
 namespace Envoy {
 namespace Network {
@@ -14,14 +14,14 @@ public:
   virtual ~HashPolicy() = default;
 
   /**
-   * @param downstream_address is the address of the connected client.
-   * @param upstream_address is the address of the connected server.
-   * @return absl::optional<uint64_t> an optional hash value to route on. A hash value might not be
-   * returned if for example the downstream address is nullptr.
+   * @param connection is the raw downstream connection. Different implementations of HashPolicy can
+   *        compute hashes based on different data accessible from the connection (e.g. IP address,
+   *        filter state, etc.).
+   * @return std::optional<uint64_t> an optional hash value to route on. A hash value might not be
+   * returned if the hash policy implementation doesn't find the expected data in the connection
+   * (e.g. IP address is null, filter state is not populated, etc.).
    */
-  virtual absl::optional<uint64_t>
-  generateHash(const Network::Address::Instance* downstream_address,
-               const Network::Address::Instance* upstream_address) const PURE;
+  virtual std::optional<uint64_t> generateHash(const Network::Connection& connection) const PURE;
 };
 } // namespace Network
 } // namespace Envoy

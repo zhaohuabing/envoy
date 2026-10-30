@@ -23,10 +23,7 @@ public:
   int count() { return count_; };
 
 private:
-  void emitLog(const Http::RequestHeaderMap&, const Http::ResponseHeaderMap&,
-               const Http::ResponseTrailerMap&, const StreamInfo::StreamInfo&) override {
-    count_++;
-  }
+  void emitLog(const Formatter::Context&, const StreamInfo::StreamInfo&) override { count_++; }
 
   int count_ = 0;
 };
@@ -35,7 +32,7 @@ TEST(AccessLogBaseTest, NoFilter) {
   StreamInfo::MockStreamInfo stream_info;
   TestImpl logger(nullptr);
   EXPECT_EQ(logger.count(), 0);
-  logger.log(nullptr, nullptr, nullptr, stream_info);
+  logger.log({}, stream_info);
   EXPECT_EQ(logger.count(), 1);
 }
 
@@ -43,10 +40,10 @@ TEST(AccessLogBaseTest, FilterReject) {
   StreamInfo::MockStreamInfo stream_info;
 
   std::unique_ptr<MockFilter> filter = std::make_unique<MockFilter>();
-  EXPECT_CALL(*filter, evaluate(_, _, _, _)).WillOnce(Return(false));
+  EXPECT_CALL(*filter, evaluate(_, _)).WillOnce(Return(false));
   TestImpl logger(std::move(filter));
   EXPECT_EQ(logger.count(), 0);
-  logger.log(nullptr, nullptr, nullptr, stream_info);
+  logger.log({}, stream_info);
   EXPECT_EQ(logger.count(), 0);
 }
 
