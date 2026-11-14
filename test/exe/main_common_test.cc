@@ -1,6 +1,5 @@
 #include "envoy/common/platform.h"
 
-#include "source/common/common/lock_guard.h"
 #include "source/common/common/mutex_tracer_impl.h"
 #include "source/common/common/random_generator.h"
 #include "source/common/common/thread.h"
@@ -9,9 +8,12 @@
 #include "source/exe/platform_impl.h"
 #include "source/server/options_impl.h"
 
+#include "test/exe/main_common_test_base.h"
 #include "test/mocks/common.h"
 #include "test/test_common/contention.h"
 #include "test/test_common/environment.h"
+#include "test/test_common/logging.h"
+#include "test/test_common/thread_factory_for_test.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -26,6 +28,7 @@
 using testing::HasSubstr;
 using testing::IsEmpty;
 using testing::NiceMock;
+using testing::Not;
 using testing::Return;
 
 namespace Envoy {
@@ -35,7 +38,7 @@ namespace {
 #if !(defined(__clang_analyzer__) ||                                                               \
       (defined(__has_feature) &&                                                                   \
        (__has_feature(thread_sanitizer) || __has_feature(address_sanitizer) ||                     \
-        __has_feature(memory_sanitizer))))
+        __has_feature(hwaddress_sanitizer) || __has_feature(memory_sanitizer))))
 const std::string& outOfMemoryPattern() {
 #if defined(TCMALLOC)
   CONSTRUCT_ON_FIRST_USE(std::string, ".*Unable to allocate.*");
@@ -52,34 +55,10 @@ const std::string& outOfMemoryPattern() {
  * an argv array that is terminated with nullptr. Identifies the config
  * file relative to runfiles directory.
  */
-class MainCommonTest : public testing::TestWithParam<Network::Address::IpVersion> {
+class MainCommonTest : public MainCommonTestBase,
+                       public testing::TestWithParam<Network::Address::IpVersion> {
 protected:
-  MainCommonTest()
-      : config_file_(TestEnvironment::temporaryFileSubstitute(
-            "test/config/integration/google_com_proxy_port_0.yaml", TestEnvironment::ParamMap(),
-            TestEnvironment::PortMap(), GetParam())),
-        argv_({"envoy-static", "--use-dynamic-base-id", "-c", config_file_.c_str(), nullptr}) {}
-
-  const char* const* argv() { return &argv_[0]; }
-  int argc() { return argv_.size() - 1; }
-
-  // Adds an argument, assuring that argv remains null-terminated.
-  void addArg(const char* arg) {
-    ASSERT(!argv_.empty());
-    const size_t last = argv_.size() - 1;
-    ASSERT(argv_[last] == nullptr); // invariant established in ctor, maintained below.
-    argv_[last] = arg;              // guaranteed non-empty
-    argv_.push_back(nullptr);
-  }
-
-  // Adds options to make Envoy exit immediately after initialization.
-  void initOnly() {
-    addArg("--mode");
-    addArg("init_only");
-  }
-
-  std::string config_file_;
-  std::vector<const char*> argv_;
+  MainCommonTest() : MainCommonTestBase(GetParam()) {}
 };
 INSTANTIATE_TEST_SUITE_P(IpVersions, MainCommonTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
@@ -102,6 +81,30 @@ TEST_P(MainCommonTest, ConstructDestructHotRestartDisabledNoInit) {
   initOnly();
   MainCommon main_common(argc(), argv());
   EXPECT_TRUE(main_common.run());
+}
+
+// This test verifies that validation can run from MainCommonBase, from a thread
+// other than the test thread. This is a desirable calling sequence in some
+// contexts. To make this work we must declare MainThread in MainCommonBase, in
+// addition to declaring it in MainCommon. There is no harm in double-declaring.
+TEST_P(MainCommonTest, ValidateUsingMainCommonBaseOutsideTestThread) {
+  EXPECT_FALSE(Thread::MainThread::isMainThreadActive());
+  const char* argv[] = {"envoy-static",       "--mode", "validate", "--config-path",
+                        config_file_.c_str(), nullptr};
+  Envoy::OptionsImpl options(ARRAY_SIZE(argv) - 1, argv, &MainCommon::hotRestartVersion,
+                             spdlog::level::info);
+  std::unique_ptr<Thread::Thread> thread =
+      Thread::threadFactoryForTest().createThread([&options]() {
+        Event::TestRealTimeSystem real_time_system;
+        DefaultListenerHooks default_listener_hooks;
+        ProdComponentFactory prod_component_factory;
+        MainCommonBase base(options, real_time_system, default_listener_hooks,
+                            prod_component_factory, std::make_unique<PlatformImpl>(),
+                            std::make_unique<Random::RandomGeneratorImpl>(), nullptr);
+        EXPECT_TRUE(base.run());
+      });
+  thread->join();
+  EXPECT_FALSE(Thread::MainThread::isMainThreadActive());
 }
 
 TEST_P(MainCommonTest, ConstructDestructHotRestartDisabledNoInitWithVectorArgs) {
@@ -199,6 +202,16 @@ TEST_P(MainCommonTest, RetryDynamicBaseIdFails) {
 #endif
 }
 
+// Verifies that the Logger::Registry is usable after constructing and
+// destructing MainCommon.
+TEST_P(MainCommonTest, ConstructDestructLogger) {
+  VERBOSE_EXPECT_NO_THROW(MainCommon main_common(argc(), argv()));
+
+  const std::string logger_name = "logger";
+  spdlog::details::log_msg log_msg(logger_name, spdlog::level::level_enum::err, "error");
+  Logger::Registry::getSink()->log(log_msg);
+}
+
 // Test that std::set_new_handler() was called and the callback functions as expected.
 // This test fails under TSAN and ASAN, so don't run it in that build:
 //   [  DEATH   ] ==845==ERROR: ThreadSanitizer: requested allocation size 0x3e800000000
@@ -214,9 +227,10 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, MainCommonDeathTest,
                          TestUtility::ipTestParamsToString);
 
 TEST_P(MainCommonDeathTest, OutOfMemoryHandler) {
-#if defined(__clang_analyzer__) || (defined(__has_feature) && (__has_feature(thread_sanitizer) ||  \
-                                                               __has_feature(address_sanitizer) || \
-                                                               __has_feature(memory_sanitizer)))
+#if defined(__clang_analyzer__) ||                                                                 \
+    (defined(__has_feature) &&                                                                     \
+     (__has_feature(thread_sanitizer) || __has_feature(address_sanitizer) ||                       \
+      __has_feature(hwaddress_sanitizer) || __has_feature(memory_sanitizer)))
   ENVOY_LOG_MISC(critical,
                  "MainCommonTest::OutOfMemoryHandler not supported by this compiler configuration");
 #else
@@ -231,7 +245,10 @@ TEST_P(MainCommonDeathTest, OutOfMemoryHandler) {
         // Allocating a fixed-size large array that results in OOM on gcc
         // results in a compile-time error on clang of "array size too big",
         // so dynamically find a size that is too large.
-        const uint64_t initial = 1 << 30;
+        // Start with a size that exceeds the x86_64 virtual address space limit (128TB)
+        // so that mmap fails immediately and tcmalloc prints its "Unable to allocate"
+        // message to stderr.
+        const uint64_t initial = uint64_t{1} << 46;
         for (uint64_t size = initial;
              size >= initial; // Disallow wraparound to avoid infinite loops on failure.
              size *= 1000) {
@@ -244,96 +261,10 @@ TEST_P(MainCommonDeathTest, OutOfMemoryHandler) {
 #endif
 }
 
-class AdminRequestTest : public MainCommonTest {
+class AdminRequestTest : public AdminRequestTestBase,
+                         public testing::TestWithParam<Network::Address::IpVersion> {
 protected:
-  AdminRequestTest() { addArg("--disable-hot-restart"); }
-
-  // Runs an admin request specified in path, blocking until completion, and
-  // returning the response body.
-  std::string adminRequest(absl::string_view path, absl::string_view method) {
-    absl::Notification done;
-    std::string out;
-    main_common_->adminRequest(
-        path, method,
-        [&done, &out](const Http::HeaderMap& /*response_headers*/, absl::string_view body) {
-          out = std::string(body);
-          done.Notify();
-        });
-    done.WaitForNotification();
-    return out;
-  }
-
-  // Initiates Envoy running in its own thread.
-  void startEnvoy() {
-    envoy_thread_ = Thread::threadFactoryForTest().createThread([this]() {
-      // Note: main_common_ is accessed in the testing thread, but
-      // is race-free, as MainCommon::run() does not return until
-      // triggered with an adminRequest POST to /quitquitquit, which
-      // is done in the testing thread.
-      main_common_ = std::make_unique<MainCommon>(argc(), argv());
-      envoy_started_ = true;
-      started_.Notify();
-      pauseResumeInterlock(pause_before_run_);
-      bool status = main_common_->run();
-      pauseResumeInterlock(pause_after_run_);
-      main_common_.reset();
-      envoy_finished_ = true;
-      envoy_return_ = status;
-      finished_.Notify();
-    });
-  }
-
-  // Conditionally pauses at a critical point in the Envoy thread, waiting for
-  // the test thread to trigger something at that exact line. The test thread
-  // can then call resume_.Notify() to allow the Envoy thread to resume.
-  void pauseResumeInterlock(bool enable) {
-    if (enable) {
-      pause_point_.Notify();
-      resume_.WaitForNotification();
-    }
-  }
-
-  // Wait until Envoy is inside the main server run loop proper. Before entering, Envoy runs any
-  // pending post callbacks, so it's not reliable to use adminRequest() or post() to do this.
-  // Generally, tests should not depend on this for correctness, but as a result of
-  // https://github.com/libevent/libevent/issues/779 we need to for TSAN. This is because the entry
-  // to event_base_loop() is where the signal base race occurs, but once we're in that loop in
-  // blocking mode, we're safe to take signals.
-  // TODO(htuch): Remove when https://github.com/libevent/libevent/issues/779 is fixed.
-  void waitForEnvoyRun() {
-    absl::Notification done;
-    main_common_->dispatcherForTest().post([this, &done] {
-      struct Sacrifice : Event::DeferredDeletable {
-        Sacrifice(absl::Notification& notify) : notify_(notify) {}
-        ~Sacrifice() override { notify_.Notify(); }
-        absl::Notification& notify_;
-      };
-      auto sacrifice = std::make_unique<Sacrifice>(done);
-      // Wait for a deferred delete cleanup, this only happens in the main server run loop.
-      main_common_->dispatcherForTest().deferredDelete(std::move(sacrifice));
-    });
-    done.WaitForNotification();
-  }
-
-  // Having triggered Envoy to quit (via signal or /quitquitquit), this blocks until Envoy exits.
-  bool waitForEnvoyToExit() {
-    finished_.WaitForNotification();
-    envoy_thread_->join();
-    return envoy_return_;
-  }
-
-  Stats::IsolatedStoreImpl stats_store_;
-  std::unique_ptr<Thread::Thread> envoy_thread_;
-  std::unique_ptr<MainCommon> main_common_;
-  absl::Notification started_;
-  absl::Notification finished_;
-  absl::Notification resume_;
-  absl::Notification pause_point_;
-  bool envoy_return_{false};
-  bool envoy_started_{false};
-  bool envoy_finished_{false};
-  bool pause_before_run_{false};
-  bool pause_after_run_{false};
+  AdminRequestTest() : AdminRequestTestBase(GetParam()) {}
 };
 INSTANTIATE_TEST_SUITE_P(IpVersions, AdminRequestTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
@@ -343,8 +274,21 @@ TEST_P(AdminRequestTest, AdminRequestGetStatsAndQuit) {
   startEnvoy();
   started_.WaitForNotification();
   EXPECT_THAT(adminRequest("/stats", "GET"), HasSubstr("filesystem.reopen_failed"));
-  adminRequest("/quitquitquit", "POST");
-  EXPECT_TRUE(waitForEnvoyToExit());
+  quitAndWait();
+}
+
+TEST_P(AdminRequestTest, AdminRequestGetNotAllowedPath) {
+  startEnvoy();
+  started_.WaitForNotification();
+  EXPECT_THAT(adminRequest("/status", "GET"), HasSubstr("request to path /status not allowed"));
+  quitAndWait();
+}
+
+TEST_P(AdminRequestTest, AdminRequestGetAllowedPrefixPath) {
+  startEnvoy();
+  started_.WaitForNotification();
+  EXPECT_THAT(adminRequest("/healthcheck/ready", "GET"), Not(HasSubstr("not allowed")));
+  quitAndWait();
 }
 
 // no signals on Windows -- could probably make this work with GenerateConsoleCtrlEvent
@@ -435,8 +379,7 @@ TEST_P(AdminRequestTest, AdminRequestBeforeRun) {
 
   // We don't get a notification when run(), so it's not safe to check whether the
   // admin handler is called until after we quit.
-  adminRequest("/quitquitquit", "POST");
-  EXPECT_TRUE(waitForEnvoyToExit());
+  quitAndWait();
   EXPECT_TRUE(admin_handler_was_called);
 
   // This just checks that some stat output was reported. We could pick any stat.
@@ -489,16 +432,6 @@ TEST_P(AdminRequestTest, AdminRequestAfterRun) {
   EXPECT_TRUE(waitForEnvoyToExit());
   EXPECT_FALSE(admin_handler_was_called);
   EXPECT_EQ(1, lambda_destroy_count);
-}
-
-// Verifies that the Logger::Registry is usable after constructing and
-// destructing MainCommon.
-TEST_P(MainCommonTest, ConstructDestructLogger) {
-  VERBOSE_EXPECT_NO_THROW(MainCommon main_common(argc(), argv()));
-
-  const std::string logger_name = "logger";
-  spdlog::details::log_msg log_msg(logger_name, spdlog::level::level_enum::err, "error");
-  Logger::Registry::getSink()->log(log_msg);
 }
 
 } // namespace Envoy

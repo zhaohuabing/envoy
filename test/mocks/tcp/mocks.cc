@@ -2,10 +2,10 @@
 
 #include "gmock/gmock.h"
 
+using testing::Return;
 using testing::ReturnRef;
 
 using testing::_;
-using testing::Invoke;
 using testing::ReturnRef;
 using testing::SaveArg;
 
@@ -24,11 +24,12 @@ MockConnectionData::~MockConnectionData() {
 }
 
 MockInstance::MockInstance() {
-  ON_CALL(*this, newConnection(_)).WillByDefault(Invoke([&](Callbacks& cb) -> Cancellable* {
+  ON_CALL(*this, newConnection(_)).WillByDefault([&](Callbacks& cb) -> Cancellable* {
     return newConnectionImpl(cb);
-  }));
+  });
   ON_CALL(*this, host()).WillByDefault(Return(host_));
   ON_CALL(*this, addIdleCallback(_)).WillByDefault(SaveArg<0>(&idle_cb_));
+  ON_CALL(*this, socketOptions()).WillByDefault(ReturnRef(socket_options_));
 }
 MockInstance::~MockInstance() = default;
 

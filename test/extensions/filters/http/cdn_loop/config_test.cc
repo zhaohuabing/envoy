@@ -6,6 +6,7 @@
 #include "source/extensions/filters/http/cdn_loop/filter.h"
 
 #include "test/mocks/server/factory_context.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
@@ -15,6 +16,7 @@ namespace Extensions {
 namespace HttpFilters {
 namespace CdnLoop {
 
+using ::Envoy::StatusHelpers::HasStatusMessage;
 using testing::HasSubstr;
 
 TEST(CdnLoopFilterFactoryTest, ValidValuesWork) {
@@ -27,7 +29,26 @@ TEST(CdnLoopFilterFactoryTest, ValidValuesWork) {
   config.set_cdn_id("cdn");
   CdnLoopFilterFactory factory;
 
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context);
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context).value();
+  cb(filter_callbacks);
+  EXPECT_NE(filter.get(), nullptr);
+  EXPECT_NE(dynamic_cast<CdnLoopFilter*>(filter.get()), nullptr);
+}
+
+TEST(CdnLoopFilterFactoryTest, CreateFilterWithServerContext) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context;
+  Http::StreamDecoderFilterSharedPtr filter;
+  Http::MockFilterChainFactoryCallbacks filter_callbacks;
+  EXPECT_CALL(filter_callbacks, addStreamDecoderFilter(_)).WillOnce(::testing::SaveArg<0>(&filter));
+
+  envoy::extensions::filters::http::cdn_loop::v3::CdnLoopConfig config;
+  config.set_cdn_id("cdn");
+  CdnLoopFilterFactory factory;
+  Server::Configuration::ExtraFactoryContext extra_context{
+      server_context.messageValidationVisitor(), "stats"};
+
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(config, server_context, extra_context).value();
   cb(filter_callbacks);
   EXPECT_NE(filter.get(), nullptr);
   EXPECT_NE(dynamic_cast<CdnLoopFilter*>(filter.get()), nullptr);
@@ -39,7 +60,7 @@ TEST(CdnLoopFilterFactoryTest, BlankCdnIdThrows) {
   envoy::extensions::filters::http::cdn_loop::v3::CdnLoopConfig config;
   CdnLoopFilterFactory factory;
 
-  EXPECT_THAT_THROWS_MESSAGE(factory.createFilterFactoryFromProto(config, "stats", context),
+  EXPECT_THAT_THROWS_MESSAGE(factory.createFilterFactoryFromProto(config, "stats", context).value(),
                              ProtoValidationException, HasSubstr("value length must be at least"));
 }
 
@@ -50,8 +71,8 @@ TEST(CdnLoopFilterFactoryTest, InvalidCdnId) {
   config.set_cdn_id("[not-token-or-ip");
   CdnLoopFilterFactory factory;
 
-  EXPECT_THAT_THROWS_MESSAGE(factory.createFilterFactoryFromProto(config, "stats", context),
-                             EnvoyException, HasSubstr("is not a valid CDN identifier"));
+  auto status_or = factory.createFilterFactoryFromProto(config, "stats", context);
+  EXPECT_THAT(status_or, HasStatusMessage(HasSubstr("is not a valid CDN identifier")));
 }
 
 TEST(CdnLoopFilterFactoryTest, InvalidCdnIdNonHeaderWhitespace) {
@@ -61,8 +82,8 @@ TEST(CdnLoopFilterFactoryTest, InvalidCdnIdNonHeaderWhitespace) {
   config.set_cdn_id("\r\n");
   CdnLoopFilterFactory factory;
 
-  EXPECT_THAT_THROWS_MESSAGE(factory.createFilterFactoryFromProto(config, "stats", context),
-                             EnvoyException, HasSubstr("is not a valid CDN identifier"));
+  auto status_or = factory.createFilterFactoryFromProto(config, "stats", context);
+  EXPECT_THAT(status_or, HasStatusMessage(HasSubstr("is not a valid CDN identifier")));
 }
 
 TEST(CdnLoopFilterFactoryTest, InvalidParsedCdnIdNotInput) {
@@ -72,8 +93,8 @@ TEST(CdnLoopFilterFactoryTest, InvalidParsedCdnIdNotInput) {
   config.set_cdn_id("cdn,cdn");
   CdnLoopFilterFactory factory;
 
-  EXPECT_THAT_THROWS_MESSAGE(factory.createFilterFactoryFromProto(config, "stats", context),
-                             EnvoyException, HasSubstr("is not a valid CDN identifier"));
+  auto status_or = factory.createFilterFactoryFromProto(config, "stats", context);
+  EXPECT_THAT(status_or, HasStatusMessage(HasSubstr("is not a valid CDN identifier")));
 }
 
 } // namespace CdnLoop

@@ -1,8 +1,9 @@
 #pragma once
 
+#include "envoy/stream_info/stream_info.h"
 #include "envoy/upstream/retry.h"
 
-#include "source/common/upstream/load_balancer_impl.h"
+#include "source/extensions/load_balancing_policies/common/load_balancer_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -17,7 +18,8 @@ public:
   }
 
   const Upstream::HealthyAndDegradedLoad&
-  determinePriorityLoad(const Upstream::PrioritySet& priority_set,
+  determinePriorityLoad(StreamInfo::StreamInfo* stream_info,
+                        const Upstream::PrioritySet& priority_set,
                         const Upstream::HealthyAndDegradedLoad& original_priority_load,
                         const PriorityMappingFunc& priority_mapping_func) override;
 

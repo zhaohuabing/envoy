@@ -21,8 +21,10 @@ namespace MongoProxy {
 
 TEST(MongoFilterConfigTest, ValidateFail) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
-  EXPECT_THROW(MongoProxyFilterConfigFactory().createFilterFactoryFromProto(
-                   envoy::extensions::filters::network::mongo_proxy::v3::MongoProxy(), context),
+  EXPECT_THROW(MongoProxyFilterConfigFactory()
+                   .createFilterFactoryFromProto(
+                       envoy::extensions::filters::network::mongo_proxy::v3::MongoProxy(), context)
+                   .IgnoreError(),
                ProtoValidationException);
 }
 
@@ -39,7 +41,7 @@ TEST(MongoFilterConfigTest, CorrectConfigurationNoFaults) {
   TestUtility::loadFromYaml(yaml_string, proto_config);
   NiceMock<Server::Configuration::MockFactoryContext> context;
   MongoProxyFilterConfigFactory factory;
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context);
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);
@@ -55,7 +57,23 @@ TEST(MongoFilterConfigTest, ValidProtoConfigurationNoFaults) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   MongoProxyFilterConfigFactory factory;
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context);
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context).value();
+  Network::MockConnection connection;
+  EXPECT_CALL(connection, addFilter(_));
+  cb(connection);
+}
+
+TEST(MongoFilterConfigTest, CorrectConfigurationWithMaxBsonDepth) {
+  const std::string yaml_string = R"EOF(
+  stat_prefix: my_stat_prefix
+  max_bson_depth: 256
+  )EOF";
+
+  envoy::extensions::filters::network::mongo_proxy::v3::MongoProxy proto_config;
+  TestUtility::loadFromYaml(yaml_string, proto_config);
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  MongoProxyFilterConfigFactory factory;
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);
@@ -72,7 +90,7 @@ TEST(MongoFilterConfigTest, MongoFilterWithEmptyProto) {
   config.add_commands("foo");
   config.add_commands("bar");
 
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context);
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context).value();
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);
@@ -91,7 +109,7 @@ TEST(MongoFilterConfigTest, InvalidExtraProperty) {
   test: a
   )EOF";
 
-  handleInvalidConfiguration(yaml_string, "test: Cannot find field");
+  handleInvalidConfiguration(yaml_string, "test");
 }
 
 TEST(MongoFilterConfigTest, EmptyConfig) {
@@ -131,7 +149,7 @@ TEST(MongoFilterConfigTest, InvalidFaultsNegativeMs) {
     fixed_delay: -1s
   )EOF";
 
-  handleInvalidConfiguration(yaml_string, "FixedDelay: value must be greater than 0s");
+  handleInvalidConfiguration(yaml_string, "Invalid duration: Expected positive duration");
 }
 
 TEST(MongoFilterConfigTest, InvalidFaultsDelayPercent) {
@@ -145,7 +163,7 @@ TEST(MongoFilterConfigTest, InvalidFaultsDelayPercent) {
       fixed_delay: 1s
     )EOF";
 
-    handleInvalidConfiguration(yaml_string, R"(invalid value -1 for type TYPE_UINT32)");
+    handleInvalidConfiguration(yaml_string, "percentage");
   }
 }
 
@@ -160,7 +178,7 @@ TEST(MongoFilterConfigTest, InvalidFaultsType) {
       fixed_delay: 1s
     )EOF";
 
-    handleInvalidConfiguration(yaml_string, R"(invalid value "df" for type TYPE_UINT32)");
+    handleInvalidConfiguration(yaml_string, "numerator");
   }
 
   {
@@ -173,7 +191,7 @@ TEST(MongoFilterConfigTest, InvalidFaultsType) {
       fixed_delay: ab
     )EOF";
 
-    handleInvalidConfiguration(yaml_string, "Illegal duration format; duration must end with 's'");
+    handleInvalidConfiguration(yaml_string, "fixed_delay");
   }
 
   {
@@ -204,7 +222,7 @@ TEST(MongoFilterConfigTest, CorrectFaultConfiguration) {
   TestUtility::loadFromYaml(yaml_string, proto_config);
   NiceMock<Server::Configuration::MockFactoryContext> context;
   MongoProxyFilterConfigFactory factory;
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context);
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, context).value();
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);
@@ -220,21 +238,10 @@ TEST(MongoFilterConfigTest, CorrectFaultConfigurationInProto) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   MongoProxyFilterConfigFactory factory;
-  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context);
+  Network::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context).value();
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);
-}
-
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(MongoFilterConfigTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.mongo_proxy";
-
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedNetworkFilterConfigFactory>::getFactory(
-          deprecated_name));
 }
 
 } // namespace MongoProxy

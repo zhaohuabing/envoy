@@ -1,8 +1,9 @@
 #include <string>
 
-#include "source/common/stats/allocator_impl.h"
+#include "source/common/stats/allocator.h"
 #include "source/common/stats/utility.h"
 
+#include "test/mocks/stats/mocks.h"
 #include "test/test_common/logging.h"
 
 #include "gtest/gtest.h"
@@ -20,11 +21,13 @@ protected:
 
   void clearStorage() {
     pool_.clear();
-    EXPECT_EQ(0, symbol_table_.numSymbols());
+    EXPECT_EQ(num_base_symbols_, symbol_table_.numSymbols());
   }
 
   SymbolTableImpl symbol_table_;
-  AllocatorImpl alloc_;
+  // Symbols pre-encoded by the table itself (the well-known stat names).
+  const uint64_t num_base_symbols_{symbol_table_.numSymbols()};
+  Allocator alloc_;
   StatNamePool pool_;
 };
 
@@ -69,6 +72,18 @@ TEST_F(MetricImplTest, FindTag) {
   EXPECT_EQ(makeStat("value1"), Utility::findTag(*counter, makeStat("name1")));
   EXPECT_EQ(makeStat("value2"), Utility::findTag(*counter, makeStat("name2")));
   EXPECT_FALSE(Utility::findTag(*counter, makeStat("name3")));
+}
+
+TEST(GaugeHelperTest, AdjustAddsWhenAddIsBigger) {
+  MockGauge gauge;
+  EXPECT_CALL(gauge, add(3));
+  gauge.adjust(5, 2);
+}
+
+TEST(GaugeHelperTest, AdjustSubtractsWhenSubIsBigger) {
+  MockGauge gauge;
+  EXPECT_CALL(gauge, sub(3));
+  gauge.adjust(2, 5);
 }
 
 } // namespace

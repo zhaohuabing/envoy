@@ -6,11 +6,13 @@
 
 #include "test/extensions/filters/http/jwt_authn/test_common.h"
 #include "test/mocks/server/factory_context.h"
+#include "test/test_common/status_utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication;
+using envoy::extensions::filters::http::jwt_authn::v3::JwtProvider;
 using envoy::extensions::filters::http::jwt_authn::v3::PerRouteConfig;
 using testing::_;
 
@@ -20,6 +22,8 @@ namespace HttpFilters {
 namespace JwtAuthn {
 namespace {
 
+using StatusHelpers::HasStatus;
+
 TEST(HttpJwtAuthnFilterFactoryTest, GoodRemoteJwks) {
   FilterFactory factory;
   ProtobufTypes::MessagePtr proto_config = factory.createEmptyConfigProto();
@@ -27,7 +31,8 @@ TEST(HttpJwtAuthnFilterFactoryTest, GoodRemoteJwks) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(*proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(*proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamDecoderFilter(_));
   cb(filter_callback);
@@ -41,7 +46,8 @@ TEST(HttpJwtAuthnFilterFactoryTest, GoodLocalJwks) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FilterFactory factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamDecoderFilter(_));
   cb(filter_callback);
@@ -55,8 +61,9 @@ TEST(HttpJwtAuthnFilterFactoryTest, BadLocalJwks) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FilterFactory factory;
-  EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context),
-               EnvoyException);
+  auto factory_cb_or = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  EXPECT_THAT(factory_cb_or, HasStatus(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("invalid local jwks")));
 }
 
 TEST(HttpJwtAuthnFilterFactoryTest, ProviderWithoutIssuer) {
@@ -67,28 +74,44 @@ TEST(HttpJwtAuthnFilterFactoryTest, ProviderWithoutIssuer) {
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   FilterFactory factory;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamDecoderFilter(_));
   cb(filter_callback);
+}
+
+TEST(HttpJwtAuthnFilterFactoryTest, UnknownAllowedAlgorithm) {
+  JwtAuthentication proto_config;
+  auto& provider = (*proto_config.mutable_providers())["provider"];
+  provider.mutable_local_jwks()->set_inline_string(PublicKey);
+  provider.add_allowed_algorithms(JwtProvider::RS256);
+  TestUtility::validate(proto_config);
+
+  provider.add_allowed_algorithms(static_cast<JwtProvider::Algorithm>(100));
+  EXPECT_THROW(TestUtility::validate(proto_config), EnvoyException);
 }
 
 TEST(HttpJwtAuthnFilterFactoryTest, EmptyPerRouteConfig) {
   PerRouteConfig per_route;
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
   FilterFactory factory;
-  EXPECT_THROW(factory.createRouteSpecificFilterConfig(per_route, context,
-                                                       context.messageValidationVisitor()),
-               EnvoyException);
+  EXPECT_THROW(
+      factory
+          .createRouteSpecificFilterConfig(per_route, context, context.messageValidationVisitor())
+          .value(),
+      EnvoyException);
 }
 
 TEST(HttpJwtAuthnFilterFactoryTest, WrongPerRouteConfigType) {
   JwtAuthentication per_route;
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
   FilterFactory factory;
-  EXPECT_THROW(factory.createRouteSpecificFilterConfig(per_route, context,
-                                                       context.messageValidationVisitor()),
-               std::bad_cast);
+  EXPECT_THROW(
+      factory
+          .createRouteSpecificFilterConfig(per_route, context, context.messageValidationVisitor())
+          .value(),
+      std::bad_cast);
 }
 
 TEST(HttpJwtAuthnFilterFactoryTest, DisabledPerRouteConfig) {
@@ -97,8 +120,10 @@ TEST(HttpJwtAuthnFilterFactoryTest, DisabledPerRouteConfig) {
 
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
   FilterFactory factory;
-  auto base_ptr = factory.createRouteSpecificFilterConfig(per_route, context,
-                                                          context.messageValidationVisitor());
+  auto base_ptr =
+      factory
+          .createRouteSpecificFilterConfig(per_route, context, context.messageValidationVisitor())
+          .value();
   EXPECT_NE(base_ptr, nullptr);
   const PerRouteFilterConfig* typed_ptr = dynamic_cast<const PerRouteFilterConfig*>(base_ptr.get());
   EXPECT_NE(typed_ptr, nullptr);
@@ -111,8 +136,10 @@ TEST(HttpJwtAuthnFilterFactoryTest, GoodPerRouteConfig) {
 
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
   FilterFactory factory;
-  auto base_ptr = factory.createRouteSpecificFilterConfig(per_route, context,
-                                                          context.messageValidationVisitor());
+  auto base_ptr =
+      factory
+          .createRouteSpecificFilterConfig(per_route, context, context.messageValidationVisitor())
+          .value();
   EXPECT_NE(base_ptr, nullptr);
   const PerRouteFilterConfig* typed_ptr = dynamic_cast<const PerRouteFilterConfig*>(base_ptr.get());
   EXPECT_NE(typed_ptr, nullptr);

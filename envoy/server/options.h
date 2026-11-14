@@ -2,14 +2,16 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "envoy/admin/v3/server_info.pb.h"
 #include "envoy/common/pure.h"
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/network/address.h"
+#include "envoy/server/drain_strategy.h"
+#include "envoy/stats/tag.h"
 
-#include "absl/types/optional.h"
 #include "spdlog/spdlog.h"
 
 namespace Envoy {
@@ -42,24 +44,6 @@ enum class Mode {
   // to be validated in a non-prod environment.
 };
 
-/**
- * During the drain sequence, different components ask the DrainManager
- * whether to drain via drainClose(). This enum dictates the behaviour of
- * drainClose() calls.
- */
-enum class DrainStrategy {
-  /**
-   * The probability of drainClose() returning true increases from 0 to 100%
-   * over the duration of the drain period.
-   */
-  Gradual,
-
-  /**
-   * drainClose() will return true as soon as the drain sequence is initiated.
-   */
-  Immediate,
-};
-
 using CommandLineOptionsPtr = std::unique_ptr<envoy::admin::v3::CommandLineOptions>;
 
 /**
@@ -82,6 +66,18 @@ public:
    *         a file using the baseIdPath option.
    */
   virtual bool useDynamicBaseId() const PURE;
+
+  /**
+   * @return bool don't get hot restart information from the parent if the communication channel
+   *         to the parent instance fails to connect.
+   */
+  virtual bool skipHotRestartOnNoParent() const PURE;
+
+  /**
+   * @return bool don't get stats from the parent. If there are a lot of stats, getting them
+   *         from the parent instance can be slow and require a lot of memory.
+   */
+  virtual bool skipHotRestartParentStats() const PURE;
 
   /**
    * @return const std::string& the dynamic base id output file.
@@ -142,6 +138,17 @@ public:
   virtual bool ignoreUnknownDynamicFields() const PURE;
 
   /**
+   * @return bool skip deprecated warning log messages?
+   **/
+  virtual bool skipDeprecatedLogs() const PURE;
+
+  /**
+   * @return bool whether to emit the entire stack trace in a single log entry
+   *         instead of one log call per frame. Useful for log aggregation systems.
+   */
+  virtual bool logStacktraceSingleEntry() const PURE;
+
+  /**
    * @return const std::string& the admin address output file.
    */
   virtual const std::string& adminAddressPath() const PURE;
@@ -169,12 +176,17 @@ public:
   virtual const std::string& logFormat() const PURE;
 
   /**
+   * @return whether or not a log format was set by CLI option.
+   */
+  virtual bool logFormatSet() const PURE;
+
+  /**
    * @return const bool indicating whether to escape c-style escape sequences in logs.
    */
   virtual bool logFormatEscaped() const PURE;
 
   /**
-   * @return const bool logger mode: whether to use Fancy Logger.
+   * @return const bool logger mode: whether to use Fine-Grain Logger.
    */
   virtual bool enableFineGrainLogging() const PURE;
 
@@ -198,6 +210,11 @@ public:
    * @return std::chrono::milliseconds the duration in msec between log flushes.
    */
   virtual std::chrono::milliseconds fileFlushIntervalMsec() const PURE;
+
+  /**
+   * @return uint64_t the minimum size in kilobytes before the log buffer is flushed.
+   */
+  virtual uint64_t fileFlushMinSizeKB() const PURE;
 
   /**
    * @return const std::string& the server's cluster.
@@ -259,6 +276,12 @@ public:
    * @return the mode of socket file.
    */
   virtual mode_t socketMode() const PURE;
+
+  /**
+   * @return the stats tags provided by the cli. Tags may contain duplicates. It is the
+   * responsibility of the caller to handle the duplicates.
+   */
+  virtual const Stats::TagVector& statsTags() const PURE;
 };
 
 } // namespace Server

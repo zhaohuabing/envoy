@@ -41,6 +41,7 @@ constexpr size_t MaxLcTrieNodes = (1 << 20);
  */
 template <class T> class LcTrie {
 public:
+  LcTrie() = default;
   /**
    * @param data supplies a vector of data and CIDR ranges.
    * @param exclusive if true then only data for the most specific subnet will be returned
@@ -137,8 +138,8 @@ public:
     // step 1. But it has a useful new property: now that all the prefixes
     // are at the leaves, they are disjoint: no prefix is nested under another.
 
-    std::vector<IpPrefix<Ipv4>> ipv4_prefixes = ipv4_temp.push_leaves();
-    std::vector<IpPrefix<Ipv6>> ipv6_prefixes = ipv6_temp.push_leaves();
+    std::vector<IpPrefix<Ipv4>> ipv4_prefixes = ipv4_temp.pushLeaves();
+    std::vector<IpPrefix<Ipv6>> ipv6_prefixes = ipv6_temp.pushLeaves();
 
     // Step 3: take the disjoint prefixes from the leaves of each Binary Trie
     // and use them to construct an LC Trie.
@@ -345,7 +346,7 @@ private:
      *     trie can be nested under another leaf)
      * @return the prefixes associated with the leaf nodes.
      */
-    std::vector<IpPrefix<IpType>> push_leaves() {
+    std::vector<IpPrefix<IpType>> pushLeaves() {
       std::vector<IpPrefix<IpType>> prefixes;
       std::function<void(Node*, DataSetSharedPtr, unsigned, IpType)> visit =
           [&](Node* node, DataSetSharedPtr data, unsigned depth, IpType prefix) {

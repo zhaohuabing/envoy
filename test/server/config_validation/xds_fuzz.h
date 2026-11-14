@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "envoy/admin/v3/config_dump.pb.h"
@@ -15,8 +17,6 @@
 #include "test/integration/http_integration.h"
 #include "test/server/config_validation/xds_fuzz.pb.h"
 #include "test/server/config_validation/xds_verifier.h"
-
-#include "absl/types/optional.h"
 
 namespace Envoy {
 
@@ -76,7 +76,7 @@ private:
   std::vector<envoy::config::route::v3::RouteConfiguration> routes_;
   std::vector<envoy::config::listener::v3::Listener> listeners_;
 
-  uint64_t version_;
+  uint64_t version_{1};
 
   Network::Address::IpVersion ip_version_;
 

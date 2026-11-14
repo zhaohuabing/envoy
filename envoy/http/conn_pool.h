@@ -40,11 +40,11 @@ public:
    * @param host supplies the description of the host that will carry the request. For logical
    *             connection pools the description may be different each time this is called.
    * @param info supplies the stream info object associated with the upstream L4 connection.
-   * @param protocol supplies the protocol associated with the stream, or absl::nullopt for raw TCP.
+   * @param protocol supplies the protocol associated with the stream, or std::nullopt for raw TCP.
    */
   virtual void onPoolReady(RequestEncoder& encoder, Upstream::HostDescriptionConstSharedPtr host,
-                           const StreamInfo::StreamInfo& info,
-                           absl::optional<Http::Protocol> protocol) PURE;
+                           StreamInfo::StreamInfo& info,
+                           std::optional<Http::Protocol> protocol) PURE;
 };
 
 class Instance;
@@ -80,6 +80,13 @@ public:
  */
 class Instance : public Envoy::ConnectionPool::Instance, public Event::DeferredDeletable {
 public:
+  struct StreamOptions {
+    // True if the request can be sent as early data.
+    bool can_send_early_data_;
+    // True if the request can be sent over HTTP/3.
+    bool can_use_http3_;
+  };
+
   ~Instance() override = default;
 
   /**
@@ -95,6 +102,7 @@ public:
    * @param cb supplies the callbacks to invoke when the connection is ready or has failed. The
    *           callbacks may be invoked immediately within the context of this call if there is a
    *           ready connection or an immediate failure. In this case, the routine returns nullptr.
+   * @param options specifies how to create the requested stream.
    * @return Cancellable* If no connection is ready, the callback is not invoked, and a handle
    *                      is returned that can be used to cancel the request. Otherwise, one of the
    *                      callbacks is called and the routine returns nullptr. NOTE: Once a callback
@@ -103,8 +111,8 @@ public:
    * @warning Do not call cancel() from the callbacks, as the request is implicitly canceled when
    *          the callbacks are called.
    */
-  virtual Cancellable* newStream(Http::ResponseDecoder& response_decoder,
-                                 Callbacks& callbacks) PURE;
+  virtual Cancellable* newStream(Http::ResponseDecoder& response_decoder, Callbacks& callbacks,
+                                 const StreamOptions& options) PURE;
 
   /**
    * Returns a user-friendly protocol description for logging.

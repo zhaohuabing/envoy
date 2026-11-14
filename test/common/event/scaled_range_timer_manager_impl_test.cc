@@ -9,6 +9,7 @@
 #include "test/mocks/common.h"
 #include "test/mocks/event/wrapped_dispatcher.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
 
@@ -175,10 +176,10 @@ TEST_F(ScaledRangeTimerManagerTest, InCallbackDisableLastTimerInSameQueue) {
   EXPECT_TRUE(timer1->enabled());
   EXPECT_TRUE(timer2->enabled());
 
-  EXPECT_CALL(callback1, Call).WillOnce(Invoke([&]() {
+  EXPECT_CALL(callback1, Call).WillOnce([&]() {
     timer2->disableTimer();
     timer2.reset();
-  }));
+  });
 
   // Run the dispatcher to make sure nothing happens when it's not supposed to.
   simTime().advanceTimeAndRun(std::chrono::seconds(100), dispatcher_, Dispatcher::RunType::Block);
@@ -202,10 +203,10 @@ TEST_F(ScaledRangeTimerManagerTest, InCallbackDisableTimerInOtherQueue) {
   EXPECT_TRUE(timer1->enabled());
   EXPECT_TRUE(timer2->enabled());
 
-  EXPECT_CALL(callback1, Call).WillOnce(Invoke([&]() {
+  EXPECT_CALL(callback1, Call).WillOnce([&]() {
     timer2->disableTimer();
     timer2.reset();
-  }));
+  });
 
   // Run the dispatcher to make sure nothing happens when it's not supposed to.
   simTime().advanceTimeAndRun(std::chrono::seconds(100), dispatcher_, Dispatcher::RunType::Block);
@@ -693,6 +694,7 @@ TEST_F(ScaledRangeTimerManagerTest, LooksUpConfiguredMinimums) {
   const ScaledTimerTypeMap timer_types{
       {ScaledTimerType::UnscaledRealTimerForTest, ScaledMinimum(UnitFloat::max())},
       {ScaledTimerType::HttpDownstreamIdleConnectionTimeout, ScaledMinimum(UnitFloat(0.3))},
+      {ScaledTimerType::HttpDownstreamMaxConnectionTimeout, ScaledMinimum(UnitFloat(0.4))},
       {ScaledTimerType::HttpDownstreamIdleStreamTimeout, ScaledMinimum(UnitFloat(0.6))},
   };
 

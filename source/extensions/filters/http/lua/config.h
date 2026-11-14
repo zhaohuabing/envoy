@@ -14,21 +14,25 @@ namespace Lua {
  * Config registration for the Lua filter. @see NamedHttpFilterConfigFactory.
  */
 class LuaFilterConfig
-    : public Common::FactoryBase<envoy::extensions::filters::http::lua::v3::Lua,
-                                 envoy::extensions::filters::http::lua::v3::LuaPerRoute> {
+    : public Common::UnifiedFactoryBase<envoy::extensions::filters::http::lua::v3::Lua,
+                                        envoy::extensions::filters::http::lua::v3::LuaPerRoute> {
 public:
-  LuaFilterConfig() : FactoryBase("envoy.filters.http.lua") {}
+  LuaFilterConfig() : UnifiedFactoryBase("envoy.filters.http.lua") {}
 
 private:
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::http::lua::v3::Lua& proto_config, const std::string&,
-      Server::Configuration::FactoryContext& context) override;
+  absl::StatusOr<Http::FilterFactoryCb> createHttpFilterFactoryFromProtoTyped(
+      const envoy::extensions::filters::http::lua::v3::Lua& proto_config,
+      Server::Configuration::ServerFactoryContext& context,
+      Server::Configuration::ExtraFactoryContext& extra_context) override;
 
-  Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::lua::v3::LuaPerRoute& proto_config,
       Server::Configuration::ServerFactoryContext& context,
       ProtobufMessage::ValidationVisitor& validator) override;
 };
+
+using UpstreamLuaFilterConfig = LuaFilterConfig;
 
 } // namespace Lua
 } // namespace HttpFilters

@@ -31,6 +31,12 @@ public:
 
   /**
    * Base64 encode an input char buffer with a given length.
+   * @param input string to encode.
+   */
+  static std::string encode(absl::string_view input);
+
+  /**
+   * Base64 encode an input char buffer with a given length.
    * @param input char array to encode.
    * @param length of the input array.
    * @param whether add padding at the end of the output.
@@ -44,7 +50,7 @@ public:
    * Note, decoded string may contain '\0' at any position, it should be treated as a sequence of
    * bytes.
    */
-  static std::string decode(const std::string& input);
+  static std::string decode(absl::string_view input);
 
   /**
    * Base64 decode an input string. Padding is not required.
@@ -82,7 +88,7 @@ public:
    * Note, decoded string may contain '\0' at any position, it should be treated as a sequence of
    * bytes.
    */
-  static std::string decode(const std::string& input);
+  static std::string decode(absl::string_view input);
 };
 
 } // namespace Envoy

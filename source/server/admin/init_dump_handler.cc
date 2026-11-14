@@ -8,21 +8,13 @@
 namespace Envoy {
 namespace Server {
 
-namespace {
-// Helper method to get the mask parameter.
-absl::optional<std::string> maskParam(const Http::Utility::QueryParams& params) {
-  return Utility::queryParam(params, "mask");
-}
-
-} // namespace
-
 InitDumpHandler::InitDumpHandler(Server::Instance& server) : HandlerContextBase(server) {}
 
-Http::Code InitDumpHandler::handlerInitDump(absl::string_view url,
-                                            Http::ResponseHeaderMap& response_headers,
-                                            Buffer::Instance& response, AdminStream&) const {
-  Http::Utility::QueryParams query_params = Http::Utility::parseAndDecodeQueryString(url);
-  const auto mask = maskParam(query_params);
+Http::Code InitDumpHandler::handlerInitDump(Http::ResponseHeaderMap& response_headers,
+                                            Buffer::Instance& response,
+                                            AdminStream& admin_stream) const {
+  const std::optional<std::string> mask =
+      Utility::nonEmptyQueryParam(admin_stream.queryParams(), "mask");
 
   envoy::admin::v3::UnreadyTargetsDumps dump = *dumpUnreadyTargets(mask);
   MessageUtil::redact(dump);
@@ -33,7 +25,7 @@ Http::Code InitDumpHandler::handlerInitDump(absl::string_view url,
 }
 
 std::unique_ptr<envoy::admin::v3::UnreadyTargetsDumps>
-InitDumpHandler::dumpUnreadyTargets(const absl::optional<std::string>& component) const {
+InitDumpHandler::dumpUnreadyTargets(const std::optional<std::string>& component) const {
   auto unready_targets_dumps = std::make_unique<envoy::admin::v3::UnreadyTargetsDumps>();
 
   if (component.has_value()) {

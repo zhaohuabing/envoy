@@ -18,15 +18,15 @@ public:
   // Network::SocketInterface
   Envoy::Network::IoHandlePtr socket(Envoy::Network::Socket::Type socket_type,
                                      Envoy::Network::Address::Type addr_type,
-                                     Envoy::Network::Address::IpVersion version,
-                                     bool socket_v6only) const override;
-  Envoy::Network::IoHandlePtr
-  socket(Envoy::Network::Socket::Type socket_type,
-         const Envoy::Network::Address::InstanceConstSharedPtr addr) const override;
+                                     Envoy::Network::Address::IpVersion version, bool socket_v6only,
+                                     const Envoy::Network::SocketCreationOptions&) const override;
+  Envoy::Network::IoHandlePtr socket(Envoy::Network::Socket::Type socket_type,
+                                     const Envoy::Network::Address::InstanceConstSharedPtr addr,
+                                     const Envoy::Network::SocketCreationOptions&) const override;
   bool ipFamilySupported(int domain) override;
 
   // Server::Configuration::BootstrapExtensionFactory
-  Server::BootstrapExtensionPtr
+  Server::BootstrapExtensionCreationResult
   createBootstrapExtension(const Protobuf::Message& config,
                            Server::Configuration::ServerFactoryContext& context) override;
   ProtobufTypes::MessagePtr createEmptyConfigProto() override;

@@ -6,6 +6,7 @@
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/extensions/filters/http/common/empty_http_filter_config.h"
+#include "test/integration/filters/test_filters.pb.h"
 
 namespace Envoy {
 
@@ -24,7 +25,7 @@ public:
 
   Http::FilterDataStatus decodeData(Buffer::Instance& buf, bool end_stream) override {
     if (end_stream) {
-      absl::WriterMutexLock m(&encode_lock_);
+      absl::WriterMutexLock m(encode_lock_);
       number_of_decode_calls_ref_++;
       // If this is the second stream to decode headers and we're at high watermark. force low
       // watermark state
@@ -37,7 +38,7 @@ public:
 
   Http::FilterDataStatus encodeData(Buffer::Instance& buf, bool end_stream) override {
     if (end_stream) {
-      absl::WriterMutexLock m(&encode_lock_);
+      absl::WriterMutexLock m(encode_lock_);
       number_of_encode_calls_ref_++;
       // If this is the first stream to encode headers and we're not at high watermark, force high
       // watermark state.
@@ -52,8 +53,9 @@ public:
     // As long as we're doing horrible things let's do *all* the horrible things.
     // Assert the connection we have is a ConnectionImpl and const cast it so we
     // can force watermark changes.
-    auto conn_impl = dynamic_cast<const Network::ConnectionImpl*>(decoder_callbacks_->connection());
-    return const_cast<Network::ConnectionImpl*>(conn_impl);
+    const Network::Connection& connection = *decoder_callbacks_->connection();
+    return const_cast<Network::ConnectionImpl*>(
+        dynamic_cast<const Network::ConnectionImpl*>(&connection));
   }
 
   absl::Mutex& encode_lock_;
@@ -61,16 +63,19 @@ public:
   uint32_t& number_of_decode_calls_ref_;
 };
 
-class TestPauseFilterConfig : public Extensions::HttpFilters::Common::EmptyHttpFilterConfig {
+class TestPauseFilterConfig : public Extensions::HttpFilters::Common::UniqueEmptyHttpFilterConfig<
+                                  test::integration::filters::PauseFilterConfig> {
 public:
-  TestPauseFilterConfig() : EmptyHttpFilterConfig("pause-filter") {}
+  TestPauseFilterConfig()
+      : UniqueEmptyHttpFilterConfig<test::integration::filters::PauseFilterConfig>("pause-filter") {
+  }
 
-  Http::FilterFactoryCb createFilter(const std::string&,
-                                     Server::Configuration::FactoryContext&) override {
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilter(const std::string&, Server::Configuration::FactoryContext&) override {
     return [&](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       // ABSL_GUARDED_BY insists the lock be held when the guarded variables are passed by
       // reference.
-      absl::WriterMutexLock m(&encode_lock_);
+      absl::WriterMutexLock m(encode_lock_);
       callbacks.addStreamFilter(std::make_shared<::Envoy::TestPauseFilter>(
           encode_lock_, number_of_encode_calls_, number_of_decode_calls_));
     };

@@ -1,38 +1,50 @@
 #pragma once
 
-#include <string>
+#include <cstdint>
 
 #include "envoy/runtime/runtime.h"
 
 #include "source/common/singleton/const_singleton.h"
 
-#include "absl/container/flat_hash_set.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/flags/commandlineflag.h"
+#include "absl/flags/flag.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Runtime {
 
+bool hasRuntimePrefix(absl::string_view feature);
 bool isRuntimeFeature(absl::string_view feature);
+
+// Returns true if the feature is one of the legacy runtime features that uses the
+// `envoy.reloadable_features` prefix but is not implemented like all other runtime
+// feature flags.
+bool isLegacyRuntimeFeature(absl::string_view feature);
+
 bool runtimeFeatureEnabled(absl::string_view feature);
 uint64_t getInteger(absl::string_view feature, uint64_t default_value);
 
+void markRuntimeInitialized();
+bool isRuntimeInitialized();
+
+void maybeSetRuntimeGuard(absl::string_view name, bool value);
+
+void maybeSetDeprecatedInts(absl::string_view name, uint32_t value);
+constexpr absl::string_view upstream_http_filters_with_tcp_proxy =
+    "envoy.restart_features.upstream_http_filters_with_tcp_proxy";
+
+// This is a singleton class to map Envoy style flag names to absl flags
 class RuntimeFeatures {
 public:
   RuntimeFeatures();
 
-  // This tracks config-guarded code paths, to determine if a given
-  // runtime-guarded-code-path has the new code run by default or the old code.
-  bool enabledByDefault(absl::string_view feature) const {
-    return enabled_features_.find(feature) != enabled_features_.end();
-  }
-  bool existsButDisabled(absl::string_view feature) const {
-    return disabled_features_.find(feature) != disabled_features_.end();
-  }
+  // Get the command line flag corresponding to the Envoy style feature name, or
+  // nullptr if it is not a registered flag.
+  absl::CommandLineFlag* getFlag(absl::string_view feature) const;
 
 private:
-  friend class RuntimeFeaturesPeer;
-
-  absl::flat_hash_set<std::string> enabled_features_;
-  absl::flat_hash_set<std::string> disabled_features_;
+  absl::flat_hash_map<std::string, absl::CommandLineFlag*> all_features_;
 };
 
 using RuntimeFeaturesDefaults = ConstSingleton<RuntimeFeatures>;

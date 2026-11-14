@@ -1,4 +1,6 @@
 #pragma once
+// Changing the default behavior of ext_proc is generally not allowed. While you may add tests, you
+// generally should not change or remove existing tests.
 
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/extensions/filters/http/ext_proc/v3/ext_proc.pb.h"
@@ -106,13 +108,9 @@ public:
   void randomizeImmediateResponse(ImmediateResponse* msg, const ProcessingRequest* req);
   void randomizeOverrideResponse(ProcessingMode* msg);
   void randomizeResponse(ProcessingResponse* resp, const ProcessingRequest* req);
-
+  grpc::Status generateResponse(ProcessingRequest& req, ProcessingResponse& resp,
+                                bool& immediate_close_grpc);
   FuzzedDataProvider* provider_;
-
-  // Protects immediate_resp_sent_
-  Thread::MutexBasicLockable immediate_resp_lock_;
-  // Flags if an immediate response was generated and sent
-  bool immediate_resp_sent_;
 };
 
 } // namespace ExternalProcessing

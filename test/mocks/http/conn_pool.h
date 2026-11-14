@@ -19,7 +19,7 @@ class MockCallbacks : public Callbacks {
                Upstream::HostDescriptionConstSharedPtr host));
   MOCK_METHOD(void, onPoolReady,
               (RequestEncoder & encoder, Upstream::HostDescriptionConstSharedPtr host,
-               const StreamInfo::StreamInfo& info, absl::optional<Http::Protocol> protocol));
+               StreamInfo::StreamInfo& info, std::optional<Http::Protocol> protocol));
 };
 
 class MockInstance : public Instance {
@@ -33,13 +33,17 @@ public:
   MOCK_METHOD(bool, isIdle, (), (const));
   MOCK_METHOD(void, drainConnections, (Envoy::ConnectionPool::DrainBehavior drain_behavior));
   MOCK_METHOD(bool, hasActiveConnections, (), (const));
-  MOCK_METHOD(Cancellable*, newStream, (ResponseDecoder & response_decoder, Callbacks& callbacks));
+  MOCK_METHOD(Cancellable*, newStream,
+              (ResponseDecoder & response_decoder, Callbacks& callbacks,
+               const Instance::StreamOptions&));
   MOCK_METHOD(bool, maybePreconnect, (float));
   MOCK_METHOD(Upstream::HostDescriptionConstSharedPtr, host, (), (const));
   MOCK_METHOD(absl::string_view, protocolDescription, (), (const));
+  MOCK_METHOD(const Network::ConnectionSocket::OptionsSharedPtr&, socketOptions, (), (override));
 
   std::shared_ptr<testing::NiceMock<Upstream::MockHostDescription>> host_;
   IdleCb idle_cb_;
+  Network::ConnectionSocket::OptionsSharedPtr socket_options_;
 };
 
 } // namespace ConnectionPool

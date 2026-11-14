@@ -3,19 +3,74 @@
 #include <cstdint>
 #include <memory>
 
+#include "envoy/common/optref.h"
 #include "envoy/common/pure.h"
+#include "envoy/config/cluster/v3/cluster.pb.h"
+#include "envoy/http/codes.h"
 #include "envoy/network/transport_socket.h"
 #include "envoy/router/router.h"
+#include "envoy/stream_info/stream_info.h"
 #include "envoy/upstream/types.h"
 #include "envoy/upstream/upstream.h"
 
+#include "xds/data/orca/v3/orca_load_report.pb.h"
+
 namespace Envoy {
+namespace Server {
+namespace Configuration {
+class ServerFactoryContext;
+} // namespace Configuration
+} // namespace Server
 namespace Http {
 namespace ConnectionPool {
 class ConnectionLifetimeCallbacks;
 } // namespace ConnectionPool
 } // namespace Http
 namespace Upstream {
+
+using ClusterProto = envoy::config::cluster::v3::Cluster;
+
+/*
+ * A handle to allow cancellation of asynchronous host selection.
+ * If chooseHost returns a HostSelectionResponse with an AsyncHostSelectionHandle
+ * handle, and the endpoint does not wish to receive onAsyncHostSelection call,
+ * it must call cancel() on the provided handle.
+ *
+ * Please note that the AsyncHostSelectionHandle may be deleted after the
+ * cancel() call. It is up to the implementation of the asynchronous load balancer
+ * to ensure the cancellation state persists until the load balancer checks it.
+ */
+class AsyncHostSelectionHandle {
+public:
+  AsyncHostSelectionHandle& operator=(const AsyncHostSelectionHandle&) = delete;
+  virtual ~AsyncHostSelectionHandle() = default;
+  virtual void cancel() PURE;
+};
+
+/*
+ * The response to a LoadBalancer::chooseHost call.
+ *
+ * chooseHost either returns a host directly or, in the case of asynchronous
+ * load balancing, returns an AsyncHostSelectionHandle handle.
+ *
+ * If it returns a AsyncHostSelectionHandle handle, the load balancer guarantees an
+ * eventual call to LoadBalancerContext::onAsyncHostSelection unless
+ * AsyncHostSelectionHandle::cancel is called.
+ */
+struct HostSelectionResponse {
+  HostSelectionResponse(HostConstSharedPtr host,
+                        std::unique_ptr<AsyncHostSelectionHandle> cancelable = nullptr)
+      : host(host), cancelable(std::move(cancelable)) {}
+  HostSelectionResponse(HostConstSharedPtr host, std::string details)
+      : host(host), details(details) {}
+  HostConstSharedPtr host;
+  // Optional details if host selection fails (empty string implies no details).
+  std::string details;
+  std::unique_ptr<AsyncHostSelectionHandle> cancelable;
+  // Optional HTTP status code to use when host selection fails because the strict override
+  // destination is missing from available endpoints. If not set, defaults to 503.
+  std::optional<Http::Code> failure_status;
+};
 
 /**
  * Context information passed to a load balancer to use when choosing a host. Not all load
@@ -29,9 +84,9 @@ public:
    * Compute and return an optional hash key to use during load balancing. This
    * method may modify internal state so it should only be called once per
    * routing attempt.
-   * @return absl::optional<uint64_t> the optional hash key to use.
+   * @return std::optional<uint64_t> the optional hash key to use.
    */
-  virtual absl::optional<uint64_t> computeHashKey() PURE;
+  virtual std::optional<uint64_t> computeHashKey() PURE;
 
   /**
    * @return Router::MetadataMatchCriteria* metadata for use in selecting a subset of hosts
@@ -44,6 +99,12 @@ public:
    * balancing.
    */
   virtual const Network::Connection* downstreamConnection() const PURE;
+
+  /**
+   * @return const StreamInfo* the incoming request stream info or nullptr to use during load
+   * balancing.
+   */
+  virtual StreamInfo::StreamInfo* requestStreamInfo() const PURE;
 
   /**
    * @return const Http::HeaderMap* the incoming headers or nullptr to use during load
@@ -89,24 +150,42 @@ public:
    */
   virtual Network::TransportSocketOptionsConstSharedPtr upstreamTransportSocketOptions() const PURE;
 
-  // Using uint32_t to express expected status of override host. Every bit in the OverrideHostStatus
-  // represent an enum value of Host::Health. The specific correspondence is shown below:
-  //
-  // * 0b001: Host::Health::Unhealthy
-  // * 0b010: Host::Health::Degraded
-  // * 0b100: Host::Health::Healthy
-  //
-  // If multiple bit fields are set, it is acceptable as long as the status of override host is in
-  // any of these statuses.
-  using OverrideHostStatus = uint32_t;
-  using OverrideHost = std::pair<std::string, OverrideHostStatus>;
-
+  /**
+   * Upstream override host structure.
+   */
+  struct OverrideHost {
+    // The target host address to select.
+    std::string host;
+    // Whether the host should be selected strictly or not.
+    // If strict and no valid host is found, the load balancer should return nullptr.
+    // If not strict, the load balancer will select another host if the target host is not valid.
+    bool strict{false};
+    // The HTTP status code to return when strict mode is enabled and the target host
+    // is not found in the set of available endpoints. Does not apply when the host
+    // exists but is unhealthy. Defaults to 503 (ServiceUnavailable).
+    Http::Code status_on_strict_destination_not_found{Http::Code::ServiceUnavailable};
+  };
   /**
    * Returns the host the load balancer should select directly. If the expected host exists and
-   * the health status of the host matches the expectation, the load balancer can bypass the load
-   * balancing algorithm and return the corresponding host directly.
+   * the host can be selected directly, the load balancer can bypass the load balancing algorithm
+   * and return the corresponding host directly.
    */
-  virtual absl::optional<OverrideHost> overrideHostToSelect() const PURE;
+  virtual OptRef<const OverrideHost> overrideHostToSelect() const PURE;
+
+  /* Called by the load balancer when asynchronous host selection completes
+   * @param host supplies the upstream host selected
+   * @param details gives optional details about the resolution success/failure.
+   */
+  virtual void onAsyncHostSelection(HostConstSharedPtr&& host, std::string&& details) PURE;
+
+  /**
+   * Called by the load balancer to set the headers modifier that will be used to modify the
+   * response headers before sending them downstream.
+   * NOTE: this should be called only once per request, no matter how many times the retrying
+   * happens.
+   * @param modifier supplies the function that will modify the response headers.
+   */
+  virtual void setHeadersModifier(std::function<void(Http::ResponseHeaderMap&)> modifier) PURE;
 };
 
 /**
@@ -124,13 +203,34 @@ class LoadBalancer {
 public:
   virtual ~LoadBalancer() = default;
 
+  /*
+   * This is a convenience wrapper function for code which does not yet support
+   * asynchronous host selection. It cancels any asynchronous lookup and treats
+   * it as host selection failure.
+   */
+  static HostConstSharedPtr
+  onlyAllowSynchronousHostSelection(HostSelectionResponse host_selection) {
+    if (host_selection.cancelable) {
+      // Async host selection not handled yet. Treat this as host selection
+      // failure.
+      host_selection.cancelable->cancel();
+    }
+    return std::move(host_selection.host);
+  }
+
   /**
    * Ask the load balancer for the next host to use depending on the underlying LB algorithm.
    * @param context supplies the load balancer context. Not all load balancers make use of all
    *        context information. Load balancers should be written to assume that context information
    *        is missing and use sensible defaults.
+   * @return a HostSelectionResponse either containing a host, or AsyncHostSelectionHandle handle.
+   *
+   * Please note that asynchronous host selection is not yet fully supported in
+   * Envoy. It works for HTTP load balancing (with the notable exclusion of the
+   * subset load balancer) but not for TCP proxy or other load balancers.
+   * Updates to functionality should be reflected in load_balancing_policies.rst
    */
-  virtual HostConstSharedPtr chooseHost(LoadBalancerContext* context) PURE;
+  virtual HostSelectionResponse chooseHost(LoadBalancerContext* context) PURE;
 
   /**
    * Returns a best effort prediction of the next host to be picked, or nullptr if not predictable.
@@ -154,12 +254,22 @@ public:
    * @return selected pool and connection to be used, or nullopt if no selection is made,
    *         for example if no matching connection is found.
    */
-  virtual absl::optional<SelectedPoolAndConnection>
+  virtual std::optional<SelectedPoolAndConnection>
   selectExistingConnection(LoadBalancerContext* context, const Host& host,
                            std::vector<uint8_t>& hash_key) PURE;
 };
 
 using LoadBalancerPtr = std::unique_ptr<LoadBalancer>;
+
+/**
+ * Necessary parameters for creating a worker local load balancer.
+ */
+struct LoadBalancerParams {
+  // The worker local priority set of the target cluster.
+  const PrioritySet& priority_set;
+  // The worker local priority set of the local cluster.
+  const PrioritySet* local_priority_set{};
+};
 
 /**
  * Factory for load balancers.
@@ -169,9 +279,22 @@ public:
   virtual ~LoadBalancerFactory() = default;
 
   /**
-   * @return LoadBalancerPtr a new load balancer.
+   * @return LoadBalancerPtr a new worker local load balancer.
    */
-  virtual LoadBalancerPtr create() PURE;
+  virtual LoadBalancerPtr create(LoadBalancerParams params) PURE;
+
+  /**
+   * @return bool whether the cluster manager should recreate this worker-local load balancer
+   *         every time the host set changes.
+   *
+   * DEPRECATED: this hook exists only to keep not-yet-migrated load balancers working while the
+   * cluster manager's recreate-on-host-change loop is phased out. New load balancers MUST return
+   * false and refresh any host-derived state by subscribing to the priority set via
+   * PrioritySet::addMemberUpdateCb. The hook has no default so out-of-tree implementations are
+   * forced to make an explicit choice during the migration; it will be removed once all known
+   * implementations have moved off the legacy contract.
+   */
+  virtual bool recreateOnHostChangeDeprecated() const PURE;
 };
 
 using LoadBalancerFactorySharedPtr = std::shared_ptr<LoadBalancerFactory>;
@@ -218,30 +341,84 @@ public:
    * instantiate any needed structured and prepare for further updates. The cluster manager
    * will do this at the appropriate time.
    */
-  virtual void initialize() PURE;
+  virtual absl::Status initialize() PURE;
 };
 
 using ThreadAwareLoadBalancerPtr = std::unique_ptr<ThreadAwareLoadBalancer>;
 
+/*
+ * Parsed load balancer configuration that will be used to create load balancer.
+ */
+class LoadBalancerConfig {
+public:
+  virtual ~LoadBalancerConfig() = default;
+
+  /**
+   * Optional method to allow a load balancer to validate endpoints before they're applied. If an
+   * error is returned from this method, the endpoints are rejected. If this method does not return
+   * an error, the load balancer must be able to use these endpoints in an update from the priority
+   * set.
+   */
+  virtual absl::Status validateEndpoints(const PriorityState&) const { return absl::OkStatus(); }
+};
+using LoadBalancerConfigPtr = std::unique_ptr<LoadBalancerConfig>;
+
 /**
- * Factory for (thread-aware) load balancers. To support a load balancing policy of
+ * Factory config for load balancers. To support a load balancing policy of
  * LOAD_BALANCING_POLICY_CONFIG, at least one load balancer factory corresponding to a policy in
  * load_balancing_policy must be registered with Envoy. Envoy will use the first policy for which
  * it has a registered factory.
  */
-class TypedLoadBalancerFactory : public Config::UntypedFactory {
+class TypedLoadBalancerFactory : public Config::TypedFactory {
 public:
   ~TypedLoadBalancerFactory() override = default;
 
   /**
    * @return ThreadAwareLoadBalancerPtr a new thread-aware load balancer.
+   *
+   * @param lb_config supplies the parsed config of the load balancer.
+   * @param cluster_info supplies the cluster info.
+   * @param priority_set supplies the priority set on the main thread.
+   * @param runtime supplies the runtime loader.
+   * @param random supplies the random generator.
+   * @param time_source supplies the time source.
    */
   virtual ThreadAwareLoadBalancerPtr
-  create(const PrioritySet& priority_set, ClusterStats& stats, Stats::Scope& stats_scope,
-         Runtime::Loader& runtime, Random::RandomGenerator& random,
-         const ::envoy::config::cluster::v3::LoadBalancingPolicy_Policy& lb_policy) PURE;
+  create(OptRef<const LoadBalancerConfig> lb_config, const ClusterInfo& cluster_info,
+         const PrioritySet& priority_set, Runtime::Loader& runtime, Random::RandomGenerator& random,
+         TimeSource& time_source) PURE;
 
-  std::string category() const override { return "envoy.load_balancers"; }
+  /**
+   * This method is used to validate and create load balancer config from typed proto config.
+   *
+   * @return LoadBalancerConfigPtr a new load balancer config or error.
+   *
+   * @param factory_context supplies the load balancer factory context.
+   * @param config supplies the typed proto config of the load balancer. A dynamic_cast could
+   *        be performed on the config to the expected proto type.
+   */
+  virtual absl::StatusOr<LoadBalancerConfigPtr>
+  loadConfig(Server::Configuration::ServerFactoryContext& factory_context,
+             const Protobuf::Message& config) PURE;
+
+  /**
+   * This method is used to validate and create load balancer config from legacy proto config.
+   * This method is only used for backwards compatibility with the legacy cluster config.
+   *
+   * @return LoadBalancerConfigPtr a new load balancer config or error.
+   *
+   * @param factory_context supplies the load balancer factory context.
+   * @param cluster supplies the legacy proto config of the cluster.
+   */
+  virtual absl::StatusOr<LoadBalancerConfigPtr>
+  loadLegacy(Server::Configuration::ServerFactoryContext& factory_context,
+             const ClusterProto& cluster) {
+    UNREFERENCED_PARAMETER(cluster);
+    UNREFERENCED_PARAMETER(factory_context);
+    return nullptr;
+  }
+
+  std::string category() const override { return "envoy.load_balancing_policies"; }
 };
 
 } // namespace Upstream

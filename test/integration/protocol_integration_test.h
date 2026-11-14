@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test/integration/http_protocol_integration.h"
+#include "test/integration/ssl_utility.h"
 
 namespace Envoy {
 
@@ -22,6 +23,20 @@ public:
   // calls for some downstream protocols and not for others, and those still
   // need the full mesh.
   bool testing_upstream_intentionally_{};
+
+protected:
+  // Configures the downstream listener to request a client certificate and validate it against
+  // `trusted_ca` (a file under test/config/integration/certs). With `accept_untrusted` a
+  // certificate that fails validation is still accepted but not reported as validated.
+  void setDownstreamClientCertValidation(const std::string& trusted_ca,
+                                         bool accept_untrusted = false);
+  // Creates a downstream connection presenting the client certificate selected by `options`.
+  Network::ClientConnectionPtr
+  makeDownstreamMtlsConnection(const Ssl::ClientSslTransportOptions& options);
+
+private:
+  // Keeps the TLS client transport socket factory alive for the connection it created.
+  Network::UpstreamTransportSocketFactoryPtr downstream_mtls_transport_socket_factory_;
 };
 
 // Tests for DownstreamProtocolIntegrationTest will be run with all protocols
@@ -42,7 +57,7 @@ protected:
   }
 
   void verifyUpStreamRequestAfterStopAllFilter() {
-    if (downstreamProtocol() >= Http::CodecType::HTTP2) {
+    if (downstreamProtocol() != Http::CodecType::HTTP1) {
       // decode-headers-return-stop-all-filter calls addDecodedData in decodeData and
       // decodeTrailers. 2 decoded data were added.
       EXPECT_EQ(count_ * size_ + added_decoded_data_size_ * 2, upstream_request_->bodyLength());

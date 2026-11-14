@@ -6,8 +6,6 @@
 #include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
 #include "test/test_common/simulated_time_system.h"
-#include "test/test_common/test_runtime.h"
-#include "test/test_common/utility.h"
 
 #include "event2/event.h"
 #include "gtest/gtest.h"
@@ -20,7 +18,8 @@ namespace {
 class SimulatedTimeSystemTest : public testing::Test {
 protected:
   SimulatedTimeSystemTest()
-      : scheduler_(time_system_.createScheduler(base_scheduler_, base_scheduler_)),
+      : base_scheduler_(time_system_),
+        scheduler_(time_system_.createScheduler(base_scheduler_, base_scheduler_)),
         start_monotonic_time_(time_system_.monotonicTime()),
         start_system_time_(time_system_.systemTime()) {}
 
@@ -29,8 +28,7 @@ protected:
   }
 
   void addTask(int64_t delay_ms, char marker, bool expect_monotonic = true) {
-    addCustomTask(
-        delay_ms, marker, []() {}, expect_monotonic);
+    addCustomTask(delay_ms, marker, []() {}, expect_monotonic);
   }
 
   void addCustomTask(int64_t delay_ms, char marker, std::function<void()> cb,
@@ -59,16 +57,67 @@ protected:
     base_scheduler_.run(Dispatcher::RunType::NonBlock);
   }
 
-  TestScopedRuntime scoped_runtime_;
   Event::MockDispatcher dispatcher_;
-  LibeventScheduler base_scheduler_;
   SimulatedTimeSystem time_system_;
+  LibeventScheduler base_scheduler_;
   SchedulerPtr scheduler_;
   std::string output_;
   std::vector<TimerPtr> timers_;
   MonotonicTime start_monotonic_time_;
   SystemTime start_system_time_;
 };
+
+TEST_F(SimulatedTimeSystemTest, AdvanceTimeForIo) {
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_, time_system_.monotonicTime());
+
+  time_system_.setIoDispatcher(&dispatcher_);
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_, time_system_.monotonicTime());
+
+  addTask(5, '5');
+  addTask(9, '9');
+  testing::NiceMock<MockDispatcher> other_dispatcher;
+  time_system_.advanceTimeForIoImpl(other_dispatcher, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_, time_system_.monotonicTime());
+
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(2));
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::milliseconds(2), time_system_.monotonicTime());
+  base_scheduler_.run(Dispatcher::RunType::NonBlock);
+  EXPECT_TRUE(output_.empty());
+
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::milliseconds(5), time_system_.monotonicTime());
+  EXPECT_TRUE(output_.empty());
+  // A pending update must be processed before the clock can advance again.
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::milliseconds(5), time_system_.monotonicTime());
+  base_scheduler_.run(Dispatcher::RunType::NonBlock);
+  EXPECT_EQ("5", output_);
+
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  base_scheduler_.run(Dispatcher::RunType::NonBlock);
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::milliseconds(9), time_system_.monotonicTime());
+  EXPECT_EQ("59", output_);
+
+  addTask(20, 'x');
+  timers_.back()->disableTimer();
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::milliseconds(9), time_system_.monotonicTime());
+
+  // A QUIC upstream can require an alarm on a worker while the test-thread client has none.
+  LibeventScheduler worker_base_scheduler(time_system_);
+  auto worker_scheduler =
+      time_system_.createScheduler(worker_base_scheduler, worker_base_scheduler);
+  auto worker_timer =
+      worker_scheduler->createTimer([this] { output_.append(1, 'w'); }, other_dispatcher);
+  worker_timer->enableTimer(std::chrono::milliseconds(3));
+  time_system_.advanceTimeForIoImpl(dispatcher_, std::chrono::milliseconds(20));
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::milliseconds(12), time_system_.monotonicTime());
+  worker_base_scheduler.run(Dispatcher::RunType::NonBlock);
+  EXPECT_EQ("59w", output_);
+  time_system_.setIoDispatcher(nullptr);
+}
 
 TEST_F(SimulatedTimeSystemTest, AdvanceTimeAsync) {
   EXPECT_EQ(start_monotonic_time_, time_system_.monotonicTime());
@@ -266,7 +315,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
   auto thread = Thread::threadFactoryForTest().createThread([this, &mutex, &done]() {
     for (;;) {
       {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         if (done) {
           return;
         }
@@ -278,7 +327,7 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
 
   TimerPtr timer = scheduler_->createTimer(
       [&mutex, &done]() {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         done = true;
       },
       dispatcher_);
@@ -287,31 +336,31 @@ TEST_F(SimulatedTimeSystemTest, WaitFor) {
   // Wait 1ms of real time. waitFor() does not advance simulated time, so this is just going to
   // verify that we return quickly and nothing has fired.
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_FALSE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::milliseconds(1)));
   }
   EXPECT_FALSE(done);
-  EXPECT_EQ(MonotonicTime(std::chrono::seconds(0)), time_system_.monotonicTime());
+  EXPECT_EQ(start_monotonic_time_, time_system_.monotonicTime());
 
   // Fire the timeout by advancing time and then verify that waitFor() returns without any timeout.
   time_system_.advanceTimeWait(std::chrono::seconds(60));
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_TRUE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_TRUE(done);
-  EXPECT_EQ(MonotonicTime(std::chrono::seconds(60)), time_system_.monotonicTime());
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::seconds(60), time_system_.monotonicTime());
   thread->join();
 
   // Waiting a third time, with no pending timeouts, will just sleep out for
   // the max duration and return a timeout.
   done = false;
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_FALSE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_FALSE(done);
-  EXPECT_EQ(MonotonicTime(std::chrono::seconds(60)), time_system_.monotonicTime());
+  EXPECT_EQ(start_monotonic_time_ + std::chrono::seconds(60), time_system_.monotonicTime());
 }
 
 TEST_F(SimulatedTimeSystemTest, Monotonic) {
@@ -420,7 +469,7 @@ TEST_F(SimulatedTimeSystemTest, DuplicateTimer2) {
   auto thread = Thread::threadFactoryForTest().createThread([this, &mutex, &done]() {
     for (;;) {
       {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         if (done) {
           return;
         }
@@ -432,21 +481,21 @@ TEST_F(SimulatedTimeSystemTest, DuplicateTimer2) {
 
   TimerPtr timer = scheduler_->createTimer(
       [&mutex, &done]() {
-        absl::MutexLock lock(&mutex);
+        absl::MutexLock lock(mutex);
         done = true;
       },
       dispatcher_);
   timer->enableTimer(std::chrono::seconds(10));
 
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_FALSE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_FALSE(done);
 
   time_system_.advanceTimeWait(std::chrono::seconds(10));
   {
-    absl::MutexLock lock(&mutex);
+    absl::MutexLock lock(mutex);
     EXPECT_TRUE(time_system_.waitFor(mutex, absl::Condition(&done), std::chrono::seconds(0)));
   }
   EXPECT_TRUE(done);

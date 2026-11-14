@@ -5,8 +5,6 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
-using testing::Invoke;
-
 namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
@@ -35,25 +33,14 @@ TEST(HttpInspectorConfigFactoryTest, TestCreateFactory) {
   Network::MockListenerFilterManager manager;
   Network::ListenerFilterPtr added_filter;
   EXPECT_CALL(manager, addAcceptFilter_(_, _))
-      .WillOnce(Invoke([&added_filter](const Network::ListenerFilterMatcherSharedPtr&,
-                                       Network::ListenerFilterPtr& filter) {
+      .WillOnce([&added_filter](const Network::ListenerFilterMatcherSharedPtr&,
+                                Network::ListenerFilterPtr& filter) {
         added_filter = std::move(filter);
-      }));
+      });
   cb(manager);
 
   // Make sure we actually create the correct type!
   EXPECT_NE(dynamic_cast<HttpInspector::Filter*>(added_filter.get()), nullptr);
-}
-
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(HttpInspectorConfigFactoryTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.listener.http_inspector";
-
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<
-          Server::Configuration::NamedListenerFilterConfigFactory>::getFactory(deprecated_name));
 }
 
 } // namespace

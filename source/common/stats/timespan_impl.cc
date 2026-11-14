@@ -21,6 +21,7 @@ void HistogramCompletableTimespanImpl::complete() { histogram_.recordValue(tickC
 void HistogramCompletableTimespanImpl::ensureTimeHistogram(const Histogram& histogram) const {
   switch (histogram.unit()) {
   case Histogram::Unit::Null:
+  case Histogram::Unit::Nanoseconds:
   case Histogram::Unit::Microseconds:
   case Histogram::Unit::Milliseconds:
     return;
@@ -34,14 +35,14 @@ void HistogramCompletableTimespanImpl::ensureTimeHistogram(const Histogram& hist
                     "histogram measuring time or fix the unit of the passed histogram.",
                     histogram.name()));
   }
-
-  NOT_REACHED_GCOVR_EXCL_LINE;
 }
 
 uint64_t HistogramCompletableTimespanImpl::tickCount() const {
   switch (histogram_.unit()) {
   case Histogram::Unit::Null:
     return 0;
+  case Histogram::Unit::Nanoseconds:
+    return HistogramCompletableTimespanImpl::elapsedDuration<std::chrono::nanoseconds>().count();
   case Histogram::Unit::Microseconds:
     return HistogramCompletableTimespanImpl::elapsedDuration<std::chrono::microseconds>().count();
   case Histogram::Unit::Milliseconds:
@@ -49,10 +50,9 @@ uint64_t HistogramCompletableTimespanImpl::tickCount() const {
   case Histogram::Unit::Unspecified:
   case Histogram::Unit::Bytes:
   case Histogram::Unit::Percent:
-    NOT_REACHED_GCOVR_EXCL_LINE;
+    PANIC("not implemented");
   }
-
-  NOT_REACHED_GCOVR_EXCL_LINE;
+  PANIC_DUE_TO_CORRUPT_ENUM;
 }
 
 } // namespace Stats

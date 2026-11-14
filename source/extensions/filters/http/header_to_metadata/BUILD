@@ -8,7 +8,7 @@ load(
 licenses(["notice"])  # Apache 2
 
 # HTTP L7 filter that transforms request data into dynamic metadata
-# Public docs: docs/root/configuration/http_filters/header_to_metadata_filter.rst
+# Public docs: https://envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/header_to_metadata_filter
 
 envoy_extension_package()
 
@@ -22,6 +22,8 @@ envoy_cc_library(
         "//source/common/config:well_known_names",
         "//source/common/http:header_utility_lib",
         "//source/common/http:utility_lib",
+        "//source/common/matcher:regex_replace_lib",
+        "//source/extensions/filters/http:well_known_names",
         "@envoy_api//envoy/extensions/filters/http/header_to_metadata/v3:pkg_cc_proto",
     ],
 )
@@ -30,6 +32,9 @@ envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
+    extra_visibility = [
+        "//test/integration:__subpackages__",
+    ],
     deps = [
         "//envoy/registry",
         "//source/common/protobuf:utility_lib",

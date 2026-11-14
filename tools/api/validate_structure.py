@@ -4,6 +4,7 @@
 #
 # ./tools/api/validate_structure.py
 
+import argparse
 import pathlib
 import re
 import sys
@@ -40,7 +41,7 @@ class ValidationError(Exception):
 
 # Extract major version and full API version string from a proto path.
 def proto_api_version(proto_path):
-    match = re.match('v(\d+).*', proto_path.parent.name)
+    match = re.match(r'v(\d+).*', proto_path.parent.name)
     if match:
         return str(proto_path.parent.name)[1:], int(match.group(1))
     return None, 0
@@ -57,7 +58,7 @@ def validate_proto_path(proto_path):
 
     # Validate that v3+ versions are regular.
     if major_version >= 3:
-        if not re.match('\d+(alpha)?$', version_str):
+        if not re.match(r'\d+(alpha)?$', version_str):
             raise ValidationError('Invalid v3+ version: %s' % version_str)
 
         # Validate v2-only paths.
@@ -77,12 +78,18 @@ def validate_proto_paths(proto_paths):
     return error_msgs
 
 
-if __name__ == '__main__':
-    api_root = 'api/envoy'
-    api_protos = pathlib.Path(api_root).rglob('*.proto')
-    error_msgs = validate_proto_paths(p.relative_to(api_root) for p in api_protos)
+def main(*args):
+    parser = argparse.ArgumentParser(description="Check API structure.")
+    parser.add_argument("api_root", type=str, help="Specify the path to the api root.")
+    args = parser.parse_args(args)
+    api_protos = pathlib.Path(args.api_root).rglob('*.proto')
+    error_msgs = validate_proto_paths(p.relative_to(args.api_root) for p in api_protos)
     if error_msgs:
         for m in error_msgs:
             print(m)
         sys.exit(1)
     sys.exit(0)
+
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])

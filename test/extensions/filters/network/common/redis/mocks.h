@@ -9,6 +9,7 @@
 
 #include "test/test_common/printers.h"
 
+#include "absl/strings/string_view.h"
 #include "gmock/gmock.h"
 
 namespace Envoy {
@@ -30,6 +31,7 @@ public:
   ~MockEncoder() override;
 
   MOCK_METHOD(void, encode, (const Common::Redis::RespValue& value, Buffer::Instance& out));
+  MOCK_METHOD(void, setProtocolVersion, (Common::Redis::RespProtocolVersion version));
 
 private:
   Common::Redis::EncoderImpl real_encoder_;
@@ -99,20 +101,35 @@ public:
   ~MockClientCallbacks() override;
 
   void onResponse(Common::Redis::RespValuePtr&& value) override { onResponse_(value); }
-  bool onRedirection(Common::Redis::RespValuePtr&& value, const std::string& host_address,
+  void onRedirection(Common::Redis::RespValuePtr&& value, const std::string& host_address,
                      bool ask_redirection) override {
-    return onRedirection_(value, host_address, ask_redirection);
+    onRedirection_(value, host_address, ask_redirection);
   }
 
   MOCK_METHOD(void, onResponse_, (Common::Redis::RespValuePtr & value));
   MOCK_METHOD(void, onFailure, ());
-  MOCK_METHOD(bool, onRedirection_,
+  MOCK_METHOD(void, onRedirection_,
               (Common::Redis::RespValuePtr & value, const std::string& host_address,
                bool ask_redirection));
 };
 
 } // namespace Client
 
+namespace AwsIamAuthenticator {
+class MockAwsIamAuthenticator : public Envoy::Extensions::NetworkFilters::Common::Redis::
+                                    AwsIamAuthenticator::AwsIamAuthenticatorImpl {
+public:
+  MockAwsIamAuthenticator(Envoy::Extensions::Common::Aws::SignerPtr signer)
+      : AwsIamAuthenticatorImpl(std::move(signer)) {}
+  ~MockAwsIamAuthenticator() override = default;
+  MOCK_METHOD(std::string, getAuthToken,
+              (absl::string_view auth_user,
+               const envoy::extensions::filters::network::redis_proxy::v3::AwsIam& aws_iam_config));
+  MOCK_METHOD(bool, addCallbackIfCredentialsPending,
+              (Extensions::Common::Aws::CredentialsPendingCallback && cb));
+};
+
+} // namespace AwsIamAuthenticator
 } // namespace Redis
 } // namespace Common
 } // namespace NetworkFilters

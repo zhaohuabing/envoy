@@ -3,7 +3,7 @@
 #include "envoy/extensions/filters/http/alternate_protocols_cache/v3/alternate_protocols_cache.pb.h"
 #include "envoy/extensions/filters/http/alternate_protocols_cache/v3/alternate_protocols_cache.pb.validate.h"
 
-#include "source/common/http/alternate_protocols_cache_manager_impl.h"
+#include "source/common/http/http_server_properties_cache_manager_impl.h"
 #include "source/extensions/filters/http/alternate_protocols_cache/filter.h"
 
 namespace Envoy {
@@ -11,14 +11,15 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AlternateProtocolsCache {
 
-Http::FilterFactoryCb AlternateProtocolsCacheFilterFactory::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb>
+AlternateProtocolsCacheFilterFactory::createHttpFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::alternate_protocols_cache::v3::FilterConfig&
         proto_config,
-    const std::string&, Server::Configuration::FactoryContext& context) {
-  Http::AlternateProtocolsCacheManagerFactoryImpl alternate_protocol_cache_manager_factory(
-      context.singletonManager(), context.threadLocal(), {context});
+    Server::Configuration::ServerFactoryContext& context,
+    Server::Configuration::ExtraFactoryContext&) {
+
   FilterConfigSharedPtr filter_config(
-      std::make_shared<FilterConfig>(proto_config, alternate_protocol_cache_manager_factory,
+      std::make_shared<FilterConfig>(proto_config, context.httpServerPropertiesCacheManager(),
                                      context.mainThreadDispatcher().timeSource()));
 
   return [filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {

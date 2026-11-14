@@ -3,7 +3,6 @@ load(
     "envoy_basic_cc_library",
     "envoy_cc_library",
     "envoy_package",
-    "envoy_select_boringssl",
 )
 
 licenses(["notice"])  # Apache 2
@@ -12,7 +11,7 @@ envoy_package()
 
 genrule(
     name = "generate_version_number",
-    srcs = ["//:VERSION"],
+    srcs = ["//:VERSION.txt"],
     outs = ["version_number.h"],
     cmd = """echo "#define BUILD_VERSION_NUMBER \\"$$(cat $<)\\"" >$@""",
     visibility = ["//visibility:private"],
@@ -20,9 +19,11 @@ genrule(
 
 genrule(
     name = "generate_api_version_number",
-    srcs = ["//:API_VERSION"],
+    srcs = ["//:API_VERSION.txt"],
     outs = ["api_version_number.h"],
-    cmd = """./$(location //tools/api_versioning:generate_api_version_header_bin) $< >$@""",
+    cmd = """
+    ./$(location //tools/api_versioning:generate_api_version_header_bin) $< >$@
+    """,
     tools = ["//tools/api_versioning:generate_api_version_header_bin"],
     visibility = ["//visibility:private"],
 )
@@ -43,6 +44,37 @@ genrule(
     visibility = ["//visibility:private"],
 )
 
+# Header-only interface for the Envoy version string. Consumers that need only to declare the
+# version-string API (such as the logger) depend on this target so that their build cache is not
+# invalidated every time the SCM revision changes. The actual implementation lives in
+# ":version_string_lib" below and must be linked by the final binary (or equivalent) alongside
+# "version_linkstamp" (production) or "test_version_linkstamp" (tests).
+envoy_cc_library(
+    name = "version_string_interface_lib",
+    hdrs = ["version_string.h"],
+)
+
+envoy_cc_library(
+    name = "version_string_lib",
+    srcs = ["version_string.cc"],
+    hdrs = [":generate_version_number"],
+    copts = select({
+        "//bazel:using_boringssl_fips": ["-DENVOY_SSL_VERSION=\\\"BoringSSL-FIPS\\\""],
+        "//bazel:using_openssl": ["-DENVOY_SSL_VERSION=\\\"OpenSSL\\\""],
+        "//conditions:default": ["-DENVOY_SSL_VERSION=\\\"BoringSSL\\\""],
+    }),
+    tags = ["notidy"],
+    deps = [
+        ":version_string_interface_lib",
+        ":version_suffix_default",
+        "//source/common/common:fmt_lib",
+        "//source/common/common:macros",
+    ],
+    # Ensure that linkers that strip unreferenced archive objects (e.g. ld with --gc-sections)
+    # still pull in version_string.cc so that envoyVersionString() resolves in final binaries.
+    alwayslink = 1,
+)
+
 envoy_cc_library(
     name = "version_includes",
     hdrs = [
@@ -58,15 +90,11 @@ envoy_cc_library(
 envoy_cc_library(
     name = "version_lib",
     srcs = ["version.cc"],
-    copts = envoy_select_boringssl(
-        [
-            "-DENVOY_SSL_VERSION=\\\"BoringSSL-FIPS\\\"",
-            "-DENVOY_SSL_FIPS",
-        ],
-        ["-DENVOY_SSL_VERSION=\\\"BoringSSL\\\""],
-    ),
+    external_deps = ["ssl"],
+    tags = ["notidy"],
     deps = [
         ":version_includes",
+        ":version_string_lib",
         "//source/common/common:macros",
         "//source/common/protobuf:utility_lib",
     ],
@@ -93,6 +121,12 @@ envoy_basic_cc_library(
 )
 
 envoy_basic_cc_library(
+    name = "version_suffix_default",
+    srcs = ["version_suffix.cc"],
+    copts = ["-fvisibility=default"],
+)
+
+envoy_basic_cc_library(
     name = "version_linkstamp",
     linkstamp = select({
         "//bazel:manual_stamp": None,
@@ -101,7 +135,7 @@ envoy_basic_cc_library(
     # Linking this library makes build cache inefficient, limiting this to //source/exe package only.
     # Tests are linked with //test/test_common:test_version_linkstamp.
     visibility = ["//source/exe:__pkg__"],
-    deps = select({
+    deps = [":version_suffix_default"] + select({
         "//bazel:manual_stamp": [":manual_version_linkstamp"],
         "//conditions:default": [],
     }),

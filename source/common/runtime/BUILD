@@ -10,6 +10,26 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_library(
+    name = "runtime_keys_lib",
+    srcs = [
+        "runtime_keys.cc",
+    ],
+    hdrs = [
+        "runtime_keys.h",
+    ],
+    deps = [
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "breaking_changes_flags",
+    hdrs = [
+        "breaking_changes_flags.h",
+    ],
+)
+
+envoy_cc_library(
     name = "runtime_features_lib",
     srcs = [
         "runtime_features.cc",
@@ -17,12 +37,27 @@ envoy_cc_library(
     hdrs = [
         "runtime_features.h",
     ],
+    # ABSL_FLAGS_STRIP_NAMES controls the behavior of the ABSL_FLAG
+    # macro. By default, it is defined on mobile platforms and false elsewhere.
+    # When defined, it causes flags to be registered in the global flag registry,
+    # which is required for Envoy runtime flags to work. By forcing this to be
+    # defined in source/common/runtime:runtime_features_lib, we ensure that
+    # even on mobile, runtime features work correctly since the ABSL_FLAGS
+    # which control them live in that target. This does NOT cause ABSL_FLAGS
+    # defined in other targets to be added to the registry, but that does not
+    # affect Envoy's usage.
+    copts = [
+        "-DABSL_FLAGS_STRIP_NAMES=0",
+    ],
     deps = [
         # AVOID ADDING TO THESE DEPENDENCIES IF POSSIBLE
         # Any code using runtime guards depends on this library, and the more dependencies there are,
         # the harder it is to runtime-guard without dependency loops.
+        ":breaking_changes_flags",
+        "@abseil-cpp//absl/flags:commandlineflag",
+        "@abseil-cpp//absl/flags:flag",
+        "//envoy/http:codec_runtime_overrides",
         "//envoy/runtime:runtime_interface",
-        "//source/common/common:hash_lib",
         "//source/common/singleton:const_singleton",
     ],
 )
@@ -64,9 +99,10 @@ envoy_cc_library(
         "//source/common/common:thread_lib",
         "//source/common/common:utility_lib",
         "//source/common/config:api_version_lib",
-        "//source/common/config:subscription_base_interface",
+        "//source/common/config:resource_type_helper_lib",
         "//source/common/filesystem:directory_lib",
         "//source/common/grpc:common_lib",
+        "//source/common/http:utility_lib",
         "//source/common/init:manager_lib",
         "//source/common/init:target_lib",
         "//source/common/init:watcher_lib",
@@ -74,11 +110,28 @@ envoy_cc_library(
         "//source/common/protobuf:utility_lib",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
-        "@envoy_api//envoy/service/discovery/v2:pkg_cc_proto",
         "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
         "@envoy_api//envoy/service/runtime/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/v3:pkg_cc_proto",
     ] + envoy_select_enable_http3([
         "//source/common/quic/platform:quiche_flags_impl_lib",
+        "@quiche//:quic_platform_base",
     ]),
+)
+
+envoy_cc_library(
+    name = "breaking_changes",
+    srcs = [
+        "breaking_changes.cc",
+    ],
+    hdrs = [
+        "breaking_changes.h",
+    ],
+    deps = [
+        ":breaking_changes_flags",
+        "//envoy/stream_info:filter_state_interface",
+        "@abseil-cpp//absl/container:inlined_vector",
+        "@abseil-cpp//absl/flags:flag",
+        "@abseil-cpp//absl/strings",
+    ],
 )

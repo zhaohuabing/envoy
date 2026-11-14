@@ -9,6 +9,7 @@
 #include "envoy/stats/stats_macros.h"
 #include "envoy/stats/timespan.h"
 
+#include "source/common/common/linked_object.h"
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/network/dubbo_proxy/active_message.h"
 #include "source/extensions/filters/network/dubbo_proxy/decoder.h"
@@ -36,6 +37,8 @@ public:
   virtual Router::Config& routerConfig() PURE;
 };
 
+using ConfigSharedPtr = std::shared_ptr<Config>;
+
 // class ActiveMessagePtr;
 class ConnectionManager : public Network::ReadFilter,
                           public Network::ConnectionCallbacks,
@@ -46,7 +49,7 @@ public:
   using ConfigSerializationType =
       envoy::extensions::filters::network::dubbo_proxy::v3::SerializationType;
 
-  ConnectionManager(Config& config, Random::RandomGenerator& random_generator,
+  ConnectionManager(ConfigSharedPtr config, Random::RandomGenerator& random_generator,
                     TimeSource& time_system);
   ~ConnectionManager() override = default;
 
@@ -68,7 +71,7 @@ public:
   Network::Connection& connection() const { return read_callbacks_->connection(); }
   TimeSource& timeSystem() const { return time_system_; }
   Random::RandomGenerator& randomGenerator() const { return random_generator_; }
-  Config& config() const { return config_; }
+  Config& config() const { return *config_; }
   SerializationType downstreamSerializationType() const { return protocol_->serializer()->type(); }
   ProtocolType downstreamProtocolType() const { return protocol_->type(); }
 
@@ -77,16 +80,16 @@ public:
                       bool end_stream);
 
   // This function is for testing only.
-  std::list<ActiveMessagePtr>& getActiveMessagesForTest() { return active_message_list_; }
+  IntrusiveList<ActiveMessage>& getActiveMessagesForTest() { return active_message_list_; }
 
 private:
   void dispatch();
   void resetAllMessages(bool local_reset);
 
   Buffer::OwnedImpl request_buffer_;
-  std::list<ActiveMessagePtr> active_message_list_;
+  IntrusiveList<ActiveMessage> active_message_list_;
 
-  Config& config_;
+  ConfigSharedPtr config_;
   TimeSource& time_system_;
   DubboFilterStats& stats_;
   Random::RandomGenerator& random_generator_;

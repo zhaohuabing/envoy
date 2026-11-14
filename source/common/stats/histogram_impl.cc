@@ -4,6 +4,7 @@
 #include <string>
 
 #include "source/common/common/utility.h"
+#include "source/common/protobuf/utility.h"
 
 #include "absl/strings/str_join.h"
 
@@ -15,8 +16,7 @@ const ConstSupportedBuckets default_buckets{};
 }
 
 HistogramStatisticsImpl::HistogramStatisticsImpl()
-    : supported_buckets_(default_buckets), computed_quantiles_(supportedQuantiles().size(), 0.0),
-      unit_(Histogram::Unit::Unspecified) {}
+    : supported_buckets_(default_buckets), computed_quantiles_(supportedQuantiles().size(), 0.0) {}
 
 HistogramStatisticsImpl::HistogramStatisticsImpl(const histogram_t* histogram_ptr,
                                                  Histogram::Unit unit,
@@ -29,6 +29,17 @@ HistogramStatisticsImpl::HistogramStatisticsImpl(const histogram_t* histogram_pt
 const std::vector<double>& HistogramStatisticsImpl::supportedQuantiles() const {
   CONSTRUCT_ON_FIRST_USE(std::vector<double>,
                          {0, 0.25, 0.5, 0.75, 0.90, 0.95, 0.99, 0.995, 0.999, 1});
+}
+
+std::vector<uint64_t> HistogramStatisticsImpl::computeDisjointBuckets() const {
+  std::vector<uint64_t> buckets;
+  buckets.reserve(computed_buckets_.size());
+  uint64_t previous_computed_bucket = 0;
+  for (uint64_t computed_bucket : computed_buckets_) {
+    buckets.push_back(computed_bucket - previous_computed_bucket);
+    previous_computed_bucket = computed_bucket;
+  }
+  return buckets;
 }
 
 std::string HistogramStatisticsImpl::quantileSummary() const {
@@ -85,15 +96,22 @@ void HistogramStatisticsImpl::refresh(const histogram_t* new_histogram_ptr) {
     }
     computed_buckets_.emplace_back(hist_approx_count_below(new_histogram_ptr, bucket));
   }
+
+  out_of_bound_count_ = hist_approx_count_above(new_histogram_ptr, supported_buckets.back());
 }
 
-HistogramSettingsImpl::HistogramSettingsImpl(const envoy::config::metrics::v3::StatsConfig& config)
-    : configs_([&config]() {
+HistogramSettingsImpl::HistogramSettingsImpl(const envoy::config::metrics::v3::StatsConfig& config,
+                                             Server::Configuration::CommonFactoryContext& context)
+    : configs_([&config, &context]() {
         std::vector<Config> configs;
         for (const auto& matcher : config.histogram_bucket_settings()) {
           std::vector<double> buckets{matcher.buckets().begin(), matcher.buckets().end()};
           std::sort(buckets.begin(), buckets.end());
-          configs.emplace_back(matcher.match(), std::move(buckets));
+          configs.emplace_back(Matchers::StringMatcherImpl(matcher.match(), context),
+                               buckets.empty()
+                                   ? std::nullopt
+                                   : std::make_optional<ConstSupportedBuckets>(std::move(buckets)),
+                               PROTOBUF_GET_OPTIONAL_WRAPPED(matcher, bins));
         }
 
         return configs;
@@ -101,11 +119,20 @@ HistogramSettingsImpl::HistogramSettingsImpl(const envoy::config::metrics::v3::S
 
 const ConstSupportedBuckets& HistogramSettingsImpl::buckets(absl::string_view stat_name) const {
   for (const auto& config : configs_) {
-    if (config.first.match(stat_name)) {
-      return config.second;
+    if (config.matcher_.match(stat_name) && config.buckets_.has_value()) {
+      return config.buckets_.value();
     }
   }
   return defaultBuckets();
+}
+
+std::optional<uint32_t> HistogramSettingsImpl::bins(absl::string_view stat_name) const {
+  for (const auto& config : configs_) {
+    if (config.matcher_.match(stat_name) && config.bins_.has_value()) {
+      return config.bins_;
+    }
+  }
+  return {};
 }
 
 const ConstSupportedBuckets& HistogramSettingsImpl::defaultBuckets() {

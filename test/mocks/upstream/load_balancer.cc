@@ -6,8 +6,9 @@
 namespace Envoy {
 namespace Upstream {
 using ::testing::_;
-using ::testing::Return;
-MockLoadBalancer::MockLoadBalancer() { ON_CALL(*this, chooseHost(_)).WillByDefault(Return(host_)); }
+MockLoadBalancer::MockLoadBalancer() {
+  ON_CALL(*this, chooseHost(_)).WillByDefault([this] { return HostSelectionResponse{host_}; });
+}
 
 MockLoadBalancer::~MockLoadBalancer() = default;
 

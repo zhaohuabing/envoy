@@ -1,6 +1,7 @@
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_test",
+    "envoy_cc_test_library",
     "envoy_package",
 )
 
@@ -9,9 +10,26 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_cc_test(
+    name = "aligned_allocator_test",
+    srcs = ["aligned_allocator_test.cc"],
+    deps = ["//source/common/memory:aligned_allocator_lib"],
+)
+
+envoy_cc_test(
     name = "debug_test",
     srcs = ["debug_test.cc"],
     deps = ["//source/common/memory:stats_lib"],
+)
+
+envoy_cc_test(
+    name = "memory_release_test",
+    srcs = ["memory_release_test.cc"],
+    deps = [
+        "//source/common/memory:stats_lib",
+        "//test/test_common:logging_lib",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:utility_lib",
+    ],
 )
 
 envoy_cc_test(
@@ -26,5 +44,13 @@ envoy_cc_test(
         "//test/mocks/server:overload_manager_mocks",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:utility_lib",
+        "@envoy_api//envoy/config/overload/v3:pkg_cc_proto",
     ],
+)
+
+envoy_cc_test_library(
+    name = "memory_test_utility_lib",
+    srcs = ["memory_test_utility.cc"],
+    hdrs = ["memory_test_utility.h"],
+    deps = ["//source/common/memory:stats_lib"],
 )

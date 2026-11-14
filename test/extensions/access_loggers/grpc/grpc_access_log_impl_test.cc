@@ -1,3 +1,4 @@
+#include <chrono>
 #include <memory>
 
 #include "envoy/config/core/v3/grpc_service.pb.h"
@@ -14,7 +15,6 @@
 #include "test/mocks/thread_local/mocks.h"
 
 using testing::_;
-using testing::Invoke;
 using testing::NiceMock;
 using testing::Return;
 
@@ -38,12 +38,11 @@ public:
                                  Grpc::MockAsyncClient* async_client) {
     EXPECT_CALL(local_info, node());
     EXPECT_CALL(*async_client, startRaw(_, _, _, _))
-        .WillOnce(
-            Invoke([this](absl::string_view, absl::string_view, Grpc::RawAsyncStreamCallbacks& cbs,
-                          const Http::AsyncClient::StreamOptions&) {
-              this->callbacks_ = dynamic_cast<AccessLogCallbacks*>(&cbs);
-              return &this->stream_;
-            }));
+        .WillOnce([this](absl::string_view, absl::string_view, Grpc::RawAsyncStreamCallbacks& cbs,
+                         const Http::AsyncClient::StreamOptions&) {
+          this->callbacks_ = dynamic_cast<AccessLogCallbacks*>(&cbs);
+          return &this->stream_;
+        });
   }
 
   void expectStreamMessage(const std::string& expected_message_yaml) {
@@ -51,12 +50,12 @@ public:
     TestUtility::loadFromYaml(expected_message_yaml, expected_message);
     EXPECT_CALL(stream_, isAboveWriteBufferHighWatermark()).WillOnce(Return(false));
     EXPECT_CALL(stream_, sendMessageRaw_(_, false))
-        .WillOnce(Invoke([expected_message](Buffer::InstancePtr& request, bool) {
+        .WillOnce([expected_message](Buffer::InstancePtr& request, bool) {
           envoy::service::accesslog::v3::StreamAccessLogsMessage message;
           Buffer::ZeroCopyInputStreamImpl request_stream(std::move(request));
           EXPECT_TRUE(message.ParseFromZeroCopyStream(&request_stream));
           EXPECT_EQ(message.DebugString(), expected_message.DebugString());
-        }));
+        });
   }
 
 private:
@@ -70,9 +69,13 @@ public:
       : async_client_(new Grpc::MockAsyncClient), timer_(new Event::MockTimer(&dispatcher_)),
         grpc_access_logger_impl_test_helper_(local_info_, async_client_) {
     EXPECT_CALL(*timer_, enableTimer(_, _));
-    logger_ = std::make_unique<GrpcAccessLoggerImpl>(
-        Grpc::RawAsyncClientPtr{async_client_}, "test_log_name", FlushInterval, BUFFER_SIZE_BYTES,
-        dispatcher_, local_info_, stats_store_);
+    *config_.mutable_log_name() = "test_log_name";
+    config_.mutable_buffer_size_bytes()->set_value(BUFFER_SIZE_BYTES);
+    config_.mutable_buffer_flush_interval()->set_nanos(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(FlushInterval).count());
+    logger_ =
+        std::make_unique<GrpcAccessLoggerImpl>(Grpc::RawAsyncClientPtr{async_client_}, config_,
+                                               dispatcher_, local_info_, *stats_store_.rootScope());
   }
 
   Grpc::MockAsyncClient* async_client_;
@@ -82,6 +85,7 @@ public:
   Event::MockTimer* timer_;
   std::unique_ptr<GrpcAccessLoggerImpl> logger_;
   GrpcAccessLoggerImplTestHelper grpc_access_logger_impl_test_helper_;
+  envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig config_;
 };
 
 TEST_F(GrpcAccessLoggerImplTest, LogHttp) {
@@ -129,18 +133,19 @@ public:
         logger_cache_(async_client_manager_, scope_, tls_, local_info_),
         grpc_access_logger_impl_test_helper_(local_info_, async_client_) {
     EXPECT_CALL(async_client_manager_, factoryForGrpcService(_, _, true))
-        .WillOnce(Invoke([this](const envoy::config::core::v3::GrpcService&, Stats::Scope&, bool) {
-          EXPECT_CALL(*factory_, createUncachedRawAsyncClient()).WillOnce(Invoke([this] {
+        .WillOnce([this](const envoy::config::core::v3::GrpcService&, Stats::Scope&, bool) {
+          EXPECT_CALL(*factory_, createUncachedRawAsyncClient()).WillOnce([this] {
             return Grpc::RawAsyncClientPtr{async_client_};
-          }));
+          });
           return Grpc::AsyncClientFactoryPtr{factory_};
-        }));
+        });
   }
 
   Grpc::MockAsyncClient* async_client_;
   Grpc::MockAsyncClientFactory* factory_;
   Grpc::MockAsyncClientManager async_client_manager_;
-  NiceMock<Stats::MockIsolatedStatsStore> scope_;
+  NiceMock<Stats::MockIsolatedStatsStore> store_;
+  Stats::Scope& scope_{*store_.rootScope()};
   NiceMock<ThreadLocal::MockInstance> tls_;
   LocalInfo::MockLocalInfo local_info_;
   GrpcAccessLoggerCacheImpl logger_cache_;

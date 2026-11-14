@@ -12,7 +12,8 @@ public:
   MockBootstrapExtension();
   ~MockBootstrapExtension() override;
 
-  MOCK_METHOD(void, onServerInitialized, (), (override));
+  MOCK_METHOD(void, onServerInitialized, (Server::Instance&), (override));
+  MOCK_METHOD(void, onWorkerThreadInitialized, (), (override));
 };
 
 namespace Configuration {
@@ -21,7 +22,7 @@ public:
   MockBootstrapExtensionFactory();
   ~MockBootstrapExtensionFactory() override;
 
-  MOCK_METHOD(BootstrapExtensionPtr, createBootstrapExtension,
+  MOCK_METHOD(BootstrapExtensionCreationResult, createBootstrapExtension,
               (const Protobuf::Message&, Configuration::ServerFactoryContext&), (override));
   MOCK_METHOD(ProtobufTypes::MessagePtr, createEmptyConfigProto, (), (override));
   MOCK_METHOD(std::string, name, (), (const, override));

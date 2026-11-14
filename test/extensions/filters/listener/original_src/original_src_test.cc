@@ -39,14 +39,14 @@ public:
 
   void setAddressToReturn(const std::string& address) {
     callbacks_.socket_.connection_info_provider_->setRemoteAddress(
-        Network::Utility::resolveUrl(address));
+        *Network::Utility::resolveUrl(address));
   }
 
 protected:
   MockBuffer buffer_;
   NiceMock<Network::MockListenerFilterCallbacks> callbacks_;
 
-  absl::optional<Network::Socket::Option::Details>
+  std::optional<Network::Socket::Option::Details>
   findOptionDetails(const Network::Socket::Options& options, Network::SocketOptionName name,
                     envoy::config::core::v3::SocketOption::SocketState state) {
     for (const auto& option : options) {
@@ -56,12 +56,13 @@ protected:
       }
     }
 
-    return absl::nullopt;
+    return std::nullopt;
   }
 };
 
 TEST_F(OriginalSrcTest, OnNewConnectionUnixSocketSkips) {
   auto filter = makeDefaultFilter();
+  EXPECT_EQ(filter->maxReadBytes(), 0);
   setAddressToReturn("unix://domain.socket");
   EXPECT_CALL(callbacks_.socket_, addOption_(_)).Times(0);
   EXPECT_EQ(filter->onAccept(callbacks_), Network::FilterStatus::Continue);
@@ -111,7 +112,7 @@ TEST_F(OriginalSrcTest, OnNewConnectionIpv4AddressBleachesPort) {
   filter->onAccept(callbacks_);
 
   NiceMock<Network::MockConnectionSocket> socket;
-  const auto expected_address = Network::Utility::parseInternetAddress("1.2.3.4");
+  const auto expected_address = Network::Utility::parseInternetAddressNoThrow("1.2.3.4");
 
   // not ideal -- we're assuming that the original_src option is first, but it's a fair assumption
   // for now.
@@ -177,6 +178,25 @@ TEST_F(OriginalSrcTest, Mark0NotAdded) {
                                        envoy::config::core::v3::SocketOption::STATE_PREBIND);
 
   ASSERT_FALSE(mark_option.has_value());
+}
+
+TEST_F(OriginalSrcTest, FilterAddsBindAddressNoPortOption) {
+  if (!ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT.hasValue()) {
+    // The option isn't supported on this platform. Just skip the test.
+    return;
+  }
+
+  auto filter = makeDefaultFilter();
+  Network::Socket::OptionsSharedPtr options;
+  setAddressToReturn("tcp://1.2.3.4:800");
+  EXPECT_CALL(callbacks_.socket_, addOptions_(_)).WillOnce(SaveArg<0>(&options));
+
+  filter->onAccept(callbacks_);
+
+  auto addr_bind_option = findOptionDetails(*options, ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT,
+                                            envoy::config::core::v3::SocketOption::STATE_PREBIND);
+
+  EXPECT_TRUE(addr_bind_option.has_value());
 }
 
 } // namespace

@@ -4,6 +4,7 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/memory/stats.h"
+#include "source/common/runtime/runtime_features.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -14,21 +15,49 @@ uint64_t MemoryStatsReader::reservedHeapBytes() { return Memory::Stats::totalCur
 
 uint64_t MemoryStatsReader::unmappedHeapBytes() { return Memory::Stats::totalPageHeapUnmapped(); }
 
-FixedHeapMonitor::FixedHeapMonitor(
-    const envoy::extensions::resource_monitors::fixed_heap::v3::FixedHeapConfig& config,
-    std::unique_ptr<MemoryStatsReader> stats)
-    : max_heap_(config.max_heap_size_bytes()), stats_(std::move(stats)) {
-  ASSERT(max_heap_ > 0);
+uint64_t MemoryStatsReader::freeMappedHeapBytes() { return Memory::Stats::totalPageHeapFree(); }
+
+uint64_t MemoryStatsReader::allocatedHeapBytes() {
+  return Memory::Stats::totalCurrentlyAllocated();
 }
 
-void FixedHeapMonitor::updateResourceUsage(Server::ResourceMonitor::Callbacks& callbacks) {
-  const size_t physical = stats_->reservedHeapBytes();
-  const size_t unmapped = stats_->unmappedHeapBytes();
-  ASSERT(physical >= unmapped);
-  const size_t used = physical - unmapped;
+FixedHeapMonitor::FixedHeapMonitor(absl::variant<uint64_t, Runtime::UInt64> max_heap_source,
+                                   std::unique_ptr<MemoryStatsReader> stats)
+    : max_heap_source_(std::move(max_heap_source)), stats_(std::move(stats)) {}
+
+void FixedHeapMonitor::updateResourceUsage(Server::ResourceUpdateCallbacks& callbacks) {
+  const uint64_t max_heap = absl::visit(
+      [](const auto& source) -> uint64_t {
+        using T = std::decay_t<decltype(source)>;
+        if constexpr (std::is_same_v<T, uint64_t>) {
+          return source;
+        } else {
+          return source.value();
+        }
+      },
+      max_heap_source_);
+  if (max_heap == 0) {
+    callbacks.onFailure(
+        absl::InvalidArgumentError("fixed_heap: max heap size must be greater than 0"));
+    return;
+  }
+
+  size_t used = 0;
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.fixed_heap_use_allocated")) {
+    used = stats_->allocatedHeapBytes();
+  } else {
+    const size_t physical = stats_->reservedHeapBytes();
+    const size_t unmapped = stats_->unmappedHeapBytes();
+    const size_t free_mapped = stats_->freeMappedHeapBytes();
+    ASSERT(physical >= (unmapped + free_mapped));
+    used = physical - unmapped - free_mapped;
+  };
 
   Server::ResourceUsage usage;
-  usage.resource_pressure_ = used / static_cast<double>(max_heap_);
+  usage.resource_pressure_ = used / static_cast<double>(max_heap);
+
+  ENVOY_LOG_MISC(trace, "FixedHeapMonitor: used={}, max_heap={}, pressure={}", used, max_heap,
+                 usage.resource_pressure_);
 
   callbacks.onSuccess(usage);
 }

@@ -3,11 +3,15 @@
 #include <vector>
 
 #include "source/common/upstream/health_checker_impl.h"
+#include "source/extensions/health_checkers/grpc/health_checker_impl.h"
+#include "source/extensions/health_checkers/http/health_checker_impl.h"
+#include "source/extensions/health_checkers/tcp/health_checker_impl.h"
 
 #include "test/common/http/common.h"
 #include "test/mocks/common.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/network/mocks.h"
+#include "test/mocks/server/health_checker_factory_context.h"
 #include "test/mocks/upstream/cluster_priority_set.h"
 #include "test/mocks/upstream/health_check_event_logger.h"
 
@@ -18,24 +22,24 @@ class HealthCheckerTestBase {
 public:
   std::shared_ptr<MockClusterMockPrioritySet> cluster_{
       std::make_shared<NiceMock<MockClusterMockPrioritySet>>()};
-  NiceMock<Event::MockDispatcher> dispatcher_;
   std::unique_ptr<NiceMock<MockHealthCheckEventLogger>> event_logger_storage_{
       std::make_unique<NiceMock<MockHealthCheckEventLogger>>()};
   NiceMock<MockHealthCheckEventLogger>& event_logger_{*event_logger_storage_};
-  NiceMock<Random::MockRandomGenerator> random_;
-  NiceMock<Runtime::MockLoader> runtime_;
+  NiceMock<Server::Configuration::MockHealthCheckerFactoryContext> context_;
 };
 
 class TestHttpHealthCheckerImpl : public HttpHealthCheckerImpl {
 public:
   using HttpHealthCheckerImpl::HttpHealthCheckerImpl;
 
-  Http::CodecClient* createCodecClient(Upstream::Host::CreateConnectionData& conn_data) override {
-    return createCodecClient_(conn_data);
+  Http::CodecClient* createCodecClient(Upstream::Host::CreateConnectionData& conn_data,
+                                       Http::CodecType codec_type) override {
+    return createCodecClient_(conn_data, codec_type);
   };
 
   // HttpHealthCheckerImpl
-  MOCK_METHOD(Http::CodecClient*, createCodecClient_, (Upstream::Host::CreateConnectionData&));
+  MOCK_METHOD(Http::CodecClient*, createCodecClient_,
+              (Upstream::Host::CreateConnectionData&, Http::CodecType));
 
   Http::CodecType codecClientType() { return codec_client_type_; }
 };
@@ -59,19 +63,17 @@ public:
                           const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig>;
 
   void expectSessionCreate(const HostWithHealthCheckMap& health_check_map);
-
-  void expectClientCreate(size_t index, const HostWithHealthCheckMap& health_check_map);
-
-  void expectStreamCreate(size_t index);
-
   void expectSessionCreate();
-  void expectClientCreate(size_t index);
+
+  // Installs the connection and codec client factories for the session at `index`. The mocks they
+  // hand out are created on demand, when the health checker actually asks for them, so the harness
+  // never has to predict whether a timer callback will create a client. Anything created is owned
+  // by the health checker (or its dispatcher's deferred delete list) and cannot leak.
+  void setupClientCreate(size_t index, const HostWithHealthCheckMap& health_check_map);
 
   std::vector<TestSessionPtr> test_sessions_;
   std::shared_ptr<TestHttpHealthCheckerImpl> health_checker_;
-  std::list<uint32_t> connection_index_{};
-  std::list<uint32_t> codec_index_{};
-  const HostWithHealthCheckMap health_checker_map_{};
+  const HostWithHealthCheckMap health_checker_map_;
 };
 
 // TODO(zasweq): This class here isn't currently being used in the unit test class.
@@ -82,7 +84,8 @@ public:
 class TcpHealthCheckerImplTestBase : public HealthCheckerTestBase {
 public:
   void expectSessionCreate();
-  void expectClientCreate();
+  // See HttpHealthCheckerImplTestBase::setupClientCreate().
+  void setupClientCreate();
 
   std::shared_ptr<TcpHealthCheckerImpl> health_checker_;
   Network::MockClientConnection* connection_{};
@@ -129,8 +132,8 @@ public:
 
   std::vector<TestSessionPtr> test_sessions_;
   std::shared_ptr<TestGrpcHealthCheckerImpl> health_checker_;
-  std::list<uint32_t> connection_index_{};
-  std::list<uint32_t> codec_index_{};
+  std::list<uint32_t> connection_index_;
+  std::list<uint32_t> codec_index_;
 };
 
 } // namespace Upstream

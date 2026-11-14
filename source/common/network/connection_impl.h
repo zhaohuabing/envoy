@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "envoy/common/scope_tracker.h"
@@ -14,15 +15,13 @@
 #include "source/common/network/connection_impl_base.h"
 #include "source/common/stream_info/stream_info_impl.h"
 
-#include "absl/types/optional.h"
-
 namespace Envoy {
 class RandomPauseFilter;
 class TestPauseFilter;
 
 namespace Network {
 
-class HappyEyeballsConnectionImpl;
+class MultiConnectionBaseImpl;
 
 /**
  * Utility functions for the connection implementation.
@@ -61,43 +60,79 @@ public:
   void addReadFilter(ReadFilterSharedPtr filter) override;
   void removeReadFilter(ReadFilterSharedPtr filter) override;
   bool initializeReadFilters() override;
+  void addAccessLogHandler(AccessLog::InstanceSharedPtr handler) override;
+
+  const ConnectionSocketPtr& getSocket() const override { return socket_; }
 
   // Network::Connection
   void addBytesSentCallback(BytesSentCb cb) override;
   void enableHalfClose(bool enabled) override;
-  bool isHalfCloseEnabled() override { return enable_half_close_; }
+  bool isHalfCloseEnabled() const override { return enable_half_close_; }
   void close(ConnectionCloseType type) final;
+  void close(ConnectionCloseType type, absl::string_view details) override {
+    if (!details.empty()) {
+      setLocalCloseReason(details);
+    }
+    close(type);
+  }
+
   std::string nextProtocol() const override { return transport_socket_->protocol(); }
   void noDelay(bool enable) override;
-  void readDisable(bool disable) override;
+  ReadDisableStatus readDisable(bool disable) override;
   void detectEarlyCloseWhenReadDisabled(bool value) override { detect_early_close_ = value; }
   bool readEnabled() const override;
+  ConnectionInfoSetter& connectionInfoSetter() override {
+    return socket_->connectionInfoProvider();
+  }
   const ConnectionInfoProvider& connectionInfoProvider() const override {
     return socket_->connectionInfoProvider();
   }
   ConnectionInfoProviderSharedPtr connectionInfoProviderSharedPtr() const override {
     return socket_->connectionInfoProviderSharedPtr();
   }
-  absl::optional<UnixDomainSocketPeerCredentials> unixSocketPeerCredentials() const override;
-  Ssl::ConnectionInfoConstSharedPtr ssl() const override { return transport_socket_->ssl(); }
+  std::optional<UnixDomainSocketPeerCredentials> unixSocketPeerCredentials() const override;
+  Ssl::ConnectionInfoConstSharedPtr ssl() const override {
+    // SSL info may be overwritten by a filter in the provider.
+    return socket_->connectionInfoProvider().sslConnection();
+  }
   State state() const override;
-  bool connecting() const override { return connecting_; }
+  bool connecting() const override {
+    ENVOY_CONN_LOG_EVENT(debug, "connection_connecting_state", "current connecting state: {}",
+                         *this, connecting_);
+    return connecting_;
+  }
   void write(Buffer::Instance& data, bool end_stream) override;
   void setBufferLimits(uint32_t limit) override;
+  void setBufferHighWatermarkTimeout(std::chrono::milliseconds timeout) override;
   uint32_t bufferLimit() const override { return read_buffer_limit_; }
-  bool aboveHighWatermark() const override { return write_buffer_above_high_watermark_; }
+  bool aboveHighWatermark() const override { return above_high_watermark_count_ > 0; }
   const ConnectionSocket::OptionsSharedPtr& socketOptions() const override {
     return socket_->options();
   }
+  bool setSocketOption(Network::SocketOptionName name, absl::Span<uint8_t> value) override;
   absl::string_view requestedServerName() const override { return socket_->requestedServerName(); }
   StreamInfo::StreamInfo& streamInfo() override { return stream_info_; }
   const StreamInfo::StreamInfo& streamInfo() const override { return stream_info_; }
   absl::string_view transportFailureReason() const override;
   bool startSecureTransport() override { return transport_socket_->startSecureTransport(); }
-  absl::optional<std::chrono::milliseconds> lastRoundTripTime() const override;
+  std::optional<std::chrono::milliseconds> lastRoundTripTime() const override;
+  void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
+                                        std::chrono::microseconds rtt) override;
+  std::optional<uint64_t> congestionWindowInBytes() const override;
 
   // Network::FilterManagerConnection
   void rawWrite(Buffer::Instance& data, bool end_stream) override;
+  void closeConnection(ConnectionCloseAction close_action) override {
+    ASSERT(close_action.isLocalClose() || close_action.isRemoteClose());
+    if (close_action.closeSocket()) {
+      // The socket will be directly closed.
+      closeSocket(close_action.event_);
+    } else {
+      // It will go through the normal close() process.
+      ASSERT(close_action.isLocalClose());
+      closeInternal(close_action.type_);
+    }
+  }
 
   // Network::ReadBufferSource
   StreamBuffer getReadBuffer() override { return {*read_buffer_, read_end_stream_}; }
@@ -130,7 +165,16 @@ public:
   // ScopeTrackedObject
   void dumpState(std::ostream& os, int indent_level) const override;
 
+  StreamInfo::DetectedCloseType detectedCloseType() const override { return detected_close_type_; }
+
 protected:
+  // Indicates if the access log has been written. This is used to ensure that the access log is
+  // written exactly once, even if close() is called multiple times.
+  bool access_log_written_{false};
+
+  // Write access log if it hasn't been written yet.
+  void ensureAccessLogWritten();
+
   // A convenience function which returns true if
   // 1) The read disable count is zero or
   // 2) The read disable count is one due to the read buffer being overrun.
@@ -141,6 +185,7 @@ protected:
 
   // Network::ConnectionImplBase
   void closeConnectionImmediately() final;
+  void closeThroughFilterManager(ConnectionCloseAction close_action);
 
   void closeSocket(ConnectionEvent close_type);
 
@@ -148,6 +193,16 @@ protected:
   void onReadBufferHighWatermark();
   void onWriteBufferLowWatermark();
   void onWriteBufferHighWatermark();
+
+  // This is called when the underlying socket is connected, not when the
+  // connected event is raised.
+  virtual void onConnected();
+
+  void setFailureReason(absl::string_view failure_reason);
+  const std::string& failureReason() const { return failure_reason_; }
+
+  // Set the detected close type for this connection.
+  virtual void setDetectedCloseType(StreamInfo::DetectedCloseType close_type);
 
   TransportSocketPtr transport_socket_;
   ConnectionSocketPtr socket_;
@@ -168,10 +223,9 @@ protected:
   bool connecting_{false};
   ConnectionEvent immediate_error_event_{ConnectionEvent::Connected};
   bool bind_error_{false};
-  std::string failure_reason_;
 
 private:
-  friend class HappyEyeballsConnectionImpl;
+  friend class MultiConnectionBaseImpl;
   friend class Envoy::RandomPauseFilter;
   friend class Envoy::TestPauseFilter;
 
@@ -188,9 +242,17 @@ private:
   // Returns true iff end of stream has been both written and read.
   bool bothSidesHalfClosed();
 
+  void closeInternal(ConnectionCloseType type);
+
+  void onBufferHighWatermarkTimeout();
+  void scheduleBufferHighWatermarkTimeout();
+  void maybeCancelBufferHighWatermarkTimeout();
+
   static std::atomic<uint64_t> next_global_id_;
 
   std::list<BytesSentCb> bytes_sent_callbacks_;
+  // Should be set with setFailureReason.
+  std::string failure_reason_;
   // Tracks the number of times reads have been disabled. If N different components call
   // readDisabled(true) this allows the connection to only resume reads when readDisabled(false)
   // has been called N times.
@@ -198,32 +260,45 @@ private:
   uint64_t last_write_buffer_size_{};
   Buffer::Instance* current_write_buffer_{};
   uint32_t read_disable_count_{0};
-  bool write_buffer_above_high_watermark_ : 1;
-  bool detect_early_close_ : 1;
-  bool enable_half_close_ : 1;
-  bool read_end_stream_raised_ : 1;
-  bool read_end_stream_ : 1;
-  bool write_end_stream_ : 1;
-  bool current_write_end_stream_ : 1;
-  bool dispatch_buffered_data_ : 1;
+  StreamInfo::DetectedCloseType detected_close_type_{StreamInfo::DetectedCloseType::Normal};
+  std::chrono::milliseconds buffer_high_watermark_timeout_{};
+  Event::TimerPtr buffer_high_watermark_timer_{nullptr};
+  bool detect_early_close_ : 1 = true;
+  bool enable_half_close_ : 1 = false;
+  bool read_end_stream_raised_ : 1 = false;
+  bool read_end_stream_ : 1 = false;
+  bool write_end_stream_ : 1 = false;
+  bool current_write_end_stream_ : 1 = false;
+  bool dispatch_buffered_data_ : 1 = false;
   // True if the most recent call to the transport socket's doRead method invoked
   // setTransportSocketIsReadable to schedule read resumption after yielding due to
   // shouldDrainReadBuffer(). When true, readDisable must schedule read resumption when
   // read_disable_count_ == 0 to ensure that read resumption happens when remaining bytes are held
   // in transport socket internal buffers.
-  bool transport_wants_read_ : 1;
+  bool transport_wants_read_ : 1 = false;
+  bool enable_close_through_filter_manager_ : 1;
 };
 
 class ServerConnectionImpl : public ConnectionImpl, virtual public ServerConnection {
 public:
   ServerConnectionImpl(Event::Dispatcher& dispatcher, ConnectionSocketPtr&& socket,
-                       TransportSocketPtr&& transport_socket, StreamInfo::StreamInfo& stream_info,
-                       bool connected);
+                       TransportSocketPtr&& transport_socket, StreamInfo::StreamInfo& stream_info);
 
   // ServerConnection impl
   void setTransportSocketConnectTimeout(std::chrono::milliseconds timeout,
                                         Stats::Counter& timeout_stat) override;
   void raiseEvent(ConnectionEvent event) override;
+  bool initializeReadFilters() override;
+
+  void setLocalCloseReason(absl::string_view reason) override {
+    ConnectionImpl::setLocalCloseReason(reason);
+    stream_info_.setDownstreamLocalCloseReason(reason);
+  }
+
+  void setDetectedCloseType(StreamInfo::DetectedCloseType close_type) override {
+    ConnectionImpl::setDetectedCloseType(close_type);
+    stream_info_.setDownstreamDetectedCloseType(close_type);
+  }
 
 private:
   void onTransportSocketConnectTimeout();
@@ -244,16 +319,38 @@ public:
                        const Address::InstanceConstSharedPtr& remote_address,
                        const Address::InstanceConstSharedPtr& source_address,
                        Network::TransportSocketPtr&& transport_socket,
-                       const Network::ConnectionSocket::OptionsSharedPtr& options);
+                       const Network::ConnectionSocket::OptionsSharedPtr& options,
+                       const Network::TransportSocketOptionsConstSharedPtr& transport_options);
+
   ClientConnectionImpl(Event::Dispatcher& dispatcher, std::unique_ptr<ConnectionSocket> socket,
                        const Address::InstanceConstSharedPtr& source_address,
                        Network::TransportSocketPtr&& transport_socket,
-                       const Network::ConnectionSocket::OptionsSharedPtr& options);
+                       const Network::ConnectionSocket::OptionsSharedPtr& options,
+                       const Network::TransportSocketOptionsConstSharedPtr& transport_options);
+
+  ~ClientConnectionImpl() override;
 
   // Network::ClientConnection
   void connect() override;
 
+protected:
+  void setDetectedCloseType(StreamInfo::DetectedCloseType close_type) override {
+    ConnectionImpl::setDetectedCloseType(close_type);
+    if (stream_info_.upstreamInfo() != nullptr) {
+      stream_info_.upstreamInfo()->setUpstreamDetectedCloseType(close_type);
+    }
+  }
+
+  void setLocalCloseReason(absl::string_view reason) override {
+    ConnectionImpl::setLocalCloseReason(reason);
+    if (stream_info_.upstreamInfo() != nullptr) {
+      stream_info_.upstreamInfo()->setUpstreamLocalCloseReason(reason);
+    }
+  }
+
 private:
+  void onConnected() override;
+
   StreamInfo::StreamInfoImpl stream_info_;
 };
 

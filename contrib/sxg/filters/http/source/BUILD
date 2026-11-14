@@ -21,16 +21,18 @@ envoy_cc_library(
         "filter.h",
         "filter_config.h",
     ],
-    external_deps = ["libsxg"],
     deps = [
         "//envoy/server:filter_config_interface",
         "//source/common/config:datasource_lib",
         "//source/common/http:codes_lib",
         "//source/common/stats:symbol_table_lib",
         "//source/common/stats:utility_lib",
+        "//source/common/secret:secret_provider_impl_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
-        "@boringssl//:ssl",
         "@envoy_api//contrib/envoy/extensions/filters/http/sxg/v3alpha:pkg_cc_proto",
+        "//bazel/deps:libsxg",
+        # use ssl label_flag to select the SSL library.
+        "//bazel:ssl",
     ],
 )
 

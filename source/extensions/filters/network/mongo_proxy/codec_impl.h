@@ -15,8 +15,8 @@ namespace MongoProxy {
 
 class MessageImpl : public virtual Message {
 public:
-  MessageImpl(int32_t request_id, uint32_t response_to)
-      : request_id_(request_id), response_to_(response_to) {}
+  MessageImpl(int32_t request_id, uint32_t response_to, uint32_t max_bson_depth = 100)
+      : request_id_(request_id), response_to_(response_to), max_bson_depth_(max_bson_depth) {}
 
   virtual void fromBuffer(uint32_t message_length, Buffer::Instance& data) PURE;
 
@@ -29,6 +29,7 @@ protected:
 
   const int32_t request_id_;
   const int32_t response_to_;
+  const uint32_t max_bson_depth_;
 };
 
 class GetMoreMessageImpl : public MessageImpl,
@@ -45,6 +46,9 @@ public:
 
   // Mongo::GetMoreMessage
   bool operator==(const GetMoreMessage& rhs) const override;
+  bool operator==(const GetMoreMessageImpl& rhs) const {
+    return operator==(static_cast<const GetMoreMessage&>(rhs));
+  }
   const std::string& fullCollectionName() const override { return full_collection_name_; }
   void fullCollectionName(const std::string& name) override { full_collection_name_ = name; }
   int32_t numberToReturn() const override { return number_to_return_; }
@@ -72,6 +76,9 @@ public:
 
   // Mongo::InsertMessage
   bool operator==(const InsertMessage& rhs) const override;
+  bool operator==(const InsertMessageImpl& rhs) const {
+    return operator==(static_cast<const InsertMessage&>(rhs));
+  }
   int32_t flags() const override { return flags_; }
   void flags(int32_t flags) override { flags_ = flags; }
   const std::string& fullCollectionName() const override { return full_collection_name_; }
@@ -99,6 +106,9 @@ public:
 
   // Mongo::KillCursorsMessage
   bool operator==(const KillCursorsMessage& rhs) const override;
+  bool operator==(const KillCursorsMessageImpl& rhs) const {
+    return operator==(static_cast<const KillCursorsMessage&>(rhs));
+  }
   int32_t numberOfCursorIds() const override { return number_of_cursor_ids_; }
   void numberOfCursorIds(int32_t number_of_cursor_ids) override {
     number_of_cursor_ids_ = number_of_cursor_ids;
@@ -127,6 +137,9 @@ public:
 
   // Mongo::QueryMessage
   bool operator==(const QueryMessage& rhs) const override;
+  bool operator==(const QueryMessageImpl& rhs) const {
+    return operator==(static_cast<const QueryMessage&>(rhs));
+  }
   int32_t flags() const override { return flags_; }
   void flags(int32_t flags) override { flags_ = flags; }
   const std::string& fullCollectionName() const override { return full_collection_name_; }
@@ -167,6 +180,9 @@ public:
 
   // Mongo::ReplyMessage
   bool operator==(const ReplyMessage& rhs) const override;
+  bool operator==(const ReplyMessageImpl& rhs) const {
+    return operator==(static_cast<const ReplyMessage&>(rhs));
+  }
   int32_t flags() const override { return flags_; }
   void flags(int32_t flags) override { flags_ = flags; }
   int64_t cursorId() const override { return cursor_id_; }
@@ -199,6 +215,9 @@ public:
 
   // CommandMessageImpl accessors.
   bool operator==(const CommandMessage& rhs) const override;
+  bool operator==(const CommandMessageImpl& rhs) const {
+    return operator==(static_cast<const CommandMessage&>(rhs));
+  }
   std::string database() const override { return database_; }
   void database(std::string database) override { database_ = database; }
   std::string commandName() const override { return command_name_; }
@@ -233,6 +252,9 @@ public:
 
   // CommandMessageReplyImpl accessors.
   bool operator==(const CommandReplyMessage& rhs) const override;
+  bool operator==(const CommandReplyMessageImpl& rhs) const {
+    return operator==(static_cast<const CommandReplyMessage&>(rhs));
+  }
   const Bson::Document* metadata() const override { return metadata_.get(); }
   void metadata(Bson::DocumentSharedPtr&& metadata) override { metadata_ = std::move(metadata); }
   const Bson::Document* commandReply() const override { return command_reply_.get(); }
@@ -250,7 +272,8 @@ private:
 
 class DecoderImpl : public Decoder, Logger::Loggable<Logger::Id::mongo> {
 public:
-  DecoderImpl(DecoderCallbacks& callbacks) : callbacks_(callbacks) {}
+  DecoderImpl(DecoderCallbacks& callbacks, uint32_t max_bson_depth)
+      : callbacks_(callbacks), max_bson_depth_(max_bson_depth) {}
 
   // Mongo::Decoder
   void onData(Buffer::Instance& data) override;
@@ -259,6 +282,7 @@ private:
   bool decode(Buffer::Instance& data);
 
   DecoderCallbacks& callbacks_;
+  const uint32_t max_bson_depth_;
 };
 
 class EncoderImpl : public Encoder, Logger::Loggable<Logger::Id::mongo> {

@@ -10,6 +10,9 @@
 #include "source/common/matcher/matcher.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/common/factory_base.h"
+#include "source/extensions/filters/http/composite/action.h"
+
+#include "xds/type/matcher/v3/http_inputs.pb.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -20,28 +23,41 @@ namespace Composite {
  * Config registration for the composite filter. @see NamedHttpFilterConfigFactory.
  */
 class CompositeFilterFactory
-    : public Common::FactoryBase<envoy::extensions::filters::http::composite::v3::Composite> {
+    : public HttpFilters::Common::CommonFactoryBase<
+          envoy::extensions::filters::http::composite::v3::Composite,
+          envoy::extensions::filters::http::composite::v3::CompositePerRoute>,
+      public Server::Configuration::NamedHttpFilterConfigFactory,
+      public Server::Configuration::UpstreamHttpFilterConfigFactory {
 public:
-  CompositeFilterFactory() : FactoryBase("envoy.filters.http.composite") {}
+  CompositeFilterFactory() : CommonFactoryBase("envoy.filters.http.composite") {}
 
-  Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::http::composite::v3::Composite& proto_config,
-      const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
+  // Override to compile named filter chains with FactoryContext access.
+  absl::StatusOr<Http::FilterFactoryCb>
+  createFilterFactoryFromProto(const Protobuf::Message& config, const std::string& stats_prefix,
+                               Server::Configuration::FactoryContext& context) override;
 
-  Server::Configuration::MatchingRequirementsPtr matchingRequirements() override {
-    auto requirements = std::make_unique<
-        envoy::extensions::filters::common::dependency::v3::MatchingRequirements>();
+  absl::StatusOr<Envoy::Http::FilterFactoryCb>
+  createFilterFactoryFromProto(const Protobuf::Message& proto_config,
+                               const std::string& stats_prefix,
+                               Server::Configuration::UpstreamFactoryContext& context) override;
 
-    // This ensure that trees are only allowed to match on request headers, avoiding configurations
-    // where the matcher requires data that will be available too late for the delegation to work
-    // correctly.
-    requirements->mutable_data_input_allow_list()->add_type_url(
-        TypeUtil::descriptorFullNameToTypeUrl(
-            envoy::type::matcher::v3::HttpRequestHeaderMatchInput::descriptor()->full_name()));
+  absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
+  createRouteSpecificFilterConfigTyped(
+      const envoy::extensions::filters::http::composite::v3::CompositePerRoute& config,
+      Server::Configuration::ServerFactoryContext& context,
+      ProtobufMessage::ValidationVisitor&) override;
 
-    return requirements;
-  }
+  // Compiles named filter chains from the config.
+  static absl::StatusOr<NamedFilterChainFactoryMapSharedPtr>
+  compileNamedFilterChains(const envoy::extensions::filters::http::composite::v3::Composite& config,
+                           const std::string& stats_prefix,
+                           Server::Configuration::FactoryContext& context);
 };
+
+using UpstreamCompositeFilterFactory = CompositeFilterFactory;
+
+DECLARE_FACTORY(CompositeFilterFactory);
+DECLARE_FACTORY(UpstreamCompositeFilterFactory);
 
 } // namespace Composite
 } // namespace HttpFilters

@@ -13,10 +13,22 @@ envoy_package()
 
 envoy_extension_cc_test(
     name = "direct_response_integration_test",
+    size = "large",
     srcs = [
         "direct_response_integration_test.cc",
     ],
     extension_names = ["envoy.filters.network.direct_response"],
+    rbe_pool = {
+        "default": {"test": "linux_x64_medium"},
+        "tsan": {
+            "build": "linux_x64_small",
+            "test": "linux_x64_medium",
+        },
+        "gcc": {
+            "build": "linux_x64_small",
+            "test": "linux_x64_medium",
+        },
+    },
     deps = [
         "//source/extensions/filters/network/direct_response:config",
         "//test/integration:integration_lib",
@@ -28,9 +40,9 @@ envoy_extension_cc_test(
     name = "direct_response_test",
     srcs = ["direct_response_test.cc"],
     extension_names = ["envoy.filters.network.direct_response"],
+    rbe_pool = {"gcc": {"build": "linux_x64_small"}},
     deps = [
         "//source/extensions/filters/network/direct_response:filter",
-        "//test/mocks/api:api_mocks",
         "//test/mocks/network:network_mocks",
         "@envoy_api//envoy/extensions/filters/network/direct_response/v3:pkg_cc_proto",
     ],

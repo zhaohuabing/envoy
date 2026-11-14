@@ -14,8 +14,9 @@ envoy_cc_library(
     srcs = ["previous_priorities.cc"],
     hdrs = ["previous_priorities.h"],
     deps = [
+        "//envoy/stream_info:stream_info_interface",
         "//envoy/upstream:retry_interface",
-        "//source/common/upstream:load_balancer_lib",
+        "//source/extensions/load_balancing_policies/common:load_balancer_lib",
     ],
 )
 

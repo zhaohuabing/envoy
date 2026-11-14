@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "envoy/stream_info/filter_state.h"
@@ -8,8 +9,17 @@
 #include "source/common/singleton/const_singleton.h"
 
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverloaded-virtual"
+#endif
+
 #include "eval/public/cel_value.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace Envoy {
 namespace Extensions {
@@ -66,13 +76,13 @@ public:
   }
 
   ProtobufTypes::MessagePtr serializeAsProto() const override;
-  absl::optional<std::string> serializeAsString() const override { return value_; }
+  std::optional<std::string> serializeAsString() const override { return value_; }
 
 private:
   const bool readonly_;
   const CelStateType type_;
   absl::string_view schema_;
-  std::string value_{};
+  std::string value_;
   bool initialized_{false};
 };
 

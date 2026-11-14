@@ -27,11 +27,7 @@ public:
   ~MockFilter() override;
 
   // AccessLog::Filter
-  MOCK_METHOD(bool, evaluate,
-              (const StreamInfo::StreamInfo& info, const Http::RequestHeaderMap& request_headers,
-               const Http::ResponseHeaderMap& response_headers,
-               const Http::ResponseTrailerMap& response_trailers),
-              (const));
+  MOCK_METHOD(bool, evaluate, (const Formatter::Context&, const StreamInfo::StreamInfo&), (const));
 };
 
 class MockAccessLogManager : public AccessLogManager {
@@ -41,7 +37,7 @@ public:
 
   // AccessLog::AccessLogManager
   MOCK_METHOD(void, reopen, ());
-  MOCK_METHOD(AccessLogFileSharedPtr, createAccessLog,
+  MOCK_METHOD(absl::StatusOr<AccessLogFileSharedPtr>, createAccessLog,
               (const Envoy::Filesystem::FilePathAndType& file_info));
 
   std::shared_ptr<MockAccessLogFile> file_{new testing::NiceMock<MockAccessLogFile>()};
@@ -53,11 +49,7 @@ public:
   ~MockInstance() override;
 
   // AccessLog::Instance
-  MOCK_METHOD(void, log,
-              (const Http::RequestHeaderMap* request_headers,
-               const Http::ResponseHeaderMap* response_headers,
-               const Http::ResponseTrailerMap* response_trailers,
-               const StreamInfo::StreamInfo& stream_info));
+  MOCK_METHOD(void, log, (const Formatter::Context&, const StreamInfo::StreamInfo&));
 };
 
 } // namespace AccessLog

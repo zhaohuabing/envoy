@@ -7,6 +7,7 @@
 
 #include "source/common/config/utility.h"
 #include "source/common/grpc/typed_async_client.h"
+#include "source/extensions/access_loggers/common/grpc_access_logger_clients.h"
 
 const char GRPC_LOG_STATS_PREFIX[] = "access_logs.grpc_access_log.";
 
@@ -16,14 +17,18 @@ namespace AccessLoggers {
 namespace GrpcCommon {
 
 GrpcAccessLoggerImpl::GrpcAccessLoggerImpl(
-    const Grpc::RawAsyncClientSharedPtr& client, std::string log_name,
-    std::chrono::milliseconds buffer_flush_interval_msec, uint64_t max_buffer_size_bytes,
+    const Grpc::RawAsyncClientSharedPtr& client,
+    const envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig& config,
     Event::Dispatcher& dispatcher, const LocalInfo::LocalInfo& local_info, Stats::Scope& scope)
-    : GrpcAccessLogger(std::move(client), buffer_flush_interval_msec, max_buffer_size_bytes,
-                       dispatcher, scope, GRPC_LOG_STATS_PREFIX,
-                       *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
-                           "envoy.service.accesslog.v3.AccessLogService.StreamAccessLogs")),
-      log_name_(log_name), local_info_(local_info) {}
+    : GrpcAccessLogger(config, dispatcher, scope, GRPC_LOG_STATS_PREFIX,
+                       std::make_unique<Common::StreamingGrpcAccessLogClient<
+                           envoy::service::accesslog::v3::StreamAccessLogsMessage,
+                           envoy::service::accesslog::v3::StreamAccessLogsResponse>>(
+                           client,
+                           *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
+                               "envoy.service.accesslog.v3.AccessLogService.StreamAccessLogs"),
+                           GrpcCommon::optionalRetryPolicy(config))),
+      log_name_(config.log_name()), local_info_(local_info) {}
 
 void GrpcAccessLoggerImpl::addEntry(envoy::data::accesslog::v3::HTTPAccessLogEntry&& entry) {
   message_.mutable_http_logs()->mutable_log_entry()->Add(std::move(entry));
@@ -43,6 +48,11 @@ void GrpcAccessLoggerImpl::initMessage() {
   identifier->set_log_name(log_name_);
 }
 
+uint32_t GrpcAccessLoggerImpl::countLogEntries() const {
+  return (message_.has_http_logs() ? message_.http_logs().log_entry_size() : 0) +
+         (message_.has_tcp_logs() ? message_.tcp_logs().log_entry_size() : 0);
+}
+
 GrpcAccessLoggerCacheImpl::GrpcAccessLoggerCacheImpl(Grpc::AsyncClientManager& async_client_manager,
                                                      Stats::Scope& scope,
                                                      ThreadLocal::SlotAllocator& tls,
@@ -51,12 +61,18 @@ GrpcAccessLoggerCacheImpl::GrpcAccessLoggerCacheImpl(Grpc::AsyncClientManager& a
 
 GrpcAccessLoggerImpl::SharedPtr GrpcAccessLoggerCacheImpl::createLogger(
     const envoy::extensions::access_loggers::grpc::v3::CommonGrpcAccessLogConfig& config,
-    const Grpc::RawAsyncClientSharedPtr& client,
-    std::chrono::milliseconds buffer_flush_interval_msec, uint64_t max_buffer_size_bytes,
     Event::Dispatcher& dispatcher) {
-  return std::make_shared<GrpcAccessLoggerImpl>(client, config.log_name(),
-                                                buffer_flush_interval_msec, max_buffer_size_bytes,
-                                                dispatcher, local_info_, scope_);
+  // We pass skip_cluster_check=true to factoryForGrpcService in order to avoid throwing
+  // exceptions in worker threads. Call sites of this getOrCreateLogger must check the cluster
+  // availability via ClusterManager::checkActiveStaticCluster beforehand, and throw exceptions in
+  // the main thread if necessary.
+  auto factory_or_error =
+      async_client_manager_.factoryForGrpcService(config.grpc_service(), scope_, true);
+  THROW_IF_NOT_OK_REF(factory_or_error.status());
+  return std::make_shared<GrpcAccessLoggerImpl>(
+      THROW_OR_RETURN_VALUE(factory_or_error.value()->createUncachedRawAsyncClient(),
+                            Grpc::RawAsyncClientPtr),
+      config, dispatcher, local_info_, scope_);
 }
 
 } // namespace GrpcCommon

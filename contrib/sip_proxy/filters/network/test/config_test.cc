@@ -12,6 +12,7 @@
 #include "gtest/gtest.h"
 
 using testing::_;
+using testing::Return;
 
 namespace Envoy {
 namespace Extensions {
@@ -32,8 +33,8 @@ class SipFilterConfigTestBase {
 public:
   void testConfig(envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy& config) {
     Network::FilterFactoryCb cb;
-    EXPECT_NO_THROW({ cb = factory_.createFilterFactoryFromProto(config, context_); });
-    EXPECT_TRUE(factory_.isTerminalFilterByProto(config, context_));
+    EXPECT_NO_THROW({ cb = factory_.createFilterFactoryFromProto(config, context_).value(); });
+    EXPECT_TRUE(factory_.isTerminalFilterByProto(config, context_.serverFactoryContext()));
 
     Network::MockConnection connection;
     EXPECT_CALL(connection, addReadFilter(_));
@@ -47,9 +48,12 @@ public:
 class SipFilterConfigTest : public testing::Test, public SipFilterConfigTestBase {};
 
 TEST_F(SipFilterConfigTest, ValidateFail) {
-  EXPECT_THROW(factory_.createFilterFactoryFromProto(
-                   envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy(), context_),
-               ProtoValidationException);
+  EXPECT_THROW(
+      factory_
+          .createFilterFactoryFromProto(
+              envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy(), context_)
+          .IgnoreError(),
+      ProtoValidationException);
 }
 
 TEST_F(SipFilterConfigTest, ValidProtoConfiguration) {
@@ -81,13 +85,15 @@ route_config:
       cluster: A
 sip_filters:
   - name: envoy.filters.sip.router
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.sip_proxy.router.v3alpha.Router
 )EOF";
 
   envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy config =
       parseSipProxyFromYaml(yaml);
   std::string cluster = "A";
   config.mutable_route_config()->mutable_routes()->at(0).mutable_route()->set_cluster(cluster);
-  EXPECT_NO_THROW({ factory_.createFilterFactoryFromProto(config, context_); });
+  EXPECT_NO_THROW({ factory_.createFilterFactoryFromProto(config, context_).IgnoreError(); });
 }
 
 // Test config with an explicitly defined router filter.
@@ -98,6 +104,8 @@ route_config:
   name: local_route
 sip_filters:
   - name: envoy.filters.sip.router
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.sip_proxy.router.v3alpha.Router
 )EOF";
 
   envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy config =
@@ -114,13 +122,15 @@ route_config:
 sip_filters:
   - name: no_such_filter
   - name: envoy.filters.sip.router
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.sip_proxy.router.v3alpha.Router
 )EOF";
 
   envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy config =
       parseSipProxyFromYaml(yaml);
 
-  EXPECT_THROW_WITH_REGEX(factory_.createFilterFactoryFromProto(config, context_), EnvoyException,
-                          "no_such_filter");
+  EXPECT_THROW_WITH_REGEX(factory_.createFilterFactoryFromProto(config, context_).IgnoreError(),
+                          EnvoyException, "no_such_filter");
 }
 
 // Test config with multiple filters.
@@ -136,10 +146,12 @@ sip_filters:
       value:
         key: value
   - name: envoy.filters.sip.router
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.sip_proxy.router.v3alpha.Router
 settings:
   transaction_timeout: 32s
-  own_domain: pcsf-cfed.cncs.svc.cluster.local
-  domain_match_parameter_name: x-suri
+  local_services:
+  - domain: pcsf-cfed.cncs.svc.cluster.local
 )EOF";
 
   SipFilters::MockFilterConfigFactory factory;
@@ -159,6 +171,13 @@ TEST_F(SipFilterConfigTest, SipProtocolOptions) {
   const std::string yaml = R"EOF(
 session_affinity: true
 registration_affinity: true
+customized_affinity:
+  entries:
+  - key_name: test
+    subscribe: true
+    query: true
+  - key_name: test1
+  stop_load_balance: false
 )EOF";
 
   envoy::extensions::filters::network::sip_proxy::v3alpha::SipProtocolOptions config;
@@ -166,8 +185,9 @@ registration_affinity: true
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
   const auto options = std::make_shared<ProtocolOptionsConfigImpl>(config);
-  EXPECT_CALL(*context.cluster_manager_.thread_local_cluster_.cluster_.info_,
-              extensionProtocolOptions(_))
+  EXPECT_CALL(
+      *context.server_factory_context_.cluster_manager_.thread_local_cluster_.cluster_.info_,
+      extensionProtocolOptions(_))
       .WillRepeatedly(Return(options));
 
   EXPECT_EQ(true, options->sessionAffinity());

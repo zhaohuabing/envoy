@@ -1,3 +1,5 @@
+#pragma once
+
 #include "envoy/common/key_value_store.h"
 #include "envoy/config/common/key_value/v3/config.pb.h"
 #include "envoy/config/common/key_value/v3/config.pb.validate.h"
@@ -17,8 +19,9 @@ namespace KeyValue {
 // [length]\n[key][length]\n[value]
 class FileBasedKeyValueStore : public KeyValueStoreBase {
 public:
-  FileBasedKeyValueStore(Event::Dispatcher& dispatcher, std::chrono::seconds flush_interval,
-                         Filesystem::Instance& file_system, const std::string& filename);
+  FileBasedKeyValueStore(Event::Dispatcher& dispatcher, std::chrono::milliseconds flush_interval,
+                         Filesystem::Instance& file_system, const std::string& filename,
+                         uint32_t max_entries);
   // KeyValueStore
   void flush() override;
 

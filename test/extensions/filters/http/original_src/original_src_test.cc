@@ -50,7 +50,7 @@ public:
 
   void setAddressToReturn(const std::string& address) {
     callbacks_.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
-        Network::Utility::resolveUrl(address));
+        *Network::Utility::resolveUrl(address));
   }
 
 protected:
@@ -60,7 +60,7 @@ protected:
   Http::TestRequestHeaderMapImpl headers_;
   Http::TestRequestTrailerMapImpl trailers_;
 
-  absl::optional<Network::Socket::Option::Details>
+  std::optional<Network::Socket::Option::Details>
   findOptionDetails(const Network::Socket::Options& options, Network::SocketOptionName name,
                     envoy::config::core::v3::SocketOption::SocketState state) {
     for (const auto& option : options) {
@@ -70,7 +70,7 @@ protected:
       }
     }
 
-    return absl::nullopt;
+    return std::nullopt;
   }
 };
 
@@ -132,7 +132,7 @@ TEST_F(OriginalSrcHttpTest, DecodeHeadersIpv4AddressBleachesPort) {
   filter->decodeHeaders(headers_, false);
 
   NiceMock<Network::MockConnectionSocket> socket;
-  const auto expected_address = Network::Utility::parseInternetAddress("1.2.3.4");
+  const auto expected_address = Network::Utility::parseInternetAddressNoThrow("1.2.3.4");
 
   for (const auto& option : *options) {
     option->setOption(socket, envoy::config::core::v3::SocketOption::STATE_PREBIND);
@@ -209,7 +209,7 @@ TEST_F(OriginalSrcHttpTest, TrailersAndDataEndStreamDoNothing) {
   EXPECT_CALL(callbacks, addUpstreamSocketOptions(_));
   EXPECT_CALL(callbacks, streamInfo());
   callbacks.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
-      Network::Utility::parseInternetAddress("1.2.3.4"));
+      Network::Utility::parseInternetAddressNoThrow("1.2.3.4"));
   filter->decodeHeaders(headers_, true);
 
   // No new expectations => no side effects from calling these.
@@ -226,13 +226,34 @@ TEST_F(OriginalSrcHttpTest, TrailersAndDataNotEndStreamDoNothing) {
   EXPECT_CALL(callbacks, addUpstreamSocketOptions(_));
   EXPECT_CALL(callbacks, streamInfo());
   callbacks.stream_info_.downstream_connection_info_provider_->setRemoteAddress(
-      Network::Utility::parseInternetAddress("1.2.3.4"));
+      Network::Utility::parseInternetAddressNoThrow("1.2.3.4"));
   filter->decodeHeaders(headers_, false);
 
   // No new expectations => no side effects from calling these.
   EXPECT_EQ(Http::FilterDataStatus::Continue, filter->decodeData(buffer_, false));
   EXPECT_EQ(Http::FilterTrailersStatus::Continue, filter->decodeTrailers(trailers_));
 }
+
+TEST_F(OriginalSrcHttpTest, FilterAddsBindAddressNoPortOption) {
+  if (!ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT.hasValue()) {
+    // The option isn't supported on this platform. Just skip the test.
+    return;
+  }
+
+  auto filter = makeDefaultFilter();
+  Network::Socket::OptionsSharedPtr options;
+  setAddressToReturn("tcp://1.2.3.4:80");
+  EXPECT_CALL(callbacks_, addUpstreamSocketOptions(_)).WillOnce(SaveArg<0>(&options));
+
+  filter->decodeHeaders(headers_, false);
+
+  const auto addr_bind_option =
+      findOptionDetails(*options, ENVOY_SOCKET_IP_BIND_ADDRESS_NO_PORT,
+                        envoy::config::core::v3::SocketOption::STATE_PREBIND);
+
+  EXPECT_TRUE(addr_bind_option.has_value());
+}
+
 } // namespace
 } // namespace OriginalSrc
 } // namespace HttpFilters

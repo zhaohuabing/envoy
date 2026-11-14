@@ -7,7 +7,9 @@
 #include "envoy/tcp/conn_pool.h"
 
 #include "source/common/common/logger.h"
-#include "source/common/upstream/load_balancer_impl.h"
+#include "source/common/config/well_known_names.h"
+#include "source/common/router/metadatamatchcriteria_impl.h"
+#include "source/common/upstream/load_balancer_context_base.h"
 #include "source/extensions/filters/network/dubbo_proxy/filters/filter.h"
 #include "source/extensions/filters/network/dubbo_proxy/router/router.h"
 
@@ -36,7 +38,7 @@ public:
   FilterStatus onMessageEncoded(MessageMetadataSharedPtr metadata, ContextSharedPtr ctx) override;
 
   // Upstream::LoadBalancerContextBase
-  const Envoy::Router::MetadataMatchCriteria* metadataMatchCriteria() override { return nullptr; }
+  const Envoy::Router::MetadataMatchCriteria* metadataMatchCriteria() override;
   const Network::Connection* downstreamConnection() const override;
 
   // Tcp::ConnectionPool::UpstreamCallbacks
@@ -82,19 +84,20 @@ private:
     SerializerPtr serializer_;
     ProtocolPtr protocol_;
 
-    bool request_complete_ : 1;
-    bool response_started_ : 1;
-    bool response_complete_ : 1;
-    bool stream_reset_ : 1;
+    bool request_complete_ : 1 = false;
+    bool response_started_ : 1 = false;
+    bool response_complete_ : 1 = false;
+    bool stream_reset_ : 1 = false;
   };
 
   void cleanup();
 
   Upstream::ClusterManager& cluster_manager_;
+  Envoy::Router::MetadataMatchCriteriaConstPtr metadata_match_;
 
   DubboFilters::DecoderFilterCallbacks* callbacks_{};
   DubboFilters::EncoderFilterCallbacks* encoder_callbacks_{};
-  RouteConstSharedPtr route_{};
+  RouteConstSharedPtr route_;
   const RouteEntry* route_entry_{};
   Upstream::ClusterInfoConstSharedPtr cluster_;
 

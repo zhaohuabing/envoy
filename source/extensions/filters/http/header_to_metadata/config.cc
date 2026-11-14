@@ -14,22 +14,35 @@ namespace Extensions {
 namespace HttpFilters {
 namespace HeaderToMetadataFilter {
 
-Http::FilterFactoryCb HeaderToMetadataConfig::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> HeaderToMetadataConfig::createFilterFactory(
     const envoy::extensions::filters::http::header_to_metadata::v3::Config& proto_config,
-    const std::string&, Server::Configuration::FactoryContext&) {
-  ConfigSharedPtr filter_config(std::make_shared<Config>(proto_config));
+    Server::Configuration::ServerFactoryContext& context, Stats::Scope& scope) {
+  absl::StatusOr<ConfigSharedPtr> filter_config_or =
+      Config::create(proto_config, context.regexEngine(), scope, false);
+  RETURN_IF_ERROR(filter_config_or.status());
 
-  return [filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+  return [filter_config = std::move(filter_config_or.value())](
+             Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(
         Http::StreamFilterSharedPtr{new HeaderToMetadataFilter(filter_config)});
   };
 }
 
-Router::RouteSpecificFilterConfigConstSharedPtr
+absl::StatusOr<Http::FilterFactoryCb> HeaderToMetadataConfig::createHttpFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::http::header_to_metadata::v3::Config& proto_config,
+    Server::Configuration::ServerFactoryContext& context,
+    Server::Configuration::ExtraFactoryContext& extra_context) {
+  return createFilterFactory(proto_config, context, extra_context.scopeOr(context));
+}
+
+absl::StatusOr<Router::RouteSpecificFilterConfigConstSharedPtr>
 HeaderToMetadataConfig::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::header_to_metadata::v3::Config& config,
-    Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
-  return std::make_shared<const Config>(config, true);
+    Server::Configuration::ServerFactoryContext& context, ProtobufMessage::ValidationVisitor&) {
+  absl::StatusOr<ConfigSharedPtr> config_or =
+      Config::create(config, context.regexEngine(), context.scope(), true);
+  RETURN_IF_ERROR(config_or.status());
+  return std::move(config_or.value());
 }
 
 /**

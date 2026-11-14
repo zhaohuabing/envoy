@@ -7,6 +7,7 @@
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/runtime/mocks.h"
+#include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -26,7 +27,7 @@ public:
   void initialize(const std::string& filter_yaml) {
     envoy::extensions::filters::network::connection_limit::v3::ConnectionLimit proto_config;
     TestUtility::loadFromYamlAndValidate(filter_yaml, proto_config);
-    config_ = std::make_shared<Config>(proto_config, stats_store_, runtime_);
+    config_ = std::make_shared<Config>(proto_config, *stats_store_.rootScope(), runtime_);
   }
 
   Thread::ThreadSynchronizer& synchronizer() { return config_->synchronizer_; }
@@ -94,7 +95,8 @@ delay: 0s
 
   // Third connection should be connection limited.
   ActiveFilter active_filter3(config_);
-  EXPECT_CALL(active_filter3.read_filter_callbacks_.connection_, close(_));
+  EXPECT_CALL(active_filter3.read_filter_callbacks_.connection_,
+              close(Network::ConnectionCloseType::NoFlush, "over_connection_limit"));
   EXPECT_EQ(Network::FilterStatus::StopIteration, active_filter3.filter_.onNewConnection());
   EXPECT_EQ(Network::FilterStatus::StopIteration, active_filter3.filter_.onData(buffer, false));
   EXPECT_EQ(1, TestUtility::findCounter(
@@ -133,7 +135,8 @@ delay: 0.2s
   EXPECT_EQ(2, TestUtility::findGauge(stats_store_,
                                       "connection_limit.connection_limit_stats.active_connections")
                    ->value());
-  EXPECT_CALL(active_filter2.read_filter_callbacks_.connection_, close(_));
+  EXPECT_CALL(active_filter2.read_filter_callbacks_.connection_,
+              close(Network::ConnectionCloseType::NoFlush, "over_connection_limit"));
   delay_timer->invokeCallback();
   EXPECT_EQ(1, TestUtility::findGauge(stats_store_,
                                       "connection_limit.connection_limit_stats.active_connections")
@@ -200,6 +203,39 @@ delay: 0s
   EXPECT_EQ(Network::FilterStatus::Continue, active_filter.filter_.onData(buffer, false));
   synchronizer().signal("increment_pre_cas");
   t1.join();
+}
+
+// The filter's stats carry the stat prefix as an explicit tag.
+TEST_F(ConnectionLimitFilterTest, StatsAreTagged) {
+  initialize(R"EOF(
+stat_prefix: connection_limit_stats
+max_connections: 1
+delay: 0.2s
+)EOF");
+
+  const Stats::CounterSharedPtr limited_connections = TestUtility::findCounter(
+      stats_store_, "connection_limit.connection_limit_stats.limited_connections");
+  ASSERT_NE(limited_connections, nullptr);
+  EXPECT_EQ("connection_limit.limited_connections", limited_connections->tagExtractedName());
+  ASSERT_EQ(1U, limited_connections->tags().size());
+  EXPECT_EQ("envoy.connection_limit_prefix", limited_connections->tags()[0].name_);
+  EXPECT_EQ("connection_limit_stats", limited_connections->tags()[0].value_);
+}
+
+// A ':' in the stat prefix stays in the flat stat names, like the legacy stat creation paths.
+TEST_F(ConnectionLimitFilterTest, ColonInStatPrefixIsPreserved) {
+  initialize(R"EOF(
+stat_prefix: "db:27017"
+max_connections: 1
+delay: 0.2s
+)EOF");
+
+  const Stats::CounterSharedPtr limited_connections =
+      TestUtility::findCounter(stats_store_, "connection_limit.db:27017.limited_connections");
+  ASSERT_NE(limited_connections, nullptr);
+  EXPECT_EQ("connection_limit.limited_connections", limited_connections->tagExtractedName());
+  ASSERT_EQ(1U, limited_connections->tags().size());
+  EXPECT_EQ("db:27017", limited_connections->tags()[0].value_);
 }
 
 } // namespace ConnectionLimitFilter

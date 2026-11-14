@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sys/types.h>
+
 #include <string>
 
 #include "envoy/access_log/access_log.h"
@@ -33,21 +35,23 @@ namespace AccessLog {
 
 class AccessLogManagerImpl : public AccessLogManager, Logger::Loggable<Logger::Id::main> {
 public:
-  AccessLogManagerImpl(std::chrono::milliseconds file_flush_interval_msec, Api::Api& api,
-                       Event::Dispatcher& dispatcher, Thread::BasicLockable& lock,
-                       Stats::Store& stats_store)
-      : file_flush_interval_msec_(file_flush_interval_msec), api_(api), dispatcher_(dispatcher),
-        lock_(lock), file_stats_{
-                         ACCESS_LOG_FILE_STATS(POOL_COUNTER_PREFIX(stats_store, "filesystem."),
-                                               POOL_GAUGE_PREFIX(stats_store, "filesystem."))} {}
+  AccessLogManagerImpl(std::chrono::milliseconds file_flush_interval_msec,
+                       uint64_t min_flush_size_kb, Api::Api& api, Event::Dispatcher& dispatcher,
+                       Thread::BasicLockable& lock, Stats::Store& stats_store)
+      : file_flush_interval_msec_(file_flush_interval_msec),
+        file_min_flush_size_kb_(min_flush_size_kb), api_(api), dispatcher_(dispatcher), lock_(lock),
+        file_stats_{ACCESS_LOG_FILE_STATS(POOL_COUNTER_PREFIX(stats_store, "filesystem."),
+                                          POOL_GAUGE_PREFIX(stats_store, "filesystem."))} {}
   ~AccessLogManagerImpl() override;
 
   // AccessLog::AccessLogManager
   void reopen() override;
-  AccessLogFileSharedPtr createAccessLog(const Filesystem::FilePathAndType& file_info) override;
+  absl::StatusOr<AccessLogFileSharedPtr>
+  createAccessLog(const Filesystem::FilePathAndType& file_info) override;
 
 private:
   const std::chrono::milliseconds file_flush_interval_msec_;
+  const uint64_t file_min_flush_size_kb_{64};
   Api::Api& api_;
   Event::Dispatcher& dispatcher_;
   Thread::BasicLockable& lock_;
@@ -66,7 +70,7 @@ class AccessLogFileImpl : public AccessLogFile {
 public:
   AccessLogFileImpl(Filesystem::FilePtr&& file, Event::Dispatcher& dispatcher,
                     Thread::BasicLockable& lock, AccessLogFileStats& stats,
-                    std::chrono::milliseconds flush_interval_msec,
+                    std::chrono::milliseconds flush_interval_msec, uint64_t min_flush_size_kb,
                     Thread::ThreadFactory& thread_factory);
   ~AccessLogFileImpl() override;
 
@@ -84,14 +88,7 @@ public:
 private:
   void doWrite(Buffer::Instance& buffer);
   void flushThreadFunc();
-  Api::IoCallBoolResult open();
   void createFlushStructures();
-
-  // return default flags set which used by open
-  static Filesystem::FlagSet defaultFlags();
-
-  // Minimum size before the flush thread will be told to flush.
-  static const uint64_t MIN_FLUSH_SIZE = 1024 * 64;
 
   Filesystem::FilePtr file_;
 
@@ -114,8 +111,8 @@ private:
                    // high performance. It is always local to the process.
   Thread::ThreadPtr flush_thread_;
   Thread::CondVar flush_event_;
-  std::atomic<bool> flush_thread_exit_{};
-  std::atomic<bool> reopen_file_{};
+  bool flush_thread_exit_ ABSL_GUARDED_BY(write_lock_){false};
+  bool reopen_file_ ABSL_GUARDED_BY(write_lock_){false};
   Buffer::OwnedImpl
       flush_buffer_ ABSL_GUARDED_BY(write_lock_); // This buffer is used by multiple threads. It
                                                   // gets filled and then flushed either when max
@@ -133,6 +130,8 @@ private:
   const std::chrono::milliseconds flush_interval_msec_; // Time interval buffer gets flushed no
                                                         // matter if it reached the MIN_FLUSH_SIZE
                                                         // or not.
+  const uint64_t min_flush_size_{
+      64 * 1024}; // Minimum size before the flush thread will be told to flush.
   AccessLogFileStats& stats_;
 };
 

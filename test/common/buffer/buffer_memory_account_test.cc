@@ -7,6 +7,7 @@
 
 #include "test/integration/tracked_watermark_buffer.h"
 #include "test/mocks/http/stream_reset_handler.h"
+#include "test/test_common/logging.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -38,7 +39,8 @@ static void noAccountsTracked(MemoryClassesToAccountsSet& memory_classes_to_acco
 
 class BufferMemoryAccountTest : public testing::Test {
 protected:
-  TrackedWatermarkBufferFactory factory_{absl::bit_width(kMinimumBalanceToTrack)};
+  TrackedWatermarkBufferFactory factory_{
+      static_cast<uint32_t>(absl::bit_width(kMinimumBalanceToTrack))};
   Http::MockStreamResetHandler mock_reset_handler_;
 };
 
@@ -311,6 +313,27 @@ TEST_F(BufferMemoryAccountTest, ExtractingSliceWithExistingStorageCreditsAccount
   buffer_account->clearDownstream();
 }
 
+TEST_F(BufferMemoryAccountTest, ExtractingImmutableSliceCreditsAccountOnSliceDestruction) {
+  auto buffer_account = factory_.createAccount(mock_reset_handler_);
+  Buffer::OwnedImpl buffer(buffer_account);
+  ASSERT_EQ(getBalance(buffer_account), 0);
+
+  buffer.appendSliceForTest("Slice 1");
+  buffer.appendSliceForTest("Slice 2");
+  EXPECT_EQ(getBalance(buffer_account), 8192);
+
+  // Unlike extractMutableFrontSlice(), the charge stays attached to the extracted
+  // slice and the account is credited only when the slice is destroyed.
+  {
+    auto slice = buffer.extractImmutableFrontSlice();
+    EXPECT_EQ(getBalance(buffer_account), 8192);
+  }
+
+  EXPECT_EQ(getBalance(buffer_account), 4096);
+
+  buffer_account->clearDownstream();
+}
+
 TEST_F(BufferMemoryAccountTest, NewReservationSlicesOnlyChargedAfterCommit) {
   auto buffer_account = factory_.createAccount(mock_reset_handler_);
   Buffer::OwnedImpl buffer(buffer_account);
@@ -514,19 +537,22 @@ TEST(WatermarkBufferFactoryTest, ShouldOnlyResetAllStreamsGreatThanOrEqualToProv
     EXPECT_EQ(memory_classes_to_account[7].size(), 1);
   });
 
-  EXPECT_CALL(largest_stream_to_reset, resetStream(_)).WillOnce(Invoke([&]() {
+  EXPECT_CALL(largest_stream_to_reset, resetStream(_)).WillOnce([&]() {
     largest_account_to_reset->credit(getBalance(largest_account_to_reset));
     largest_account_to_reset->clearDownstream();
-  }));
+  });
 
-  EXPECT_CALL(stream_to_reset, resetStream(_)).WillOnce(Invoke([&]() {
+  EXPECT_CALL(stream_to_reset, resetStream(_)).WillOnce([&]() {
     account_to_reset->credit(getBalance(account_to_reset));
     account_to_reset->clearDownstream();
-  }));
+  });
 
   EXPECT_CALL(stream_that_should_not_be_reset, resetStream(_)).Times(0);
   // Should call resetStream on all streams in bucket >= 1.
-  EXPECT_EQ(factory.resetAccountsGivenPressure(0.85), 2);
+  EXPECT_LOG_CONTAINS("warn", "resetting 2 streams in 2 buckets, 5 empty buckets",
+                      EXPECT_EQ(factory.resetAccountsGivenPressure(0.85), 2));
+  EXPECT_LOG_NOT_CONTAINS("warn", "resetting",
+                          EXPECT_EQ(factory.resetAccountsGivenPressure(0.85), 0));
 
   account_to_not_reset->credit(kMinimumBalanceToTrack);
   account_to_not_reset->clearDownstream();
@@ -558,11 +584,11 @@ TEST(WatermarkBufferFactoryTest, ComputesBucketToResetCorrectly) {
   float pressure = 0.0;
   const float pressure_gradation = 1.0 / BufferMemoryAccountImpl::NUM_MEMORY_CLASSES_;
   for (uint32_t i = 0; i < BufferMemoryAccountImpl::NUM_MEMORY_CLASSES_; ++i) {
-    EXPECT_CALL(*reset_handlers.back(), resetStream(_)).WillOnce(Invoke([&]() {
+    EXPECT_CALL(*reset_handlers.back(), resetStream(_)).WillOnce([&]() {
       auto current_account = accounts.back();
       current_account->credit(getBalance(current_account));
       current_account->clearDownstream();
-    }));
+    });
 
     EXPECT_EQ(factory.resetAccountsGivenPressure(pressure), 1);
 

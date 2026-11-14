@@ -8,15 +8,18 @@
 #include "source/extensions/filters/http/admission_control/config.h"
 #include "source/extensions/filters/http/admission_control/evaluators/success_criteria_evaluator.h"
 
+#include "test/mocks/http/mocks.h"
 #include "test/mocks/runtime/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/thread_local/mocks.h"
-#include "test/test_common/simulated_time_system.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+using ::Envoy::StatusHelpers::HasStatusMessage;
+using testing::_;
 using testing::NiceMock;
 using testing::Return;
 
@@ -33,9 +36,11 @@ public:
   std::shared_ptr<AdmissionControlFilterConfig> makeConfig(const std::string& yaml) {
     AdmissionControlProto proto;
     TestUtility::loadFromYamlAndValidate(yaml, proto);
-    auto tls =
-        ThreadLocal::TypedSlot<ThreadLocalControllerImpl>::makeUnique(context_.threadLocal());
-    auto evaluator = std::make_unique<SuccessCriteriaEvaluator>(proto.success_criteria());
+    auto tls = ThreadLocal::TypedSlot<ThreadLocalControllerImpl>::makeUnique(
+        context_.server_factory_context_.threadLocal());
+    auto evaluator_or = SuccessCriteriaEvaluator::create(proto.success_criteria());
+    EXPECT_OK(evaluator_or);
+    auto evaluator = std::move(evaluator_or.value());
     return std::make_shared<AdmissionControlFilterConfig>(proto, runtime_, random_, scope_,
                                                           std::move(tls), std::move(evaluator));
   }
@@ -43,7 +48,8 @@ public:
 protected:
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Server::Configuration::MockFactoryContext> context_;
-  Stats::IsolatedStoreImpl scope_;
+  Stats::IsolatedStoreImpl store_;
+  Stats::Scope& scope_{*store_.rootScope()};
   NiceMock<Random::MockRandomGenerator> random_;
 };
 
@@ -72,9 +78,9 @@ success_criteria:
   AdmissionControlProto proto;
   TestUtility::loadFromYamlAndValidate(yaml, proto);
   NiceMock<Server::Configuration::MockFactoryContext> factory_context;
-  EXPECT_THROW_WITH_MESSAGE(admission_control_filter_factory.createFilterFactoryFromProtoTyped(
-                                proto, "whatever", factory_context),
-                            EnvoyException, "Success rate threshold cannot be less than 1.0%.");
+  auto status_or = admission_control_filter_factory.createFilterFactoryFromProto(proto, "whatever",
+                                                                                 factory_context);
+  EXPECT_THAT(status_or, HasStatusMessage("Success rate threshold cannot be less than 1.0%."));
 }
 
 TEST_F(AdmissionControlConfigTest, SmallSuccessRateThreshold) {
@@ -99,9 +105,9 @@ success_criteria:
   AdmissionControlProto proto;
   TestUtility::loadFromYamlAndValidate(yaml, proto);
   NiceMock<Server::Configuration::MockFactoryContext> factory_context;
-  EXPECT_THROW_WITH_MESSAGE(admission_control_filter_factory.createFilterFactoryFromProtoTyped(
-                                proto, "whatever", factory_context),
-                            EnvoyException, "Success rate threshold cannot be less than 1.0%.");
+  auto status_or = admission_control_filter_factory.createFilterFactoryFromProto(proto, "whatever",
+                                                                                 factory_context);
+  EXPECT_THAT(status_or, HasStatusMessage("Success rate threshold cannot be less than 1.0%."));
 }
 
 // Verify the configuration when all fields are set.
@@ -142,8 +148,6 @@ success_criteria:
 // Verify the config defaults when not specified.
 TEST_F(AdmissionControlConfigTest, BasicTestMinimumConfigured) {
   // Empty config. No fields are required.
-  AdmissionControlProto proto;
-
   const std::string yaml = R"EOF(
 success_criteria:
   http_criteria:
@@ -211,6 +215,43 @@ success_criteria:
   EXPECT_CALL(runtime_.snapshot_, getDouble("foo.max_rejection_probability", 70.0))
       .WillOnce(Return(300.0));
   EXPECT_EQ(0.7, config->maxRejectionProbability());
+}
+
+TEST_F(AdmissionControlConfigTest, CreateFilterFactoryFromProtoWithServerContext) {
+  AdmissionControlFilterFactory admission_control_filter_factory;
+  const std::string yaml = R"EOF(
+enabled:
+  default_value: false
+  runtime_key: "foo.enabled"
+sampling_window: 1337s
+sr_threshold:
+  default_value:
+    value: 95
+  runtime_key: "foo.sr_threshold"
+aggression:
+  default_value: 4.2
+  runtime_key: "foo.aggression"
+success_criteria:
+  http_criteria:
+  grpc_criteria:
+)EOF";
+
+  AdmissionControlProto proto;
+  TestUtility::loadFromYamlAndValidate(yaml, proto);
+
+  // createHttpFilterFactoryFromProto returns a StatusOr<FilterFactoryCb>; unwrap with value().
+  Server::Configuration::ExtraFactoryContext extra_context{
+      context_.serverFactoryContext().messageValidationVisitor(), "stats_prefix"};
+  auto cb =
+      admission_control_filter_factory
+          .createHttpFilterFactoryFromProto(proto, context_.serverFactoryContext(), extra_context)
+          .value();
+
+  EXPECT_TRUE(cb != nullptr);
+
+  Http::MockFilterChainFactoryCallbacks callbacks;
+  EXPECT_CALL(callbacks, addStreamFilter(_));
+  cb(callbacks);
 }
 
 } // namespace

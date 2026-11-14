@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <random>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,7 @@
 #include "envoy/config/route/v3/route.pb.h"
 #include "envoy/config/route/v3/route_components.pb.h"
 #include "envoy/http/codec.h"
+#include "envoy/server/overload/thread_local_overload_state.h"
 #include "envoy/service/runtime/v3/rtds.pb.h"
 
 #include "source/common/api/api_impl.h"
@@ -35,9 +37,11 @@
 
 #include "test/mocks/common.h"
 #include "test/mocks/stats/mocks.h"
+#include "test/test_common/file_system_for_test.h"
 #include "test/test_common/printers.h"
 #include "test/test_common/resources.h"
 #include "test/test_common/test_time.h"
+#include "test/test_common/thread_factory_for_test.h"
 
 #include "absl/container/fixed_array.h"
 #include "absl/strings/str_cat.h"
@@ -45,25 +49,7 @@
 #include "absl/synchronization/notification.h"
 #include "gtest/gtest.h"
 
-using testing::GTEST_FLAG(random_seed);
-
 namespace Envoy {
-
-// The purpose of using the static seed here is to use --test_arg=--gtest_random_seed=[seed]
-// to specify the seed of the problem to replay.
-int32_t getSeed() {
-  static const int32_t seed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  std::chrono::system_clock::now().time_since_epoch())
-                                  .count();
-  return seed;
-}
-
-TestRandomGenerator::TestRandomGenerator()
-    : seed_(GTEST_FLAG(random_seed) == 0 ? getSeed() : GTEST_FLAG(random_seed)), generator_(seed_) {
-  std::cerr << "TestRandomGenerator running with seed " << seed_ << "\n";
-}
-
-uint64_t TestRandomGenerator::random() { return generator_(); }
 
 bool TestUtility::headerMapEqualIgnoreOrder(const Http::HeaderMap& lhs,
                                             const Http::HeaderMap& rhs) {
@@ -74,7 +60,9 @@ bool TestUtility::headerMapEqualIgnoreOrder(const Http::HeaderMap& lhs,
     lhs_keys.insert(key);
     return Http::HeaderMap::Iterate::Continue;
   });
-  rhs.iterate([&lhs, &rhs, &rhs_keys](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
+  bool values_match = true;
+  rhs.iterate([&values_match, &lhs, &rhs,
+               &rhs_keys](const Http::HeaderEntry& header) -> Http::HeaderMap::Iterate {
     const std::string key{header.key().getStringView()};
     // Compare with canonicalized multi-value headers. This ensures we respect order within
     // a header.
@@ -84,12 +72,13 @@ bool TestUtility::headerMapEqualIgnoreOrder(const Http::HeaderMap& lhs,
         Http::HeaderUtility::getAllOfHeaderAsString(rhs, Http::LowerCaseString(key));
     ASSERT(rhs_entry.result());
     if (lhs_entry.result() != rhs_entry.result()) {
+      values_match = false;
       return Http::HeaderMap::Iterate::Break;
     }
     rhs_keys.insert(key);
     return Http::HeaderMap::Iterate::Continue;
   });
-  return lhs_keys.size() == rhs_keys.size();
+  return values_match && lhs_keys.size() == rhs_keys.size();
 }
 
 bool TestUtility::buffersEqual(const Buffer::Instance& lhs, const Buffer::Instance& rhs) {
@@ -144,7 +133,7 @@ bool TestUtility::rawSlicesEqual(const Buffer::RawSlice* lhs, const Buffer::RawS
 }
 
 void TestUtility::feedBufferWithRandomCharacters(Buffer::Instance& buffer, uint64_t n_char,
-                                                 uint64_t seed) {
+                                                 uint64_t seed, uint64_t n_slice) {
   const std::string sample = "Neque porro quisquam est qui dolorem ipsum..";
   std::mt19937 generate(seed);
   std::uniform_int_distribution<> distribute(1, sample.length() - 1);
@@ -152,7 +141,9 @@ void TestUtility::feedBufferWithRandomCharacters(Buffer::Instance& buffer, uint6
   for (uint64_t n = 0; n < n_char; ++n) {
     str += sample.at(distribute(generate));
   }
-  buffer.add(str);
+  for (uint64_t n = 0; n < n_slice; ++n) {
+    buffer.add(str);
+  }
 }
 
 Stats::CounterSharedPtr TestUtility::findCounter(Stats::Store& store, const std::string& name) {
@@ -173,72 +164,67 @@ Stats::ParentHistogramSharedPtr TestUtility::findHistogram(Stats::Store& store,
   return findByName(store.histograms(), name);
 }
 
-AssertionResult TestUtility::waitForCounterEq(Stats::Store& store, const std::string& name,
-                                              uint64_t value, Event::TestTimeSystem& time_system,
-                                              std::chrono::milliseconds timeout,
-                                              Event::Dispatcher* dispatcher) {
+AssertionResult TestUtility::waitForCounter(Stats::Store& store, const std::string& name,
+                                            testing::Matcher<uint64_t> value_matcher,
+                                            Event::TestTimeSystem& time_system,
+                                            std::chrono::milliseconds timeout,
+                                            Event::Dispatcher* dispatcher) {
   Event::TestTimeSystem::RealTimeBound bound(timeout);
-  while (findCounter(store, name) == nullptr || findCounter(store, name)->value() != value) {
+  while (true) {
+    Stats::CounterSharedPtr counter = findCounter(store, name);
+    if (counter != nullptr && value_matcher.Matches(counter->value())) {
+      return AssertionSuccess();
+    }
     time_system.advanceTimeWait(std::chrono::milliseconds(10));
     if (timeout != std::chrono::milliseconds::zero() && !bound.withinBound()) {
-      std::string current_value;
-      if (findCounter(store, name)) {
-        current_value = absl::StrCat(findCounter(store, name)->value());
-      } else {
-        current_value = "nil";
-      }
-      return AssertionFailure() << fmt::format(
-                 "timed out waiting for {} to be {}, current value {}", name, value, current_value);
+      counter = findCounter(store, name);
+      const std::string current_value = counter != nullptr ? absl::StrCat(counter->value()) : "nil";
+      return AssertionFailure() << "timed out waiting for " << name << " to " << value_matcher
+                                << ": current value " << current_value;
     }
     if (dispatcher != nullptr) {
       dispatcher->run(Event::Dispatcher::RunType::NonBlock);
     }
   }
-  return AssertionSuccess();
 }
 
-AssertionResult TestUtility::waitForCounterGe(Stats::Store& store, const std::string& name,
-                                              uint64_t value, Event::TestTimeSystem& time_system,
-                                              std::chrono::milliseconds timeout) {
+AssertionResult TestUtility::waitForGauge(Stats::Store& store, const std::string& name,
+                                          testing::Matcher<uint64_t> value_matcher,
+                                          Event::TestTimeSystem& time_system,
+                                          std::chrono::milliseconds timeout) {
   Event::TestTimeSystem::RealTimeBound bound(timeout);
-  while (findCounter(store, name) == nullptr || findCounter(store, name)->value() < value) {
+  while (true) {
+    Stats::GaugeSharedPtr gauge = findGauge(store, name);
+    if (gauge != nullptr && value_matcher.Matches(gauge->value())) {
+      return AssertionSuccess();
+    }
     time_system.advanceTimeWait(std::chrono::milliseconds(10));
     if (timeout != std::chrono::milliseconds::zero() && !bound.withinBound()) {
-      return AssertionFailure() << fmt::format("timed out waiting for {} to be {}", name, value);
+      gauge = findGauge(store, name);
+      const std::string current_value = gauge != nullptr ? absl::StrCat(gauge->value()) : "nil";
+      return AssertionFailure() << "timed out waiting for " << name << " to " << value_matcher
+                                << ": current value " << current_value;
     }
   }
-  return AssertionSuccess();
 }
 
-AssertionResult TestUtility::waitForGaugeGe(Stats::Store& store, const std::string& name,
-                                            uint64_t value, Event::TestTimeSystem& time_system,
-                                            std::chrono::milliseconds timeout) {
+AssertionResult TestUtility::waitForProactiveOverloadResourceUsageEq(
+    Server::ThreadLocalOverloadState& overload_state,
+    const Server::OverloadProactiveResourceName resource_name, int64_t expected_value,
+    Event::TestTimeSystem& time_system, Event::Dispatcher& dispatcher,
+    std::chrono::milliseconds timeout) {
   Event::TestTimeSystem::RealTimeBound bound(timeout);
-  while (findGauge(store, name) == nullptr || findGauge(store, name)->value() < value) {
+  const auto& monitor = overload_state.getProactiveResourceMonitorForTest(resource_name);
+  while (monitor->currentResourceUsage() != expected_value) {
     time_system.advanceTimeWait(std::chrono::milliseconds(10));
     if (timeout != std::chrono::milliseconds::zero() && !bound.withinBound()) {
-      return AssertionFailure() << fmt::format("timed out waiting for {} to be {}", name, value);
-    }
-  }
-  return AssertionSuccess();
-}
-
-AssertionResult TestUtility::waitForGaugeEq(Stats::Store& store, const std::string& name,
-                                            uint64_t value, Event::TestTimeSystem& time_system,
-                                            std::chrono::milliseconds timeout) {
-  Event::TestTimeSystem::RealTimeBound bound(timeout);
-  while (findGauge(store, name) == nullptr || findGauge(store, name)->value() != value) {
-    time_system.advanceTimeWait(std::chrono::milliseconds(10));
-    if (timeout != std::chrono::milliseconds::zero() && !bound.withinBound()) {
-      std::string current_value;
-      if (findGauge(store, name)) {
-        current_value = absl::StrCat(findGauge(store, name)->value());
-      } else {
-        current_value = "nil";
-      }
+      uint64_t current_value;
+      current_value = monitor->currentResourceUsage();
       return AssertionFailure() << fmt::format(
-                 "timed out waiting for {} to be {}, current value {}", name, value, current_value);
+                 "timed out waiting for proactive resource to be {}, current value {}",
+                 expected_value, current_value);
     }
+    dispatcher.run(Event::Dispatcher::RunType::NonBlock);
   }
   return AssertionSuccess();
 }
@@ -251,8 +237,9 @@ AssertionResult TestUtility::waitForGaugeDestroyed(Stats::Store& store, const st
   return AssertionSuccess();
 }
 
-AssertionResult TestUtility::waitUntilHistogramHasSamples(Stats::Store& store,
+AssertionResult TestUtility::waitForNumHistogramSamplesGe(Stats::Store& store,
                                                           const std::string& name,
+                                                          uint64_t min_sample_count_required,
                                                           Event::TestTimeSystem& time_system,
                                                           Event::Dispatcher& main_dispatcher,
                                                           std::chrono::milliseconds timeout) {
@@ -261,7 +248,7 @@ AssertionResult TestUtility::waitUntilHistogramHasSamples(Stats::Store& store,
     auto histo = findByName<Stats::ParentHistogramSharedPtr>(store.histograms(), name);
     if (histo) {
       uint64_t sample_count = readSampleCount(main_dispatcher, *histo);
-      if (sample_count) {
+      if (sample_count >= min_sample_count_required) {
         break;
       }
     }
@@ -269,10 +256,19 @@ AssertionResult TestUtility::waitUntilHistogramHasSamples(Stats::Store& store,
     time_system.advanceTimeWait(std::chrono::milliseconds(10));
 
     if (timeout != std::chrono::milliseconds::zero() && !bound.withinBound()) {
-      return AssertionFailure() << fmt::format("timed out waiting for {} to have samples", name);
+      return AssertionFailure() << fmt::format("timed out waiting for {} to have {} samples", name,
+                                               min_sample_count_required);
     }
   }
   return AssertionSuccess();
+}
+
+AssertionResult TestUtility::waitUntilHistogramHasSamples(Stats::Store& store,
+                                                          const std::string& name,
+                                                          Event::TestTimeSystem& time_system,
+                                                          Event::Dispatcher& main_dispatcher,
+                                                          std::chrono::milliseconds timeout) {
+  return waitForNumHistogramSamplesGe(store, name, 1, time_system, main_dispatcher, timeout);
 }
 
 uint64_t TestUtility::readSampleCount(Event::Dispatcher& main_dispatcher,
@@ -290,11 +286,27 @@ uint64_t TestUtility::readSampleCount(Event::Dispatcher& main_dispatcher,
   return sample_count;
 }
 
+double TestUtility::readSampleSum(Event::Dispatcher& main_dispatcher,
+                                  const Stats::ParentHistogram& histogram) {
+  // Note: we need to read the sample count from the main thread, to avoid data races.
+  double sample_sum = 0;
+  absl::Notification notification;
+
+  main_dispatcher.post([&] {
+    sample_sum = histogram.cumulativeStatistics().sampleSum();
+    notification.Notify();
+  });
+  notification.WaitForNotification();
+
+  return sample_sum;
+}
+
 std::list<Network::DnsResponse>
 TestUtility::makeDnsResponse(const std::list<std::string>& addresses, std::chrono::seconds ttl) {
   std::list<Network::DnsResponse> ret;
   for (const auto& address : addresses) {
-    ret.emplace_back(Network::DnsResponse(Network::Utility::parseInternetAddress(address), ttl));
+    ret.emplace_back(
+        Network::DnsResponse(Network::Utility::parseInternetAddressNoThrow(address), ttl));
   }
   return ret;
 }
@@ -314,6 +326,11 @@ std::vector<std::string> TestUtility::listFiles(const std::string& path, bool re
     }
   }
   return file_names;
+}
+
+std::string TestUtility::uniqueFilename(absl::string_view prefix) {
+  return absl::StrCat(prefix, "_", getpid(), "_",
+                      std::chrono::system_clock::now().time_since_epoch().count());
 }
 
 std::string TestUtility::addLeftAndRightPadding(absl::string_view to_pad, int desired_length) {
@@ -397,13 +414,13 @@ bool TestUtility::gaugesZeroed(
 }
 
 void ConditionalInitializer::setReady() {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   EXPECT_FALSE(ready_);
   ready_ = true;
 }
 
 void ConditionalInitializer::waitReady() {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   if (ready_) {
     ready_ = false;
     return;
@@ -415,7 +432,7 @@ void ConditionalInitializer::waitReady() {
 }
 
 void ConditionalInitializer::wait() {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   mutex_.Await(absl::Condition(&ready_));
   EXPECT_TRUE(ready_);
 }

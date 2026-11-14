@@ -5,6 +5,7 @@
 
 #include "test/extensions/filters/http/common/empty_http_filter_config.h"
 #include "test/integration/filters/common.h"
+#include "test/integration/filters/test_filters.pb.h"
 
 namespace Envoy {
 
@@ -15,8 +16,15 @@ public:
 };
 
 constexpr char TestPassThroughFilter::name[];
-static Registry::RegisterFactory<SimpleFilterConfig<TestPassThroughFilter>,
-                                 Server::Configuration::NamedHttpFilterConfigFactory>
+static Registry::RegisterFactory<
+    UniqueSimpleFilterConfig<TestPassThroughFilter,
+                             test::integration::filters::PassthroughFilterConfig>,
+    Server::Configuration::NamedHttpFilterConfigFactory>
     register_;
+static Registry::RegisterFactory<
+    UniqueSimpleFilterConfig<TestPassThroughFilter,
+                             test::integration::filters::PassthroughFilterConfig>,
+    Server::Configuration::UpstreamHttpFilterConfigFactory>
+    register_upstream_;
 
 } // namespace Envoy

@@ -1,6 +1,9 @@
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 
 #include "source/common/common/fmt.h"
+#include "source/common/config/well_known_names.h"
+#include "source/common/runtime/runtime_features.h"
+#include "source/common/stats/thread_local_store.h"
 #include "source/extensions/filters/network/thrift_proxy/buffer_helper.h"
 
 #include "test/extensions/filters/network/thrift_proxy/integration.h"
@@ -10,6 +13,7 @@
 #include "gtest/gtest.h"
 
 using testing::Combine;
+using testing::Ge;
 using testing::HasSubstr;
 using ::testing::TestParamInfo;
 using testing::Values;
@@ -47,7 +51,6 @@ public:
                     - name: "x-header-2"
                       string_match:
                         safe_regex:
-                          google_re2: {}
                           regex: "0.[5-9]"
                     - name: "x-header-3"
                       range_match:
@@ -75,7 +78,7 @@ public:
   void initializeCall(DriverMode mode) {
     std::tie(transport_, protocol_, multiplexed_, std::ignore) = GetParam();
 
-    absl::optional<std::string> service_name;
+    std::optional<std::string> service_name;
     if (multiplexed_) {
       service_name = "svcname";
     }
@@ -99,7 +102,7 @@ public:
   void initializeOneway() {
     std::tie(transport_, protocol_, multiplexed_, std::ignore) = GetParam();
 
-    absl::optional<std::string> service_name;
+    std::optional<std::string> service_name;
     if (multiplexed_) {
       service_name = "svcname";
     }
@@ -141,7 +144,45 @@ public:
 
     tryInitializePassthrough();
 
+    // Exercise both stats modes without doubling the test matrix: these tests only run on IPv4, so
+    // the multiplexed and non-multiplexed variants run the server in different modes. The mode is
+    // read during server initialization, before the runtime loader exists, so it has to be set
+    // directly rather than with addRuntimeOverride().
+    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.enable_stats_explicit_tags",
+                                  explicitTags());
     BaseThriftIntegrationTest::initialize();
+
+    // Sanity check that the parameterized mode really took effect; otherwise both variants would
+    // silently be exercising the same thing.
+    auto* store = dynamic_cast<Stats::ThreadLocalStoreImpl*>(&test_server_->statStore());
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->useExplicitTags(), explicitTags());
+  }
+
+  // Whether the stats store derives tags with the explicit-tags logic (the tag-friendly scope API)
+  // rather than with the legacy tag-extraction rules. Both modes must produce identical stat names,
+  // tag-extracted names and tags for the connection manager stats.
+  bool explicitTags() const { return std::get<2>(GetParam()); }
+
+  // Checks a stat's flat name, the name it is tag-extracted to, and the tags attached to it.
+  void expectStat(const std::string& name, const std::string& tag_extracted_name,
+                  const std::vector<std::pair<std::string, std::string>>& tags) {
+    Stats::CounterSharedPtr counter = test_server_->counter(name);
+    Stats::GaugeSharedPtr gauge = test_server_->gauge(name);
+    const Stats::Metric* metric = counter != nullptr ? static_cast<Stats::Metric*>(counter.get())
+                                                     : static_cast<Stats::Metric*>(gauge.get());
+    ASSERT_NE(metric, nullptr) << "no counter or gauge named '" << name << "'";
+
+    EXPECT_EQ(metric->tagExtractedName(), tag_extracted_name) << " for stat '" << name << "'";
+
+    std::vector<std::pair<std::string, std::string>> actual_tags;
+    for (const Stats::Tag& tag : metric->tags()) {
+      actual_tags.emplace_back(tag.name_, tag.value_);
+    }
+    std::sort(actual_tags.begin(), actual_tags.end());
+    std::vector<std::pair<std::string, std::string>> expected_tags = tags;
+    std::sort(expected_tags.begin(), expected_tags.end());
+    EXPECT_EQ(actual_tags, expected_tags) << " for stat '" << name << "'";
   }
 
 protected:
@@ -257,6 +298,7 @@ TEST_P(ThriftConnManagerIntegrationTest, Success) {
 }
 
 TEST_P(ThriftConnManagerIntegrationTest, IDLException) {
+  DISABLE_UNDER_WINDOWS; // https://github.com/envoyproxy/envoy/issues/21017
   initializeCall(DriverMode::IDLException);
 
   IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
@@ -304,6 +346,7 @@ TEST_P(ThriftConnManagerIntegrationTest, IDLException) {
 }
 
 TEST_P(ThriftConnManagerIntegrationTest, Exception) {
+  DISABLE_UNDER_WINDOWS; // https://github.com/envoyproxy/envoy/issues/21017
   initializeCall(DriverMode::Exception);
 
   IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
@@ -352,7 +395,7 @@ TEST_P(ThriftConnManagerIntegrationTest, EarlyClose) {
   FakeRawConnectionPtr fake_upstream_connection;
   ASSERT_TRUE(expected_upstream->waitForRawConnection(fake_upstream_connection));
 
-  test_server_->waitForCounterGe("thrift.thrift_stats.cx_destroy_remote_with_active_rq", 1);
+  test_server_->waitForCounter("thrift.thrift_stats.cx_destroy_remote_with_active_rq", Ge(1));
 
   Stats::CounterSharedPtr counter =
       test_server_->counter("thrift.thrift_stats.cx_destroy_remote_with_active_rq");
@@ -376,7 +419,7 @@ TEST_P(ThriftConnManagerIntegrationTest, EarlyCloseWithUpstream) {
 
   tcp_client->close();
 
-  test_server_->waitForCounterGe("thrift.thrift_stats.cx_destroy_remote_with_active_rq", 1);
+  test_server_->waitForCounter("thrift.thrift_stats.cx_destroy_remote_with_active_rq", Ge(1));
 
   Stats::CounterSharedPtr counter =
       test_server_->counter("thrift.thrift_stats.cx_destroy_remote_with_active_rq");
@@ -473,91 +516,68 @@ TEST_P(ThriftConnManagerIntegrationTest, OnewayEarlyClosePartialRequest) {
   FakeRawConnectionPtr fake_upstream_connection;
   ASSERT_TRUE(expected_upstream->waitForRawConnection(fake_upstream_connection));
 
-  test_server_->waitForCounterGe("thrift.thrift_stats.cx_destroy_remote_with_active_rq", 1);
+  test_server_->waitForCounter("thrift.thrift_stats.cx_destroy_remote_with_active_rq", Ge(1));
 
   Stats::CounterSharedPtr counter =
       test_server_->counter("thrift.thrift_stats.cx_destroy_remote_with_active_rq");
   EXPECT_EQ(1U, counter->value());
 }
 
-class ThriftTwitterConnManagerIntegrationTest : public ThriftConnManagerIntegrationTest {};
+TEST_P(ThriftConnManagerIntegrationTest, NegativeVarIntCrashRepro) {
+  // Only relevant for Header transport
+  if (std::get<0>(GetParam()) != TransportType::Header) {
+    return;
+  }
 
-INSTANTIATE_TEST_SUITE_P(FramedTwitter, ThriftTwitterConnManagerIntegrationTest,
-                         Combine(Values(TransportType::Framed), Values(ProtocolType::Twitter),
-                                 Values(false, true), Values(false, true)),
-                         paramToString);
+  initializeCommon();
 
-// Because of the protocol upgrade requests and the difficulty of separating them, we test this
-// protocol independently.
-TEST_P(ThriftTwitterConnManagerIntegrationTest, Success) {
-// This test relies on an old Apache Thrift Python package
-// that is only available in Python2. Disabling the test on Windows.
-#ifndef WIN32
+  Buffer::OwnedImpl buffer;
+  buffer.writeBEInt<int32_t>(100);    // frame size
+  buffer.writeBEInt<int16_t>(0x0FFF); // magic
+  buffer.writeBEInt<int16_t>(0);      // flags
+  buffer.writeBEInt<int32_t>(1);      // sequence number
+  buffer.writeBEInt<int16_t>(10);     // header size / 4 (header_size = 40)
+
+  // Header data
+  buffer.writeByte(0); // Protocol ID (Binary) - varint 0
+  buffer.writeByte(0); // Num transforms - varint 0
+  buffer.writeByte(1); // Info ID (1) - varint 1
+  buffer.writeByte(1); // Header Count (1) - varint 1
+
+  // Key length: -1 (encoded as varint 0xFF 0xFF 0xFF 0xFF 0x0F)
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0xFF);
+  buffer.writeByte(0x0F);
+
+  for (int i = 0; i < 80; i++) {
+    buffer.writeByte(0);
+  }
+
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
+  EXPECT_TRUE(tcp_client->write(buffer.toString(), false, false));
+
+  // The connection should be closed because of the exception in decodeFrameStart
+  tcp_client->waitForDisconnect();
+
+  test_server_->waitForCounter("thrift.thrift_stats.request_decoding_error", Ge(1));
+}
+
+// The connection manager's stats have the same flat names, tag-extracted names and tags whether the
+// tags are derived by the legacy tag-extraction rules (non-multiplexed variants) or supplied
+// explicitly (multiplexed variants).
+TEST_P(ThriftConnManagerIntegrationTest, StatsTagsAndNamesAreIdenticalInBothModes) {
   initializeCall(DriverMode::Success);
 
-  uint32_t upgrade_request_size = request_bytes_.peekBEInt<uint32_t>() + 4;
-  Buffer::OwnedImpl upgrade_request_bytes;
-  upgrade_request_bytes.move(request_bytes_, upgrade_request_size);
-
-  uint32_t upgrade_response_size = response_bytes_.peekBEInt<uint32_t>() + 4;
-  Buffer::OwnedImpl upgrade_response_bytes;
-  upgrade_response_bytes.move(response_bytes_, upgrade_response_size);
-
-  // Upgrade request/response happens without an upstream.
-  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("listener_0"));
-  ASSERT_TRUE(tcp_client->write(upgrade_request_bytes.toString()));
-  tcp_client->waitForData(upgrade_response_bytes.toString());
-  EXPECT_TRUE(
-      TestUtility::buffersEqual(Buffer::OwnedImpl(tcp_client->data()), upgrade_response_bytes));
-
-  // First real request triggers upstream connection.
-  ASSERT_TRUE(tcp_client->write(request_bytes_.toString()));
-  FakeRawConnectionPtr fake_upstream_connection;
-  FakeUpstream* expected_upstream = getExpectedUpstream(false);
-  ASSERT_TRUE(expected_upstream->waitForRawConnection(fake_upstream_connection));
-
-  // Check that upstream receives the upgrade request
-  std::string upgrade_data;
-  ASSERT_TRUE(fake_upstream_connection->waitForData(upgrade_request_size, &upgrade_data));
-  Buffer::OwnedImpl upstream_upgrade_request(upgrade_data);
-  EXPECT_EQ(upgrade_request_bytes.toString(), upstream_upgrade_request.toString());
-
-  // Respond with successful upgrade reply.
-  ASSERT_TRUE(fake_upstream_connection->write(upgrade_response_bytes.toString()));
-
-  // Check that upstream receives the real request.
-  // TODO(zuercher): fix FakeRawConnection to allow data to be reset so we don't have to account
-  // for the upgrade message that we already checked.
-  std::string data;
-  ASSERT_TRUE(
-      fake_upstream_connection->waitForData(upgrade_request_size + request_bytes_.length(), &data));
-  Buffer::OwnedImpl upstream_request(data.substr(upgrade_request_size));
-  EXPECT_EQ(request_bytes_.toString(), upstream_request.toString());
-
-  // Respond to request.
-  ASSERT_TRUE(fake_upstream_connection->write(response_bytes_.toString()));
-
-  // TODO(zuercher): likewise fix IntegrationTcpClient to allow data to be reset so we don't have
-  // to account for the upgrade response we already checked.
-  tcp_client->waitForData(response_bytes_.toString(), false);
-  tcp_client->close();
-
-  EXPECT_TRUE(TestUtility::buffersEqual(
-      Buffer::OwnedImpl(tcp_client->data().substr(upgrade_response_size)), response_bytes_));
-
-  // 2 requests on downstream but the first is an upgrade, so only one on upstream side
-  Stats::CounterSharedPtr counter = test_server_->counter("thrift.thrift_stats.request_call");
-  EXPECT_EQ(2U, counter->value());
-  int upstream_idx = getExpectedUpstreamIdx(false);
-  counter = test_server_->counter(
-      fmt::format("cluster.cluster_{}.thrift.upstream_rq_call", upstream_idx));
-  EXPECT_EQ(1U, counter->value());
-  counter = test_server_->counter("thrift.thrift_stats.response_success");
-  EXPECT_EQ(2U, counter->value());
-  counter = test_server_->counter(
-      fmt::format("cluster.cluster_{}.thrift.upstream_resp_success", upstream_idx));
-  EXPECT_EQ(1U, counter->value());
-#endif
+  const std::vector<std::pair<std::string, std::string>> tags{
+      {Config::TagNames::get().THRIFT_PREFIX, "thrift_stats"}};
+  expectStat("thrift.thrift_stats.request", "thrift.request", tags);
+  expectStat("thrift.thrift_stats.request_call", "thrift.request_call", tags);
+  expectStat("thrift.thrift_stats.response_success", "thrift.response_success", tags);
+  expectStat("thrift.thrift_stats.request_active", "thrift.request_active", tags);
+  // The router filter's stats are tagged the same way.
+  expectStat("thrift.thrift_stats.route_missing", "thrift.route_missing", tags);
 }
 
 } // namespace ThriftProxy

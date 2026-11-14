@@ -1,6 +1,6 @@
 #include "source/common/quic/envoy_quic_alarm.h"
 #include "source/common/quic/envoy_quic_alarm_factory.h"
-#include "source/common/quic/platform/envoy_quic_clock.h"
+#include "source/common/quic/envoy_quic_clock.h"
 
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/utility.h"
@@ -22,7 +22,7 @@ public:
   void OnAlarm() override { fired_ = true; }
 
   bool fired() const { return fired_; }
-  void set_fired(bool fired) { fired_ = fired; }
+  void setFired(bool fired) { fired_ = fired; }
 
 private:
   bool fired_{false};
@@ -33,7 +33,7 @@ public:
   EnvoyQuicAlarmTest()
       : api_(Api::createApiForTest(time_system_)),
         dispatcher_(api_->allocateDispatcher("test_thread")), clock_(*dispatcher_),
-        alarm_factory_(*dispatcher_, clock_) {}
+        alarm_factory_(*dispatcher_, clock_), start_time_(clock_.Now()) {}
 
   void advanceMsAndLoop(int64_t delay_ms) {
     time_system_.advanceTimeAndRun(std::chrono::milliseconds(delay_ms), *dispatcher_,
@@ -46,6 +46,7 @@ protected:
   Event::DispatcherPtr dispatcher_;
   EnvoyQuicClock clock_;
   EnvoyQuicAlarmFactory alarm_factory_;
+  const quic::QuicTime start_time_;
   quic::QuicConnectionArena arena_;
 };
 
@@ -140,7 +141,7 @@ TEST_F(EnvoyQuicAlarmTest, PostponeDeadline) {
   // Postpone deadline to a later time.
   alarm->Update(clock_.Now() + QuicTime::Delta::FromMilliseconds(5), quic::QuicTime::Delta::Zero());
   advanceMsAndLoop(1);
-  EXPECT_EQ(10, (clock_.Now() - quic::QuicTime::Zero()).ToMilliseconds());
+  EXPECT_EQ(10, (clock_.Now() - start_time_).ToMilliseconds());
   // alarm shouldn't fire at old deadline.
   EXPECT_FALSE(unowned_delegate->fired());
 
@@ -151,7 +152,7 @@ TEST_F(EnvoyQuicAlarmTest, PostponeDeadline) {
 
 TEST_F(EnvoyQuicAlarmTest, SetAlarmToPastTime) {
   advanceMsAndLoop(100);
-  EXPECT_EQ(100, (clock_.Now() - quic::QuicTime::Zero()).ToMilliseconds());
+  EXPECT_EQ(100, (clock_.Now() - start_time_).ToMilliseconds());
   auto unowned_delegate = new TestDelegate();
   quic::QuicArenaScopedPtr<quic::QuicAlarm> alarm(alarm_factory_.CreateAlarm(unowned_delegate));
   // Alarm will be active 1ms after Update() for the purpose of avoiding firing
@@ -167,14 +168,14 @@ TEST_F(EnvoyQuicAlarmTest, UpdateAlarmWithPastDeadline) {
   quic::QuicArenaScopedPtr<quic::QuicAlarm> alarm(alarm_factory_.CreateAlarm(unowned_delegate));
   alarm->Set(clock_.Now() + QuicTime::Delta::FromMilliseconds(10));
   advanceMsAndLoop(9);
-  EXPECT_EQ(9, (clock_.Now() - quic::QuicTime::Zero()).ToMilliseconds());
+  EXPECT_EQ(9, (clock_.Now() - start_time_).ToMilliseconds());
   EXPECT_FALSE(unowned_delegate->fired());
   // Alarm will be active 1ms after Update() for the purpose of avoiding firing
   // in the same event loop.
   alarm->Update(clock_.Now() - QuicTime::Delta::FromMilliseconds(1), quic::QuicTime::Delta::Zero());
   advanceMsAndLoop(1);
   EXPECT_TRUE(unowned_delegate->fired());
-  unowned_delegate->set_fired(false);
+  unowned_delegate->setFired(false);
   advanceMsAndLoop(1);
   // alarm shouldn't fire at the original deadline.
   EXPECT_FALSE(unowned_delegate->fired());
@@ -182,7 +183,7 @@ TEST_F(EnvoyQuicAlarmTest, UpdateAlarmWithPastDeadline) {
 
 TEST_F(EnvoyQuicAlarmTest, CancelActiveAlarm) {
   advanceMsAndLoop(100);
-  EXPECT_EQ(100, (clock_.Now() - quic::QuicTime::Zero()).ToMilliseconds());
+  EXPECT_EQ(100, (clock_.Now() - start_time_).ToMilliseconds());
   auto unowned_delegate = new TestDelegate();
   quic::QuicArenaScopedPtr<quic::QuicAlarm> alarm(alarm_factory_.CreateAlarm(unowned_delegate));
   // alarm becomes active upon Set().

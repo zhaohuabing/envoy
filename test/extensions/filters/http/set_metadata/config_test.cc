@@ -7,7 +7,7 @@
 #include "source/extensions/filters/http/set_metadata/set_metadata_filter.h"
 
 #include "test/mocks/server/factory_context.h"
-#include "test/mocks/server/instance.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -22,12 +22,21 @@ using SetMetadataProtoConfig = envoy::extensions::filters::http::set_metadata::v
 
 TEST(SetMetadataFilterConfigTest, SimpleConfig) {
   const std::string yaml = R"EOF(
-metadata_namespace: thenamespace
-value:
-  mynumber: 20
-  mylist: ["b"]
-  tags:
-    mytag1: 1
+metadata:
+- metadata_namespace: thenamespace
+  value:
+    mynumber: 20
+    mylist: ["b"]
+    tags:
+      mytag1: 1
+  allow_overwrite: true
+- metadata_namespace: thenamespace
+  typed_value:
+    '@type': type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config
+    metadata_namespace: foo_namespace
+    value:
+      foo: bar
+  allow_overwrite: true
   )EOF";
 
   SetMetadataProtoConfig proto_config;
@@ -36,10 +45,69 @@ value:
   testing::NiceMock<Server::Configuration::MockFactoryContext> context;
   SetMetadataConfig factory;
 
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
+  Http::FilterFactoryCb cb =
+      factory.createFilterFactoryFromProto(proto_config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callbacks;
   EXPECT_CALL(filter_callbacks, addStreamDecoderFilter(_));
   cb(filter_callbacks);
+}
+
+TEST(SetMetadataFilterConfigTest, SimpleConfigServerContext) {
+  const std::string yaml = R"EOF(
+metadata:
+- metadata_namespace: thenamespace
+  value:
+    mynumber: 20
+    mylist: ["b"]
+    tags:
+      mytag1: 1
+  allow_overwrite: true
+- metadata_namespace: thenamespace
+  typed_value:
+    '@type': type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config
+    metadata_namespace: foo_namespace
+    value:
+      foo: bar
+  allow_overwrite: true
+  )EOF";
+
+  SetMetadataProtoConfig proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  SetMetadataConfig factory;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(proto_config, context, extra_context).value();
+  Http::MockFilterChainFactoryCallbacks filter_callbacks;
+  EXPECT_CALL(filter_callbacks, addStreamDecoderFilter(_));
+  cb(filter_callbacks);
+}
+
+TEST(SetMetadataFilterConfigTest, CreateRouteSpecificConfig) {
+  const std::string yaml = R"EOF(
+metadata:
+- metadata_namespace: thenamespace
+  value:
+    mynumber: 20
+    mylist: ["b"]
+    tags:
+      mytag1: 1
+  allow_overwrite: true
+  )EOF";
+
+  SetMetadataProtoConfig proto_config;
+  TestUtility::loadFromYamlAndValidate(yaml, proto_config);
+
+  testing::NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  SetMetadataConfig factory;
+
+  auto& validation_visitor = ProtobufMessage::getNullValidationVisitor();
+  const auto result =
+      factory.createRouteSpecificFilterConfig(proto_config, context, validation_visitor);
+  EXPECT_OK(result);
 }
 
 } // namespace SetMetadataFilter

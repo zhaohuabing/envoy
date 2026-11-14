@@ -6,6 +6,7 @@
 #include "test/test_common/environment.h"
 #include "test/test_common/utility.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 using source::extensions::filters::http::aws_lambda::Request;
@@ -23,13 +24,42 @@ public:
     // instance metadata and timing-out.
     TestEnvironment::setEnvVar("AWS_ACCESS_KEY_ID", "aws-user", 1 /*overwrite*/);
     TestEnvironment::setEnvVar("AWS_SECRET_ACCESS_KEY", "secret", 1 /*overwrite*/);
+    TestEnvironment::setEnvVar("AWS_EC2_METADATA_DISABLED", "true", 1 /*overwrite*/);
     setUpstreamProtocol(Http::CodecType::HTTP1);
   }
 
   void TearDown() override { fake_upstream_connection_.reset(); }
 
-  void setupLambdaFilter(bool passthrough) {
-    const std::string filter =
+  void addUpstreamProtocolOptions() {
+    config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      auto* cluster = bootstrap.mutable_static_resources()->mutable_clusters(0);
+
+      ConfigHelper::HttpProtocolOptions protocol_options;
+      protocol_options.mutable_upstream_http_protocol_options()->set_auto_sni(true);
+      protocol_options.mutable_upstream_http_protocol_options()->set_auto_san_validation(true);
+      protocol_options.mutable_explicit_http_config()->mutable_http_protocol_options();
+      ConfigHelper::setProtocolOptions(*cluster, protocol_options);
+    });
+  }
+
+  void replaceRoute() {
+    config_helper_.addConfigModifier(
+        [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+                hcm) {
+          auto* vhost = hcm.mutable_route_config()->mutable_virtual_hosts(0);
+          vhost->clear_routes();
+          auto route = vhost->add_routes();
+          auto* match = route->mutable_match();
+          match->set_prefix("/api/lambda/");
+          auto* action = route->mutable_route();
+          action->set_cluster("cluster_0");
+          action->set_prefix_rewrite("/new_path/");
+          action->set_host_rewrite_literal("lambda.us-east-2.amazonaws.com");
+        });
+  }
+
+  void setupLambdaFilter(bool passthrough, bool downstream) {
+    constexpr absl::string_view filter =
         R"EOF(
             name: envoy.filters.http.aws_lambda
             typed_config:
@@ -37,13 +67,18 @@ public:
               arn: "arn:aws:lambda:us-west-2:123456789:function:test"
               payload_passthrough: {}
             )EOF";
-    config_helper_.prependFilter(fmt::format(filter, passthrough));
+    config_helper_.prependFilter(fmt::format(filter, passthrough), downstream);
 
-    constexpr auto metadata_yaml = R"EOF(
+    if (!downstream) {
+      addUpstreamProtocolOptions();
+      replaceRoute();
+    } else {
+      constexpr auto metadata_yaml = R"EOF(
         com.amazonaws.lambda:
           egress_gateway: true
         )EOF";
-    config_helper_.addClusterFilterMetadata(metadata_yaml);
+      config_helper_.addClusterFilterMetadata(metadata_yaml);
+    }
   }
 
   template <typename TMap>
@@ -156,8 +191,8 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, AwsLambdaFilterIntegrationTest,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                          TestUtility::ipTestParamsToString);
 
-TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedHeaderOnlyRequest) {
-  setupLambdaFilter(false /*passthrough*/);
+TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedHeaderOnlyRequestDownstream) {
+  setupLambdaFilter(false /*passthrough*/, true);
   HttpIntegrationTest::initialize();
 
   Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
@@ -202,7 +237,7 @@ TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedHeaderOnlyRequest) {
 }
 
 TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedPlainBody) {
-  setupLambdaFilter(false /*passthrough*/);
+  setupLambdaFilter(false /*passthrough*/, true);
   HttpIntegrationTest::initialize();
 
   Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
@@ -251,7 +286,7 @@ TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedPlainBody) {
 }
 
 TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedBinaryBody) {
-  setupLambdaFilter(false /*passthrough*/);
+  setupLambdaFilter(false /*passthrough*/, true);
   HttpIntegrationTest::initialize();
 
   Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
@@ -297,6 +332,250 @@ TEST_P(AwsLambdaFilterIntegrationTest, JsonWrappedBinaryBody) {
   runTest(request_headers, request_body, expected_json_request, lambda_response_headers,
           lambda_response_body, expected_response_headers, expected_response_cookies,
           expected_response_body);
+}
+
+TEST_P(AwsLambdaFilterIntegrationTest, UpstreamShouldBeProcessedAfterRoute) {
+  setupLambdaFilter(false /*passthrough*/, false);
+  HttpIntegrationTest::initialize();
+
+  Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
+                                                 {":method", "GET"},
+                                                 {":path", "/api/lambda/resize?type=jpg"},
+                                                 {":authority", "host"},
+                                                 {"s3-location", "mybucket/images/123.jpg"}};
+  constexpr auto expected_json_request = R"EOF(
+  {
+    "rawPath": "/new_path/resize?type=jpg",
+    "method": "GET",
+    "headers":{ "s3-location": "mybucket/images/123.jpg"},
+    "queryStringParameters": {"type":"jpg"},
+    "body": "",
+    "isBase64Encoded": false
+  }
+  )EOF";
+
+  const std::string lambda_response_body = R"EOF(
+  {
+      "body": "my-bucket/123-small.jpg",
+      "isBase64Encoded": false,
+      "statusCode": 200,
+      "cookies": ["user=John", "session-id=1337"],
+      "headers": {"x-amz-custom-header": "envoy,proxy"}
+  }
+  )EOF";
+
+  Http::TestResponseHeaderMapImpl lambda_response_headers{
+      {":status", "201"},
+      {"content-type", "application/json"},
+      {"content-length", fmt::format("{}", lambda_response_body.length())}};
+
+  Http::TestResponseHeaderMapImpl expected_response_headers{{":status", "200"},
+                                                            {"content-type", "application/json"},
+                                                            {"x-amz-custom-header", "envoy,proxy"}};
+  std::vector<std::string> expected_response_cookies{"user=John", "session-id=1337"};
+  constexpr auto expected_response_body = "my-bucket/123-small.jpg";
+  runTest(request_headers, "" /*request_body*/, expected_json_request, lambda_response_headers,
+          lambda_response_body, expected_response_headers, expected_response_cookies,
+          expected_response_body);
+}
+
+TEST_P(AwsLambdaFilterIntegrationTest, ExcludeHeadersFromSigning) {
+  const std::string filter_config = R"EOF(
+    name: envoy.filters.http.aws_lambda
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.aws_lambda.v3.Config
+      arn: "arn:aws:lambda:us-west-2:123456789:function:test"
+      payload_passthrough: true
+      match_excluded_headers:
+        - prefix: x-amzn
+        - exact: x-custom-exclude
+  )EOF";
+
+  config_helper_.prependFilter(filter_config, true);
+
+  constexpr auto metadata_yaml = R"EOF(
+    com.amazonaws.lambda:
+      egress_gateway: true
+  )EOF";
+  config_helper_.addClusterFilterMetadata(metadata_yaml);
+
+  HttpIntegrationTest::initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
+                                                 {":method", "GET"},
+                                                 {":path", "/test"},
+                                                 {":authority", "host"},
+                                                 {"x-amzn-vpc-id", "vpc-12345"},
+                                                 {"x-amzn-trace-id", "trace-abc"},
+                                                 {"x-custom-exclude", "should-not-sign"},
+                                                 {"x-custom-include", "should-sign"}};
+
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // Verify that Authorization header is present (signing occurred)
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("authorization")).empty());
+
+  // Verify excluded headers are still forwarded but not in signed headers
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-amzn-vpc-id")).empty());
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-amzn-trace-id")).empty());
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-custom-exclude")).empty());
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-custom-include")).empty());
+
+  // Get the Authorization header to verify excluded headers are not in SignedHeaders
+  auto auth_header = upstream_request_->headers().get(Http::LowerCaseString("authorization"));
+  ASSERT_FALSE(auth_header.empty());
+  std::string auth_value(auth_header[0]->value().getStringView());
+
+  // Verify that custom headers and x-custom-exclude are not in SignedHeaders
+  EXPECT_THAT(auth_value, testing::Not(testing::HasSubstr("x-amzn-vpc-id")));
+  EXPECT_THAT(auth_value, testing::Not(testing::HasSubstr("x-amzn-trace-id")));
+  EXPECT_THAT(auth_value, testing::Not(testing::HasSubstr("x-custom-exclude")));
+
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  upstream_request_->encodeHeaders(response_headers, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  codec_client_->close();
+  ASSERT_TRUE(fake_upstream_connection_->close());
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+}
+
+TEST_P(AwsLambdaFilterIntegrationTest, IncludeHeadersInSigning) {
+  const std::string filter_config = R"EOF(
+    name: envoy.filters.http.aws_lambda
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.aws_lambda.v3.Config
+      arn: "arn:aws:lambda:us-west-2:123456789:function:test"
+      payload_passthrough: true
+      match_included_headers:
+        - prefix: x-custom
+        - exact: user-agent
+  )EOF";
+
+  config_helper_.prependFilter(filter_config, true);
+
+  constexpr auto metadata_yaml = R"EOF(
+    com.amazonaws.lambda:
+      egress_gateway: true
+  )EOF";
+  config_helper_.addClusterFilterMetadata(metadata_yaml);
+
+  HttpIntegrationTest::initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
+                                                 {":method", "POST"},
+                                                 {":path", "/test"},
+                                                 {":authority", "host"},
+                                                 {"x-custom-header", "custom-value"},
+                                                 {"user-agent", "test-agent"},
+                                                 {"x-other-header", "other-value"}};
+
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // Verify that Authorization header is present (signing occurred)
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("authorization")).empty());
+
+  // Verify all headers are still forwarded
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-custom-header")).empty());
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("user-agent")).empty());
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-other-header")).empty());
+
+  // Get the Authorization header to verify only included headers are in SignedHeaders
+  auto auth_header = upstream_request_->headers().get(Http::LowerCaseString("authorization"));
+  ASSERT_FALSE(auth_header.empty());
+  std::string auth_value(auth_header[0]->value().getStringView());
+
+  // Verify that included headers are in SignedHeaders
+  EXPECT_THAT(auth_value, testing::HasSubstr("x-custom-header"));
+  EXPECT_THAT(auth_value, testing::HasSubstr("user-agent"));
+
+  // Verify that non-included headers are not in SignedHeaders (except required headers like host)
+  EXPECT_THAT(auth_value, testing::Not(testing::HasSubstr("x-other-header")));
+
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  upstream_request_->encodeHeaders(response_headers, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  codec_client_->close();
+  ASSERT_TRUE(fake_upstream_connection_->close());
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+}
+
+TEST_P(AwsLambdaFilterIntegrationTest, ExcludeHeadersUpstream) {
+  const std::string filter_config = R"EOF(
+    name: envoy.filters.http.aws_lambda
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.aws_lambda.v3.Config
+      arn: "arn:aws:lambda:us-west-2:123456789:function:test"
+      payload_passthrough: true
+      match_excluded_headers:
+        - prefix: x-amzn
+  )EOF";
+
+  config_helper_.prependFilter(filter_config, false);
+  addUpstreamProtocolOptions();
+
+  constexpr auto metadata_yaml = R"EOF(
+    com.amazonaws.lambda:
+      egress_gateway: true
+  )EOF";
+  config_helper_.addClusterFilterMetadata(metadata_yaml);
+
+  HttpIntegrationTest::initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl request_headers{{":scheme", "http"},
+                                                 {":method", "GET"},
+                                                 {":path", "/test"},
+                                                 {":authority", "host"},
+                                                 {"x-amzn-vpc-id", "vpc-12345"}};
+
+  auto response = codec_client_->makeHeaderOnlyRequest(request_headers);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+
+  // Verify that Authorization header is present
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("authorization")).empty());
+
+  // Verify custom header is still forwarded
+  EXPECT_FALSE(upstream_request_->headers().get(Http::LowerCaseString("x-amzn-vpc-id")).empty());
+
+  // Get the Authorization header to verify custom header is not in SignedHeaders
+  auto auth_header = upstream_request_->headers().get(Http::LowerCaseString("authorization"));
+  ASSERT_FALSE(auth_header.empty());
+  std::string auth_value(auth_header[0]->value().getStringView());
+  EXPECT_THAT(auth_value, testing::Not(testing::HasSubstr("x-amzn-vpc-id")));
+
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  upstream_request_->encodeHeaders(response_headers, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+
+  codec_client_->close();
+  ASSERT_TRUE(fake_upstream_connection_->close());
+  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
 }
 
 } // namespace

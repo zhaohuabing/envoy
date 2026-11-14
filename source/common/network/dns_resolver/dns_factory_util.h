@@ -25,9 +25,8 @@ void makeDefaultAppleDnsResolverConfig(
 void makeDefaultDnsResolverConfig(
     envoy::config::core::v3::TypedExtensionConfig& typed_dns_resolver_config);
 
-// If it is MacOS and the run time flag: envoy.restart_features.use_apple_api_for_dns_lookups
-// is enabled, create an AppleDnsResolverConfig typed config.
-bool checkUseAppleApiForDnsLookups(
+// If it is MacOS and it's compiled it, create an AppleDnsResolverConfig typed config.
+bool tryUseAppleApiForDnsLookups(
     envoy::config::core::v3::TypedExtensionConfig& typed_dns_resolver_config);
 
 // If the config has typed_dns_resolver_config, copy it over.
@@ -55,7 +54,7 @@ bool checkDnsResolutionConfigExist(
     }
     cares.mutable_dns_resolver_options()->MergeFrom(
         config.dns_resolution_config().dns_resolver_options());
-    typed_dns_resolver_config.mutable_typed_config()->PackFrom(cares);
+    std::ignore = typed_dns_resolver_config.mutable_typed_config()->PackFrom(cares);
     typed_dns_resolver_config.set_name(std::string(CaresDnsResolver));
     return true;
   }
@@ -71,7 +70,7 @@ void handleLegacyDnsResolverData(
   envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig cares;
   cares.mutable_dns_resolver_options()->set_use_tcp_for_dns_lookups(
       config.use_tcp_for_dns_lookups());
-  typed_dns_resolver_config.mutable_typed_config()->PackFrom(cares);
+  std::ignore = typed_dns_resolver_config.mutable_typed_config()->PackFrom(cares);
   typed_dns_resolver_config.set_name(std::string(CaresDnsResolver));
 }
 
@@ -97,7 +96,7 @@ envoy::config::core::v3::TypedExtensionConfig makeDnsResolverConfig(const Config
   }
 
   // If use apple API for DNS lookups, create an AppleDnsResolverConfig typed config.
-  if (checkUseAppleApiForDnsLookups(typed_dns_resolver_config)) {
+  if (tryUseAppleApiForDnsLookups(typed_dns_resolver_config)) {
     return typed_dns_resolver_config;
   }
 
@@ -131,7 +130,7 @@ template <class ConfigType>
 Network::DnsResolverFactory& createDnsResolverFactoryFromProto(
     const ConfigType& config,
     envoy::config::core::v3::TypedExtensionConfig& typed_dns_resolver_config) {
-  ASSERT(Thread::MainThread::isMainOrTestThread());
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
   typed_dns_resolver_config = makeDnsResolverConfig(config);
   return createDnsResolverFactoryFromTypedConfig(typed_dns_resolver_config);
 }
