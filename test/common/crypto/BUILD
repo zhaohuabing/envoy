@@ -15,13 +15,12 @@ envoy_cc_test(
     srcs = [
         "utility_test.cc",
     ],
-    external_deps = [
-        "ssl",
-    ],
+    external_deps = ["ssl"],
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/common/common:hex_lib",
         "//source/common/crypto:utility_lib",
+        "//test/test_common:status_utility_lib",
     ],
 )
 
@@ -34,7 +33,11 @@ envoy_cc_fuzz_test(
     name = "get_sha_256_digest_fuzz_test",
     srcs = ["get_sha_256_digest_fuzz_test.cc"],
     corpus = "get_sha_256_digest_corpus",
-    deps = ["//source/common/crypto:utility_lib"],
+    external_deps = ["abseil_strings"],
+    deps = [
+        "//source/common/common:assert_lib",
+        "//source/common/crypto:utility_lib",
+    ],
 )
 
 envoy_cc_fuzz_test(

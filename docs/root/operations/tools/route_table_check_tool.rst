@@ -15,12 +15,17 @@ Usage
       The tool config input file specifies urls (composed of authorities and paths)
       and expected route parameter values. Additional parameters such as additional headers are optional.
 
-      Schema: All internal schemas in the tool are based on :repo:`proto3 <test/tools/router_check/validation.proto>`.
+      Schema: All internal schemas in the tool are based on :repo:`proto3 <tools/router_check/validation.proto>`.
 
     -c <string>,  --config-path <string>
-      Path to a v2 router config file (YAML or JSON). The router config file schema is found in
+      Path to a router config file (YAML or JSON). The router config file schema is found in
       :ref:`config <envoy_v3_api_file_envoy/config/route/v3/route.proto>` and the config file extension
       must reflect its file type (for instance, .json for JSON and .yaml for YAML).
+
+    -o <string>,  --output-path <string>
+      Path to a file where to write test results as binary proto. If the file already exists,
+      an attempt to overwrite it will be made. The validation result schema is found in
+      :repo:`proto3 <tools/router_check/validation.proto>`.
 
     -d,  --details
       Show detailed test execution results. The first line indicates the test name.
@@ -37,6 +42,9 @@ Usage
 
     --disable-deprecation-check
       Disables the deprecation check for RouteConfiguration proto.
+
+    --detailed-coverage
+      Enables displaying of not covered routes for non-comprehensive code coverage mode.
 
     -h,  --help
       Displays usage information and exits.
@@ -60,15 +68,20 @@ Output
     locations ats cluster_name
     Test_6
 
+  If an ``--output-path`` option is specified, then a ``ValidationResult`` proto message with the test results is written to a file.
+  If the ``--only-show-failures`` flag is provided, only the failed test cases are written to a file.
+
 Building
+  The tool is included in the :ref:`tools image <install_tools>`.
+
   The tool can be built locally using Bazel. ::
 
-    bazel build //test/tools/router_check:router_check_tool
+    bazel build //tools/router_check:router_check_tool
 
 Running
   Example ::
 
-    bazel-bin/test/tools/router_check/router_check_tool -c router_config.(yaml|json) -t tool_config.json --details
+    bazel-bin/tools/router_check/router_check_tool -c router_config.(yaml|json) -t tool_config.json --details
 
 Testing
   A bash shell script test can be run with bazel. The test compares routes using different router and

@@ -42,8 +42,8 @@ void BufferFilter::initConfig() {
   config_initialized_ = true;
   settings_ = config_->settings();
 
-  const auto* route_local = Http::Utility::resolveMostSpecificPerFilterConfig<BufferFilterSettings>(
-      "envoy.filters.http.buffer", callbacks_->route());
+  const auto* route_local =
+      Http::Utility::resolveMostSpecificPerFilterConfig<BufferFilterSettings>(callbacks_);
   settings_ = route_local ? route_local : settings_;
 }
 
@@ -60,7 +60,7 @@ Http::FilterHeadersStatus BufferFilter::decodeHeaders(Http::RequestHeaderMap& he
     return Http::FilterHeadersStatus::Continue;
   }
 
-  callbacks_->setDecoderBufferLimit(settings_->maxRequestBytes());
+  callbacks_->setBufferLimit(settings_->maxRequestBytes());
   request_headers_ = &headers;
 
   return Http::FilterHeadersStatus::StopIteration;

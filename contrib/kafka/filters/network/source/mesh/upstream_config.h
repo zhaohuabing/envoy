@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -9,7 +10,6 @@
 
 #include "source/common/common/logger.h"
 
-#include "absl/types/optional.h"
 #include "contrib/envoy/extensions/filters/network/kafka_mesh/v3alpha/kafka_mesh.pb.h"
 #include "contrib/envoy/extensions/filters/network/kafka_mesh/v3alpha/kafka_mesh.pb.validate.h"
 
@@ -39,9 +39,14 @@ struct ClusterConfig {
   // producer property.
   std::map<std::string, std::string> upstream_producer_properties_;
 
+  // This map always contains entries with keys 'bootstrap.servers' and 'group.id', as these are the
+  // only mandatory consumer properties.
+  std::map<std::string, std::string> upstream_consumer_properties_;
+
   bool operator==(const ClusterConfig& rhs) const {
     return name_ == rhs.name_ && partition_count_ == rhs.partition_count_ &&
-           upstream_producer_properties_ == rhs.upstream_producer_properties_;
+           upstream_producer_properties_ == rhs.upstream_producer_properties_ &&
+           upstream_consumer_properties_ == rhs.upstream_consumer_properties_;
   }
 };
 
@@ -58,7 +63,7 @@ public:
 
   // Provides cluster for given Kafka topic, according to the rules contained within this
   // configuration object.
-  virtual absl::optional<ClusterConfig>
+  virtual std::optional<ClusterConfig>
   computeClusterConfigForTopic(const std::string& topic) const PURE;
 };
 
@@ -73,7 +78,7 @@ public:
   UpstreamKafkaConfigurationImpl(const KafkaMeshProtoConfig& config);
 
   // UpstreamKafkaConfiguration
-  absl::optional<ClusterConfig>
+  std::optional<ClusterConfig>
   computeClusterConfigForTopic(const std::string& topic) const override;
 
   // UpstreamKafkaConfiguration

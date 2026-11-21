@@ -14,7 +14,7 @@ FileEventImpl::FileEventImpl(Event::Dispatcher& dispatcher, Event::FileReadyCb c
         auto ephemeral_events = event_listener_.getAndClearEphemeralEvents();
         ENVOY_LOG(trace, "User space event {} invokes callbacks on events = {}",
                   static_cast<void*>(this), ephemeral_events);
-        cb(ephemeral_events);
+        THROW_IF_NOT_OK(cb(ephemeral_events));
       })),
       io_source_(io_source) {
   setEnabled(events);
@@ -41,13 +41,13 @@ void FileEventImpl::setEnabled(uint32_t events) {
   uint32_t events_to_notify = 0;
   if ((events & Event::FileReadyType::Read) && (io_source_.isReadable() ||
                                                 // Notify Read event when end-of-stream is received.
-                                                io_source_.isPeerShutDownWrite())) {
+                                                io_source_.hasReceivedEof())) {
     events_to_notify |= Event::FileReadyType::Read;
   }
-  if ((events & Event::FileReadyType::Write) && io_source_.isPeerWritable()) {
+  if ((events & Event::FileReadyType::Write) && io_source_.isWriteUnblocked()) {
     events_to_notify |= Event::FileReadyType::Write;
   }
-  if ((events & Event::FileReadyType::Closed) && io_source_.isPeerShutDownWrite()) {
+  if ((events & Event::FileReadyType::Closed) && io_source_.hasReceivedEof()) {
     events_to_notify |= Event::FileReadyType::Closed;
   }
   if (events_to_notify != 0) {
@@ -57,7 +57,7 @@ void FileEventImpl::setEnabled(uint32_t events) {
   }
   ENVOY_LOG(
       trace,
-      "User space file event {} set enabled events {} and events {} is active. Will {} reschedule.",
+      "User space file event {} set enabled events {} and events {} is active. Will {}reschedule.",
       static_cast<void*>(this), events, events_to_notify, was_enabled ? "not " : "");
 }
 

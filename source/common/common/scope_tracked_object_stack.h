@@ -3,6 +3,7 @@
 #include <functional>
 #include <vector>
 
+#include "envoy/common/execution_context.h"
 #include "envoy/common/scope_tracker.h"
 
 namespace Envoy {
@@ -22,7 +23,19 @@ public:
 
   void add(const ScopeTrackedObject& object) { tracked_objects_.push_back(object); }
 
+  OptRef<const StreamInfo::StreamInfo> trackedStream() const override {
+    // NOLINTNEXTLINE(modernize-loop-convert)
+    for (auto iter = tracked_objects_.rbegin(); iter != tracked_objects_.rend(); ++iter) {
+      OptRef<const StreamInfo::StreamInfo> stream = iter->get().trackedStream();
+      if (stream.has_value()) {
+        return stream;
+      }
+    }
+    return {};
+  }
+
   void dumpState(std::ostream& os, int indent_level) const override {
+    // NOLINTNEXTLINE(modernize-loop-convert)
     for (auto iter = tracked_objects_.rbegin(); iter != tracked_objects_.rend(); ++iter) {
       iter->get().dumpState(os, indent_level);
     }

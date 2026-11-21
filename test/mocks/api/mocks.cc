@@ -1,5 +1,7 @@
 #include "mocks.h"
 
+#include <cstring>
+
 #include "source/common/common/assert.h"
 #include "source/common/common/lock_guard.h"
 
@@ -7,7 +9,6 @@
 #include "gtest/gtest.h"
 
 using testing::_;
-using testing::Invoke;
 using testing::ReturnRef;
 
 namespace Envoy {
@@ -15,7 +16,7 @@ namespace Api {
 
 MockApi::MockApi() {
   ON_CALL(*this, fileSystem()).WillByDefault(ReturnRef(file_system_));
-  ON_CALL(*this, rootScope()).WillByDefault(ReturnRef(stats_store_));
+  ON_CALL(*this, rootScope()).WillByDefault(ReturnRef(*stats_store_.rootScope()));
   ON_CALL(*this, randomGenerator()).WillByDefault(ReturnRef(random_));
   ON_CALL(*this, bootstrap()).WillByDefault(ReturnRef(empty_bootstrap_));
 }
@@ -38,7 +39,7 @@ Event::DispatcherPtr MockApi::allocateDispatcher(const std::string& name,
 }
 
 MockOsSysCalls::MockOsSysCalls() {
-  ON_CALL(*this, close(_)).WillByDefault(Invoke([](os_fd_t fd) {
+  ON_CALL(*this, close(_)).WillByDefault([](os_fd_t fd) {
 #ifdef WIN32
     int rc = ::closesocket(fd);
     int last_error = ::GetLastError();
@@ -53,21 +54,23 @@ MockOsSysCalls::MockOsSysCalls() {
     const int rc = ::close(fd);
     return SysCallIntResult{rc, errno};
 #endif
-  }));
+  });
 }
 
 MockOsSysCalls::~MockOsSysCalls() = default;
 
 SysCallIntResult MockOsSysCalls::setsockopt(os_fd_t sockfd, int level, int optname,
                                             const void* optval, socklen_t optlen) {
-  ASSERT(optlen == sizeof(int));
-
   // Allow mocking system call failure.
   if (setsockopt_(sockfd, level, optname, optval, optlen) != 0) {
     return SysCallIntResult{-1, 0};
   }
 
-  boolsockopts_[SockOptKey(sockfd, level, optname)] = !!*reinterpret_cast<const int*>(optval);
+  if (optlen >= sizeof(int)) {
+    int val = 0;
+    memcpy(&val, optval, sizeof(int));
+    boolsockopts_[SockOptKey(sockfd, level, optname)] = (val != 0);
+  }
   return SysCallIntResult{0, 0};
 };
 

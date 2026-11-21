@@ -10,7 +10,6 @@ namespace Envoy {
 namespace Upstream {
 
 using ::testing::_;
-using ::testing::Invoke;
 using ::testing::ReturnPointee;
 using ::testing::ReturnRef;
 
@@ -19,13 +18,13 @@ MockPrioritySet::MockPrioritySet() {
   ON_CALL(*this, hostSetsPerPriority()).WillByDefault(ReturnRef(host_sets_));
   ON_CALL(testing::Const(*this), hostSetsPerPriority()).WillByDefault(ReturnRef(host_sets_));
   ON_CALL(*this, addMemberUpdateCb(_))
-      .WillByDefault(Invoke([this](PrioritySet::MemberUpdateCb cb) -> Common::CallbackHandlePtr {
+      .WillByDefault([this](PrioritySet::MemberUpdateCb cb) -> Common::CallbackHandlePtr {
         return member_update_cb_helper_.add(cb);
-      }));
+      });
   ON_CALL(*this, addPriorityUpdateCb(_))
-      .WillByDefault(Invoke([this](PrioritySet::PriorityUpdateCb cb) -> Common::CallbackHandlePtr {
+      .WillByDefault([this](PrioritySet::PriorityUpdateCb cb) -> Common::CallbackHandlePtr {
         return priority_update_cb_helper_.add(cb);
-      }));
+      });
   ON_CALL(*this, crossPriorityHostMap()).WillByDefault(ReturnPointee(&cross_priority_host_map_));
 }
 
@@ -40,6 +39,7 @@ HostSet& MockPrioritySet::getHostSet(uint32_t priority) {
           host_set->addMemberUpdateCb([this](uint32_t priority, const HostVector& hosts_added,
                                              const HostVector& hosts_removed) {
             runUpdateCallbacks(priority, hosts_added, hosts_removed);
+            return absl::OkStatus();
           }));
     }
   }
@@ -48,8 +48,8 @@ HostSet& MockPrioritySet::getHostSet(uint32_t priority) {
 
 void MockPrioritySet::runUpdateCallbacks(uint32_t priority, const HostVector& hosts_added,
                                          const HostVector& hosts_removed) {
-  member_update_cb_helper_.runCallbacks(hosts_added, hosts_removed);
   priority_update_cb_helper_.runCallbacks(priority, hosts_added, hosts_removed);
+  member_update_cb_helper_.runCallbacks(hosts_added, hosts_removed);
 }
 
 } // namespace Upstream

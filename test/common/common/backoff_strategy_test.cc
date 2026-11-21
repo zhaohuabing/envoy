@@ -1,10 +1,13 @@
 #include "source/common/common/backoff_strategy.h"
 
 #include "test/mocks/common.h"
+#include "test/test_common/status_utility.h"
 
 #include "gtest/gtest.h"
 
+using Envoy::StatusHelpers::IsOk;
 using testing::NiceMock;
+using testing::Not;
 using testing::Return;
 
 namespace Envoy {
@@ -29,9 +32,6 @@ TEST(ExponentialBackOffStrategyTest, JitteredBackOffBasicReset) {
   jittered_back_off.reset();
   EXPECT_EQ(2, jittered_back_off.nextBackOffMs()); // Should start from start
   EXPECT_EQ(27, jittered_back_off.nextBackOffMs());
-
-  jittered_back_off.reset(26);
-  EXPECT_EQ(1, jittered_back_off.nextBackOffMs()); // 26 % 27
 }
 
 TEST(ExponentialBackOffStrategyTest, JitteredBackOffDoesntOverflow) {
@@ -81,9 +81,6 @@ TEST(ExponentialBackOffStrategyTest, JitteredBackOffWithMaxIntervalReset) {
   EXPECT_EQ(79, jittered_back_off.nextBackOffMs());
   EXPECT_EQ(99, jittered_back_off.nextBackOffMs()); // Should return Max here
   EXPECT_EQ(99, jittered_back_off.nextBackOffMs());
-
-  jittered_back_off.reset(4);
-  EXPECT_EQ(3, jittered_back_off.nextBackOffMs());
 }
 
 TEST(LowerBoundBackOffStrategyTest, JitteredBackOffWithLowRandomValue) {
@@ -109,9 +106,33 @@ TEST(FixedBackOffStrategyTest, FixedBackOffBasicReset) {
 
   fixed_back_off.reset();
   EXPECT_EQ(30, fixed_back_off.nextBackOffMs());
+}
 
-  fixed_back_off.reset(20);
-  EXPECT_EQ(20, fixed_back_off.nextBackOffMs());
+TEST(BackOffStrategyUtilsTest, InvalidConfig) {
+  {
+    // Valid config.
+    envoy::config::core::v3::BackoffStrategy backoff_strategy;
+    backoff_strategy.mutable_base_interval()->set_seconds(2);
+    backoff_strategy.mutable_max_interval()->set_seconds(3);
+    EXPECT_OK(BackOffStrategyUtils::validateBackOffStrategyConfig(backoff_strategy, 1, 10));
+  }
+
+  {
+    // Max interval is lower than base interval.
+    envoy::config::core::v3::BackoffStrategy backoff_strategy;
+    backoff_strategy.mutable_base_interval()->set_seconds(3);
+    backoff_strategy.mutable_max_interval()->set_seconds(2);
+    EXPECT_THAT(BackOffStrategyUtils::validateBackOffStrategyConfig(backoff_strategy, 1, 10),
+                Not(IsOk()));
+  }
+
+  {
+    // Max interval is lower than base interval.
+    envoy::config::core::v3::BackoffStrategy backoff_strategy;
+    backoff_strategy.mutable_max_interval()->set_nanos(2000000);
+    EXPECT_THAT(BackOffStrategyUtils::validateBackOffStrategyConfig(backoff_strategy, 3, 10),
+                Not(IsOk()));
+  }
 }
 
 } // namespace Envoy

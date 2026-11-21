@@ -15,12 +15,12 @@
 #include "source/common/common/assert.h"
 #include "source/common/common/empty_string.h"
 #include "source/common/common/fmt.h"
+#include "source/common/config/well_known_names.h"
 #include "source/common/http/codes.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
-#include "source/common/stats/utility.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -33,8 +33,9 @@ struct RcDetailsValues {
 };
 using RcDetails = ConstSingleton<RcDetailsValues>;
 
-FaultSettings::FaultSettings(const envoy::extensions::filters::http::fault::v3::HTTPFault& fault)
-    : fault_filter_headers_(Http::HeaderUtility::buildHeaderDataVector(fault.headers())),
+FaultSettings::FaultSettings(const envoy::extensions::filters::http::fault::v3::HTTPFault& fault,
+                             Server::Configuration::CommonFactoryContext& context)
+    : fault_filter_headers_(Http::HeaderUtility::buildHeaderDataVector(fault.headers(), context)),
       delay_percent_runtime_(PROTOBUF_GET_STRING_OR_DEFAULT(fault, delay_percent_runtime,
                                                             RuntimeKeys::get().DelayPercentKey)),
       abort_percent_runtime_(PROTOBUF_GET_STRING_OR_DEFAULT(fault, abort_percent_runtime,
@@ -50,7 +51,8 @@ FaultSettings::FaultSettings(const envoy::extensions::filters::http::fault::v3::
       response_rate_limit_percent_runtime_(
           PROTOBUF_GET_STRING_OR_DEFAULT(fault, response_rate_limit_percent_runtime,
                                          RuntimeKeys::get().ResponseRateLimitPercentKey)),
-      disable_downstream_cluster_stats_(fault.disable_downstream_cluster_stats()) {
+      disable_downstream_cluster_stats_(fault.disable_downstream_cluster_stats()),
+      filter_metadata_(fault.filter_metadata()) {
   if (fault.has_abort()) {
     request_abort_config_ =
         std::make_unique<Filters::Common::Fault::FaultAbortConfig>(fault.abort());
@@ -78,19 +80,33 @@ FaultSettings::FaultSettings(const envoy::extensions::filters::http::fault::v3::
 }
 
 FaultFilterConfig::FaultFilterConfig(
-    const envoy::extensions::filters::http::fault::v3::HTTPFault& fault, Runtime::Loader& runtime,
-    const std::string& stats_prefix, Stats::Scope& scope, TimeSource& time_source)
-    : settings_(fault), runtime_(runtime), stats_(generateStats(stats_prefix, scope)),
-      scope_(scope), time_source_(time_source),
+    const envoy::extensions::filters::http::fault::v3::HTTPFault& fault,
+    const std::string& stats_prefix, Stats::Scope& scope,
+    Server::Configuration::CommonFactoryContext& context)
+    : settings_(fault, context), runtime_(context.runtime()),
+      stats_(generateStats(stats_prefix, scope)), scope_(scope), time_source_(context.timeSource()),
       stat_name_set_(scope.symbolTable().makeSet("Fault")),
+      aborts_dry_run_(stat_name_set_->add("aborts_dry_run")),
       aborts_injected_(stat_name_set_->add("aborts_injected")),
       delays_injected_(stat_name_set_->add("delays_injected")),
-      stats_prefix_(stat_name_set_->add(absl::StrCat(stats_prefix, "fault"))) {}
+      stats_prefix_(stat_name_set_->add(absl::StrCat(stats_prefix, "fault"))),
+      downstream_cluster_tag_(
+          stat_name_set_->add(Envoy::Config::TagNames::get().FAULT_DOWNSTREAM_CLUSTER)),
+      aborts_dry_run_base_(stat_name_set_->add(absl::StrCat(stats_prefix, "fault.aborts_dry_run"))),
+      aborts_injected_base_(
+          stat_name_set_->add(absl::StrCat(stats_prefix, "fault.aborts_injected"))),
+      delays_injected_base_(
+          stat_name_set_->add(absl::StrCat(stats_prefix, "fault.delays_injected"))) {}
 
-void FaultFilterConfig::incCounter(Stats::StatName downstream_cluster, Stats::StatName stat_name) {
+void FaultFilterConfig::incCounter(Stats::StatName downstream_cluster, Stats::StatName stat_name,
+                                   Stats::StatName base_name) {
   if (!settings_.disableDownstreamClusterStats()) {
-    Stats::Utility::counterFromStatNames(scope_, {stats_prefix_, downstream_cluster, stat_name})
-        .inc();
+    // '<stats_prefix>fault.<downstream_cluster>.<stat_name>', with the downstream cluster as its
+    // tag; the tag-extracted name (the pre-joined base_name) drops the cluster segment.
+    const Stats::StatNameJoiner name({stats_prefix_, downstream_cluster, stat_name},
+                                     scope_.constSymbolTable());
+    const Stats::StatNameTag tag{downstream_cluster_tag_, downstream_cluster};
+    scope_.counterFromTaggedName(base_name, Stats::StatNameTagSpan{tag}, name.statName()).inc();
   }
 }
 
@@ -111,8 +127,8 @@ Http::FilterHeadersStatus FaultFilter::decodeHeaders(Http::RequestHeaderMap& hea
   // faults. In other words, runtime is supported only when faults are
   // configured at the filter level.
   fault_settings_ = config_->settings();
-  const auto* per_route_settings = Http::Utility::resolveMostSpecificPerFilterConfig<FaultSettings>(
-      "envoy.filters.http.fault", decoder_callbacks_->route());
+  const auto* per_route_settings =
+      Http::Utility::resolveMostSpecificPerFilterConfig<FaultSettings>(decoder_callbacks_);
   fault_settings_ = per_route_settings ? per_route_settings : fault_settings_;
 
   if (!matchesTargetUpstreamCluster()) {
@@ -161,27 +177,34 @@ Http::FilterHeadersStatus FaultFilter::decodeHeaders(Http::RequestHeaderMap& hea
 }
 
 bool FaultFilter::maybeSetupDelay(const Http::RequestHeaderMap& request_headers) {
-  absl::optional<std::chrono::milliseconds> duration = delayDuration(request_headers);
+  std::optional<std::chrono::milliseconds> duration = delayDuration(request_headers);
   if (duration.has_value() && tryIncActiveFaults()) {
     delay_timer_ = decoder_callbacks_->dispatcher().createTimer(
         [this, &request_headers]() -> void { postDelayInjection(request_headers); });
     ENVOY_LOG(debug, "fault: delaying request {}ms", duration.value().count());
     delay_timer_->enableTimer(duration.value(), &decoder_callbacks_->scope());
     recordDelaysInjectedStats();
-    decoder_callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::DelayInjected);
+    decoder_callbacks_->streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::DelayInjected);
+    setFilterMetadata();
     return true;
   }
   return false;
 }
 
 bool FaultFilter::maybeDoAbort(const Http::RequestHeaderMap& request_headers) {
-  absl::optional<Http::Code> http_status;
-  absl::optional<Grpc::Status::GrpcStatus> grpc_status;
+  std::optional<Http::Code> http_status;
+  std::optional<Grpc::Status::GrpcStatus> grpc_status;
   std::tie(http_status, grpc_status) = abortStatus(request_headers);
 
-  if (http_status.has_value() && tryIncActiveFaults()) {
-    abortWithStatus(http_status.value(), grpc_status);
-    return true;
+  if (http_status.has_value()) {
+    if (isAbortDryRun()) {
+      onAbortDryRun(http_status.value(), grpc_status);
+      return false;
+    }
+    if (tryIncActiveFaults()) {
+      abortWithStatus(http_status.value(), grpc_status);
+      return true;
+    }
   }
 
   return false;
@@ -192,7 +215,7 @@ void FaultFilter::maybeSetupResponseRateLimit(const Http::RequestHeaderMap& requ
     return;
   }
 
-  absl::optional<uint64_t> rate_kbps =
+  std::optional<uint64_t> rate_kbps =
       fault_settings_->responseRateLimit()->rateKbps(&request_headers);
   if (!rate_kbps.has_value()) {
     return;
@@ -204,18 +227,19 @@ void FaultFilter::maybeSetupResponseRateLimit(const Http::RequestHeaderMap& requ
 
   config_->stats().response_rl_injected_.inc();
 
-  response_limiter_ = std::make_unique<Envoy::Extensions::HttpFilters::Common::StreamRateLimiter>(
-      rate_kbps.value(), encoder_callbacks_->encoderBufferLimit(),
+  response_limiter_ = std::make_unique<Common::StreamRateLimiter>(
+      encoder_callbacks_->bufferLimit(),
       [this] { encoder_callbacks_->onEncoderFilterAboveWriteBufferHighWatermark(); },
       [this] { encoder_callbacks_->onEncoderFilterBelowWriteBufferLowWatermark(); },
       [this](Buffer::Instance& data, bool end_stream) {
         encoder_callbacks_->injectEncodedDataToFilterChain(data, end_stream);
       },
       [this] { encoder_callbacks_->continueEncoding(); },
-      [](uint64_t) {
+      [](uint64_t, uint64_t, std::chrono::milliseconds) {
         // write stats callback.
       },
-      config_->timeSource(), decoder_callbacks_->dispatcher(), decoder_callbacks_->scope());
+      decoder_callbacks_->dispatcher(), decoder_callbacks_->scope(),
+      Common::StreamRateLimiter::simpleTokenBucket(rate_kbps.value(), config_->timeSource()));
 }
 
 bool FaultFilter::faultOverflow() {
@@ -247,6 +271,10 @@ bool FaultFilter::isDelayEnabled(const Http::RequestHeaderMap& request_headers) 
                                                       request_delay->percentage(&request_headers));
 }
 
+bool FaultFilter::isAbortDryRun() const {
+  return fault_settings_->requestAbort() != nullptr && fault_settings_->requestAbort()->dryRun();
+}
+
 bool FaultFilter::isAbortEnabled(const Http::RequestHeaderMap& request_headers) {
   const auto request_abort = fault_settings_->requestAbort();
   if (request_abort == nullptr) {
@@ -272,9 +300,9 @@ bool FaultFilter::isResponseRateLimitEnabled(const Http::RequestHeaderMap& reque
       fault_settings_->responseRateLimit()->percentage(&request_headers));
 }
 
-absl::optional<std::chrono::milliseconds>
+std::optional<std::chrono::milliseconds>
 FaultFilter::delayDuration(const Http::RequestHeaderMap& request_headers) {
-  absl::optional<std::chrono::milliseconds> ret;
+  std::optional<std::chrono::milliseconds> ret;
 
   if (!isDelayEnabled(request_headers)) {
     return ret;
@@ -305,13 +333,13 @@ FaultFilter::delayDuration(const Http::RequestHeaderMap& request_headers) {
 
 AbortHttpAndGrpcStatus FaultFilter::abortStatus(const Http::RequestHeaderMap& request_headers) {
   if (!isAbortEnabled(request_headers)) {
-    return AbortHttpAndGrpcStatus{absl::nullopt, absl::nullopt};
+    return AbortHttpAndGrpcStatus{std::nullopt, std::nullopt};
   }
 
   auto http_status = abortHttpStatus(request_headers);
   // If http status code is set, then gRPC status won't be used.
   if (http_status.has_value()) {
-    return AbortHttpAndGrpcStatus{http_status, absl::nullopt};
+    return AbortHttpAndGrpcStatus{http_status, std::nullopt};
   }
 
   auto grpc_status = abortGrpcStatus(request_headers);
@@ -320,16 +348,16 @@ AbortHttpAndGrpcStatus FaultFilter::abortStatus(const Http::RequestHeaderMap& re
     return AbortHttpAndGrpcStatus{Http::Code::OK, grpc_status};
   }
 
-  return AbortHttpAndGrpcStatus{absl::nullopt, absl::nullopt};
+  return AbortHttpAndGrpcStatus{std::nullopt, std::nullopt};
 }
 
-absl::optional<Http::Code>
+std::optional<Http::Code>
 FaultFilter::abortHttpStatus(const Http::RequestHeaderMap& request_headers) {
   // See if the configured abort provider has a default status code, if not there is no abort status
   // code (e.g., header configuration and no/invalid header).
   auto http_status = fault_settings_->requestAbort()->httpStatusCode(&request_headers);
   if (!http_status.has_value()) {
-    return absl::nullopt;
+    return std::nullopt;
   }
 
   auto default_http_status_code = static_cast<uint64_t>(http_status.value());
@@ -344,11 +372,11 @@ FaultFilter::abortHttpStatus(const Http::RequestHeaderMap& request_headers) {
   return static_cast<Http::Code>(runtime_http_status_code);
 }
 
-absl::optional<Grpc::Status::GrpcStatus>
+std::optional<Grpc::Status::GrpcStatus>
 FaultFilter::abortGrpcStatus(const Http::RequestHeaderMap& request_headers) {
   auto grpc_status = fault_settings_->requestAbort()->grpcStatusCode(&request_headers);
   if (!grpc_status.has_value()) {
-    return absl::nullopt;
+    return std::nullopt;
   }
 
   auto default_grpc_status_code = static_cast<uint64_t>(grpc_status.value());
@@ -370,6 +398,15 @@ void FaultFilter::recordDelaysInjectedStats() {
   }
 
   config_->stats().delays_injected_.inc();
+}
+
+void FaultFilter::recordAbortsDryRunStats() {
+  // Downstream specific stats.
+  if (!downstream_cluster_.empty() && !fault_settings_->disableDownstreamClusterStats()) {
+    config_->incAbortsDryRun(downstream_cluster_storage_->statName());
+  }
+
+  config_->stats().aborts_dry_run_.inc();
 }
 
 void FaultFilter::recordAbortsInjectedStats() {
@@ -441,41 +478,74 @@ void FaultFilter::postDelayInjection(const Http::RequestHeaderMap& request_heade
   resetTimerState();
 
   // Delays can be followed by aborts
-  absl::optional<Http::Code> http_status;
-  absl::optional<Grpc::Status::GrpcStatus> grpc_status;
+  std::optional<Http::Code> http_status;
+  std::optional<Grpc::Status::GrpcStatus> grpc_status;
   std::tie(http_status, grpc_status) = abortStatus(request_headers);
 
   if (http_status.has_value()) {
-    abortWithStatus(http_status.value(), grpc_status);
-  } else {
-    // Should not continue to count as an active fault after the delay has elapsed if no other type
-    // of fault is active. As the delay timer is always done at this point and followed abort faults
-    // have been checked earlier, here we just check if there's a response rate limit configured.
-    ASSERT(fault_active_);
-    ASSERT(delay_timer_ == nullptr);
-    if (!isResponseRateLimitConfigured()) {
-      config_->stats().active_faults_.dec();
-      fault_active_ = false;
+    if (!isAbortDryRun()) {
+      abortWithStatus(http_status.value(), grpc_status);
+      return;
     }
-
-    // Continue request processing.
-    decoder_callbacks_->continueDecoding();
+    onAbortDryRun(http_status.value(), grpc_status);
   }
+
+  // Should not continue to count as an active fault after the delay has elapsed if no other type
+  // of fault is active. As the delay timer is always done at this point and followed abort faults
+  // have been checked earlier, here we just check if there's a response rate limit configured.
+  ASSERT(fault_active_);
+  ASSERT(delay_timer_ == nullptr);
+  if (!isResponseRateLimitConfigured()) {
+    config_->stats().active_faults_.dec();
+    fault_active_ = false;
+  }
+
+  // Continue request processing.
+  decoder_callbacks_->continueDecoding();
 }
 
 void FaultFilter::abortWithStatus(Http::Code http_status_code,
-                                  absl::optional<Grpc::Status::GrpcStatus> grpc_status) {
+                                  std::optional<Grpc::Status::GrpcStatus> grpc_status) {
   recordAbortsInjectedStats();
-  decoder_callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::FaultInjected);
-  decoder_callbacks_->sendLocalReply(http_status_code, "fault filter abort", nullptr, grpc_status,
+  decoder_callbacks_->streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::FaultInjected);
+  setFilterMetadata();
+  absl::string_view body = "fault filter abort";
+  if (fault_settings_->requestAbort() != nullptr &&
+      !fault_settings_->requestAbort()->responseBody().empty()) {
+    body = fault_settings_->requestAbort()->responseBody();
+  }
+  decoder_callbacks_->sendLocalReply(http_status_code, body, nullptr, grpc_status,
                                      RcDetails::get().FaultAbort);
+}
+
+void FaultFilter::onAbortDryRun(Http::Code http_status_code,
+                                std::optional<Grpc::Status::GrpcStatus> grpc_status) {
+  recordAbortsDryRunStats();
+  auto& dynamic_metadata = decoder_callbacks_->streamInfo().dynamicMetadata();
+  auto& filter_metadata =
+      (*dynamic_metadata.mutable_filter_metadata())[decoder_callbacks_->filterConfigName()];
+  auto& dry_run_abort = *(*filter_metadata.mutable_fields())["dry_run_abort"]
+                             .mutable_struct_value()
+                             ->mutable_fields();
+  dry_run_abort.clear();
+  if (grpc_status.has_value()) {
+    dry_run_abort["grpc_status"].set_number_value(static_cast<uint64_t>(grpc_status.value()));
+  } else {
+    dry_run_abort["http_status"].set_number_value(static_cast<uint64_t>(http_status_code));
+  }
+}
+
+void FaultFilter::setFilterMetadata() {
+  auto& dynamic_metadata = decoder_callbacks_->streamInfo().dynamicMetadata();
+  (*dynamic_metadata.mutable_filter_metadata())[decoder_callbacks_->filterConfigName()] =
+      fault_settings_->filterMetadata();
 }
 
 bool FaultFilter::matchesTargetUpstreamCluster() {
   bool matches = true;
 
   if (!fault_settings_->upstreamCluster().empty()) {
-    Router::RouteConstSharedPtr route = decoder_callbacks_->route();
+    const auto route = decoder_callbacks_->route();
     matches = route && route->routeEntry() &&
               (route->routeEntry()->clusterName() == fault_settings_->upstreamCluster());
   }

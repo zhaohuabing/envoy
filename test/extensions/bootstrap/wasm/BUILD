@@ -31,7 +31,18 @@ envoy_extension_cc_test(
         "//test/extensions/bootstrap/wasm/test_data:logging_rust.wasm",
     ]),
     extension_names = ["envoy.bootstrap.wasm"],
-    external_deps = ["abseil_optional"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
+    tags = ["skip_on_windows"],
     deps = [
         "//source/common/event:dispatcher_lib",
         "//source/common/stats:isolated_store_lib",
@@ -40,7 +51,7 @@ envoy_extension_cc_test(
         "//source/extensions/common/wasm:wasm_lib",
         "//test/extensions/bootstrap/wasm/test_data:stats_cpp_plugin",
         "//test/extensions/common/wasm:wasm_runtime",
-        "//test/mocks/server:server_mocks",
+        "//test/mocks/local_info:local_info_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:simulated_time_system_lib",
@@ -49,11 +60,21 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "wasm_integration_test",
+    size = "large",
     srcs = ["wasm_integration_test.cc"],
     data = envoy_select_wasm_cpp_tests([
         "//test/extensions/bootstrap/wasm/test_data:http_cpp.wasm",
     ]),
     extension_names = ["envoy.bootstrap.wasm"],
+    rbe_pool = {
+        "gcc": {"build": "linux_x64_small"},
+        "cto": {"link": "linux_x64_small"},
+        "openssl": {"link": "linux_x64_small"},
+        "coverage": {"link": "linux_x64_large"},
+        "tsan": {"link": "linux_x64_small"},
+        "asan": {"link": "linux_x64_small"},
+    },
+    tags = ["skip_on_windows"],
     deps = [
         "//source/extensions/bootstrap/wasm:config",
         "//source/extensions/common/wasm:wasm_lib",
@@ -70,6 +91,23 @@ envoy_extension_cc_test(
         "//test/extensions/bootstrap/wasm/test_data:start_cpp.wasm",
     ]),
     extension_names = ["envoy.bootstrap.wasm"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "gcc": {"build": "linux_x64_large"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "asan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
+    tags = ["skip_on_windows"],
     deps = [
         "//envoy/registry",
         "//source/common/stats:isolated_store_lib",
@@ -77,9 +115,7 @@ envoy_extension_cc_test(
         "//source/extensions/common/wasm:wasm_lib",
         "//test/extensions/bootstrap/wasm/test_data:start_cpp_plugin",
         "//test/extensions/common/wasm:wasm_runtime",
-        "//test/mocks/event:event_mocks",
         "//test/mocks/server:server_mocks",
-        "//test/mocks/thread_local:thread_local_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:environment_lib",
         "@envoy_api//envoy/extensions/wasm/v3:pkg_cc_proto",
@@ -93,11 +129,10 @@ envoy_extension_cc_test_binary(
         "//test/extensions/bootstrap/wasm/test_data:speed_cpp.wasm",
     ]),
     extension_names = ["envoy.bootstrap.wasm"],
-    external_deps = [
-        "abseil_optional",
-        "benchmark",
-    ],
+    rbe_pool = {"build": "linux_x64_small"},
+    tags = ["skip_on_windows"],
     deps = [
+        "//bazel:cpp_runfiles",
         "//source/common/event:dispatcher_lib",
         "//source/common/stats:isolated_store_lib",
         "//source/common/stats:stats_lib",
@@ -105,9 +140,10 @@ envoy_extension_cc_test_binary(
         "//source/extensions/common/wasm:wasm_lib",
         "//test/extensions/bootstrap/wasm/test_data:speed_cpp_plugin",
         "//test/extensions/common/wasm:wasm_runtime",
-        "//test/mocks/server:server_mocks",
+        "//test/mocks/local_info:local_info_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:simulated_time_system_lib",
+        "@benchmark",
     ],
 )

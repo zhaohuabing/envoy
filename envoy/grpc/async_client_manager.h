@@ -4,6 +4,9 @@
 #include "envoy/grpc/async_client.h"
 #include "envoy/stats/scope.h"
 
+#include "source/common/common/hash.h"
+#include "source/common/protobuf/utility.h"
+
 namespace Envoy {
 namespace Grpc {
 
@@ -22,19 +25,59 @@ public:
    * exclusively. For example, some filters pass *this reference to raw client. In this case, the
    * client must be destroyed before the filter instance. In this case, the grpc client must be
    * owned by the filter instance exclusively.
-   * @return RawAsyncClientPtr async client.
+   * @return RawAsyncClientPtr async client or an error status.
    */
-  virtual RawAsyncClientPtr createUncachedRawAsyncClient() PURE;
+  virtual absl::StatusOr<RawAsyncClientPtr> createUncachedRawAsyncClient() PURE;
 
 private:
   friend class AsyncClientFactoryImpl;
 };
 
-// TODO(chaoqin-li1123): Remove this enum class when we verify that sharing async client is safe and
-// the "envoy.reloadable_features.enable_grpc_async_client_cache" runtime has been removed.
-enum class CacheOption { AlwaysCache, CacheWhenRuntimeEnabled };
-
 using AsyncClientFactoryPtr = std::unique_ptr<AsyncClientFactory>;
+
+// The key of the raw gRPC client cache. Two keys are equal when their configs serialize to the same
+// bytes.
+class GrpcServiceConfigWithHashKey {
+public:
+  GrpcServiceConfigWithHashKey() { updateKey(); }
+
+  explicit GrpcServiceConfigWithHashKey(envoy::config::core::v3::GrpcService config)
+      : config_(std::move(config)) {
+    updateKey();
+  }
+
+  template <typename H> friend H AbslHashValue(H h, const GrpcServiceConfigWithHashKey& wrapper) {
+    return H::combine(std::move(h), wrapper.pre_computed_hash_);
+  }
+
+  std::size_t getPreComputedHash() const { return pre_computed_hash_; }
+
+  friend bool operator==(const GrpcServiceConfigWithHashKey& lhs,
+                         const GrpcServiceConfigWithHashKey& rhs) {
+    return lhs.pre_computed_hash_ == rhs.pre_computed_hash_ &&
+           lhs.serialized_config_ == rhs.serialized_config_;
+  }
+
+  const envoy::config::core::v3::GrpcService& config() const { return config_; }
+
+  void setConfig(const envoy::config::core::v3::GrpcService& g) {
+    config_ = g;
+    updateKey();
+  }
+
+private:
+  friend class GrpcServiceConfigWithHashKeyPeer;
+
+  // Serializes the config deterministically and hashes the bytes. Equal bytes mean equal configs.
+  void updateKey() {
+    serialized_config_ = MessageUtil::serializeDeterministically(config_);
+    pre_computed_hash_ = HashUtil::xxHash64(serialized_config_);
+  }
+
+  envoy::config::core::v3::GrpcService config_;
+  std::string serialized_config_;
+  std::size_t pre_computed_hash_;
+};
 
 // Singleton gRPC client manager. Grpc::AsyncClientManager can be used to create per-service
 // Grpc::AsyncClientFactory instances. All manufactured Grpc::AsyncClients must
@@ -43,6 +86,7 @@ class AsyncClientManager {
 public:
   virtual ~AsyncClientManager() = default;
 
+  // TODO(diazalan) deprecate old getOrCreateRawAsyncClient once all filters have been transitioned
   /**
    * Create a Grpc::RawAsyncClient. The async client is cached thread locally and shared across
    * different filter instances.
@@ -51,13 +95,27 @@ public:
    * @param skip_cluster_check if set to true skips checks for cluster presence and being statically
    * configured.
    * @param cache_option always use cache or use cache when runtime is enabled.
+   * @return RawAsyncClientPtr a grpc async client or an invalid status.
+   */
+  virtual absl::StatusOr<RawAsyncClientSharedPtr>
+  getOrCreateRawAsyncClient(const envoy::config::core::v3::GrpcService& grpc_service,
+                            Stats::Scope& scope, bool skip_cluster_check) PURE;
+
+  /**
+   * Create a Grpc::RawAsyncClient. The async client is cached thread locally and shared across
+   * different filter instances.
+   * @param grpc_service Envoy::Grpc::GrpcServiceConfigWithHashKey which contains config and
+   * hash key.
+   * @param scope stats scope.
+   * @param skip_cluster_check if set to true skips checks for cluster presence and being statically
+   * configured.
+   * @param cache_option always use cache or use cache when runtime is enabled.
    * @return RawAsyncClientPtr a grpc async client.
    * @throws EnvoyException when grpc_service validation fails.
    */
-  virtual RawAsyncClientSharedPtr
-  getOrCreateRawAsyncClient(const envoy::config::core::v3::GrpcService& grpc_service,
-                            Stats::Scope& scope, bool skip_cluster_check,
-                            CacheOption cache_option) PURE;
+  virtual absl::StatusOr<RawAsyncClientSharedPtr>
+  getOrCreateRawAsyncClientWithHashKey(const GrpcServiceConfigWithHashKey& grpc_service,
+                                       Stats::Scope& scope, bool skip_cluster_check) PURE;
 
   /**
    * Create a Grpc::AsyncClients factory for a service. Validation of the service is performed and
@@ -66,10 +124,9 @@ public:
    * @param scope stats scope.
    * @param skip_cluster_check if set to true skips checks for cluster presence and being statically
    * configured.
-   * @return AsyncClientFactoryPtr factory for grpc_service.
-   * @throws EnvoyException when grpc_service validation fails.
+   * @return AsyncClientFactoryPtr factory for grpc_service or an error status.
    */
-  virtual AsyncClientFactoryPtr
+  virtual absl::StatusOr<AsyncClientFactoryPtr>
   factoryForGrpcService(const envoy::config::core::v3::GrpcService& grpc_service,
                         Stats::Scope& scope, bool skip_cluster_check) PURE;
 };

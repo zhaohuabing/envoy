@@ -16,11 +16,90 @@ namespace Filters {
 namespace Common {
 namespace ExtAuthz {
 
+namespace {
+
+const std::string& getHeaderValue(const envoy::config::core::v3::HeaderValue& header,
+                                  bool read_raw_value) {
+  // Prefer raw_value when populated so non-UTF-8 bytes are preserved, and fall back to value for
+  // backwards compatibility with authorization servers that only populate value.
+  if (read_raw_value && !header.raw_value().empty()) {
+    return header.raw_value();
+  }
+  return header.value();
+}
+
+void copyHeaderFieldIntoResponse(
+    ResponsePtr& response,
+    const Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValueOption>& headers,
+    bool read_raw_value) {
+  for (const auto& header : headers) {
+    const std::string& value = getHeaderValue(header.header(), read_raw_value);
+    if (header.append().value()) {
+      response->headers_to_append.emplace_back(header.header().key(), value);
+    } else {
+      response->headers_to_set.emplace_back(header.header().key(), value);
+    }
+  }
+}
+
+void copyOkResponseMutations(ResponsePtr& response,
+                             const envoy::service::auth::v3::OkHttpResponse& ok_response,
+                             bool read_raw_value) {
+  copyHeaderFieldIntoResponse(response, ok_response.headers(), read_raw_value);
+
+  for (const auto& header : ok_response.response_headers_to_add()) {
+    const std::string& value = getHeaderValue(header.header(), read_raw_value);
+    if (header.has_append()) {
+      if (header.append().value()) {
+        response->response_headers_to_add.emplace_back(header.header().key(), value);
+      } else {
+        response->response_headers_to_set.emplace_back(header.header().key(), value);
+      }
+    } else {
+      switch (header.append_action()) {
+      case Router::HeaderValueOption::APPEND_IF_EXISTS_OR_ADD:
+        response->response_headers_to_add.emplace_back(header.header().key(), value);
+        break;
+      case Router::HeaderValueOption::ADD_IF_ABSENT:
+        response->response_headers_to_add_if_absent.emplace_back(header.header().key(), value);
+        break;
+      case Router::HeaderValueOption::OVERWRITE_IF_EXISTS:
+        response->response_headers_to_overwrite_if_exists.emplace_back(header.header().key(),
+                                                                       value);
+        break;
+      case Router::HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD:
+        response->response_headers_to_set.emplace_back(header.header().key(), value);
+        break;
+      default:
+        response->saw_invalid_append_actions = true;
+        break;
+      }
+    }
+  }
+
+  response->headers_to_remove = std::vector<std::string>{ok_response.headers_to_remove().begin(),
+                                                         ok_response.headers_to_remove().end()};
+
+  for (const auto& query_parameter : ok_response.query_parameters_to_set()) {
+    response->query_parameters_to_set.emplace_back(query_parameter.key(), query_parameter.value());
+  }
+
+  response->query_parameters_to_remove =
+      std::vector<std::string>{ok_response.query_parameters_to_remove().begin(),
+                               ok_response.query_parameters_to_remove().end()};
+}
+
+} // namespace
+
 GrpcClientImpl::GrpcClientImpl(const Grpc::RawAsyncClientSharedPtr& async_client,
-                               const absl::optional<std::chrono::milliseconds>& timeout)
+                               const std::optional<std::chrono::milliseconds>& timeout,
+                               bool emit_client_span, bool read_raw_header_value)
     : async_client_(async_client), timeout_(timeout),
       service_method_(*Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
-          "envoy.service.auth.v3.Authorization.Check")) {}
+          "envoy.service.auth.v3.Authorization.Check")),
+      read_raw_header_value_(read_raw_header_value) {
+  emit_client_span_ = emit_client_span;
+}
 
 GrpcClientImpl::~GrpcClientImpl() { ASSERT(!callbacks_); }
 
@@ -38,49 +117,39 @@ void GrpcClientImpl::check(RequestCallbacks& callbacks,
   Http::AsyncClient::RequestOptions options;
   options.setTimeout(timeout_);
   options.setParentContext(Http::AsyncClient::ParentContext{&stream_info});
+  options.setSampled(emit_client_span_ ? std::nullopt : std::make_optional(false));
 
   ENVOY_LOG(trace, "Sending CheckRequest: {}", request.DebugString());
   request_ = async_client_->send(service_method_, request, *this, parent_span, options);
 }
 
-void GrpcClientImpl::onSuccess(std::unique_ptr<envoy::service::auth::v3::CheckResponse>&& response,
-                               Tracing::Span& span) {
+void GrpcClientImpl::onSuccess(
+    Grpc::ResponsePtr<envoy::service::auth::v3::CheckResponse>&& response, Tracing::Span& span) {
   ENVOY_LOG(trace, "Received CheckResponse: {}", response->DebugString());
   ResponsePtr authz_response = std::make_unique<Response>(Response{});
+  authz_response->grpc_status = response->status().code();
   if (response->status().code() == Grpc::Status::WellKnownGrpcStatus::Ok) {
     span.setTag(TracingConstants::get().TraceStatus, TracingConstants::get().TraceOk);
     authz_response->status = CheckStatus::OK;
     if (response->has_ok_response()) {
-      toAuthzResponseHeader(authz_response, response->ok_response().headers());
-      if (response->ok_response().headers_to_remove_size() > 0) {
-        for (const auto& header : response->ok_response().headers_to_remove()) {
-          authz_response->headers_to_remove.push_back(Http::LowerCaseString(header));
-        }
-      }
-      if (response->ok_response().query_parameters_to_set_size() > 0) {
-        for (const auto& query_parameter : response->ok_response().query_parameters_to_set()) {
-          authz_response->query_parameters_to_set.push_back(
-              std::pair(query_parameter.key(), query_parameter.value()));
-        }
-      }
-      if (response->ok_response().query_parameters_to_remove_size() > 0) {
-        for (const auto& key : response->ok_response().query_parameters_to_remove()) {
-          authz_response->query_parameters_to_remove.push_back(key);
-        }
-      }
-      // These two vectors hold header overrides of encoded response headers.
-      if (response->ok_response().response_headers_to_add_size() > 0) {
-        for (const auto& header : response->ok_response().response_headers_to_add()) {
-          if (header.append().value()) {
-            authz_response->response_headers_to_add.emplace_back(
-                Http::LowerCaseString(header.header().key()), header.header().value());
-          } else {
-            authz_response->response_headers_to_set.emplace_back(
-                Http::LowerCaseString(header.header().key()), header.header().value());
-          }
-        }
-      }
+      const auto& ok_response = response->ok_response();
+      copyOkResponseMutations(authz_response, ok_response, read_raw_header_value_);
     }
+  } else if (response->has_error_response()) {
+    // If error_response is present, treat it as an error and not denial.
+    span.setTag(TracingConstants::get().TraceStatus, TracingConstants::get().TraceError);
+    authz_response->status = CheckStatus::Error;
+
+    // For error responses, don't set a default status_code.
+    // Let the filter use status_on_error configuration.
+    const auto& error_response = response->error_response();
+    copyHeaderFieldIntoResponse(authz_response, error_response.headers(), read_raw_header_value_);
+
+    const uint32_t status_code = error_response.status().code();
+    if (status_code > 0) {
+      authz_response->status_code = static_cast<Http::Code>(status_code);
+    }
+    authz_response->body = error_response.body();
   } else {
     span.setTag(TracingConstants::get().TraceStatus, TracingConstants::get().TraceUnauthz);
     authz_response->status = CheckStatus::Denied;
@@ -88,7 +157,8 @@ void GrpcClientImpl::onSuccess(std::unique_ptr<envoy::service::auth::v3::CheckRe
     // The default HTTP status code for denied response is 403 Forbidden.
     authz_response->status_code = Http::Code::Forbidden;
     if (response->has_denied_response()) {
-      toAuthzResponseHeader(authz_response, response->denied_response().headers());
+      copyHeaderFieldIntoResponse(authz_response, response->denied_response().headers(),
+                                  read_raw_header_value_);
 
       const uint32_t status_code = response->denied_response().status().code();
       if (status_code > 0) {
@@ -106,8 +176,9 @@ void GrpcClientImpl::onSuccess(std::unique_ptr<envoy::service::auth::v3::CheckRe
     authz_response->dynamic_metadata = response->dynamic_metadata();
   }
 
-  callbacks_->onComplete(std::move(authz_response));
+  RequestCallbacks* callbacks = callbacks_;
   callbacks_ = nullptr;
+  callbacks->onComplete(std::move(authz_response));
 }
 
 void GrpcClientImpl::onFailure(Grpc::Status::GrpcStatus status, const std::string&,
@@ -117,23 +188,10 @@ void GrpcClientImpl::onFailure(Grpc::Status::GrpcStatus status, const std::strin
   ASSERT(status != Grpc::Status::WellKnownGrpcStatus::Ok);
   Response response{};
   response.status = CheckStatus::Error;
-  response.status_code = Http::Code::Forbidden;
-  callbacks_->onComplete(std::make_unique<Response>(response));
+  response.grpc_status = status;
+  RequestCallbacks* callbacks = callbacks_;
   callbacks_ = nullptr;
-}
-
-void GrpcClientImpl::toAuthzResponseHeader(
-    ResponsePtr& response,
-    const Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValueOption>& headers) {
-  for (const auto& header : headers) {
-    if (header.append().value()) {
-      response->headers_to_append.emplace_back(Http::LowerCaseString(header.header().key()),
-                                               header.header().value());
-    } else {
-      response->headers_to_set.emplace_back(Http::LowerCaseString(header.header().key()),
-                                            header.header().value());
-    }
-  }
+  callbacks->onComplete(std::make_unique<Response>(response));
 }
 
 } // namespace ExtAuthz

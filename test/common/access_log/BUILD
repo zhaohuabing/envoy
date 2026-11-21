@@ -11,18 +11,31 @@ envoy_package()
 envoy_cc_test(
     name = "access_log_impl_test",
     srcs = ["access_log_impl_test.cc"],
+    copts = [
+        "-DUSE_CEL_PARSER",
+    ],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
     deps = [
         "//source/common/access_log:access_log_lib",
+        "//source/common/formatter:formatter_extension_lib",
         "//source/common/stream_info:utility_lib",
         "//source/extensions/access_loggers/file:config",
-        "//source/extensions/access_loggers/grpc:http_config",
-        "//source/extensions/access_loggers/grpc:tcp_config",
-        "//source/extensions/access_loggers/stream:config",
+        "//source/extensions/access_loggers/filters/cel:config",
         "//test/common/stream_info:test_util",
         "//test/common/upstream:utility_lib",
         "//test/mocks/access_log:access_log_mocks",
         "//test/mocks/event:event_mocks",
-        "//test/mocks/filesystem:filesystem_mocks",
+        "//test/mocks/router:router_mocks",
         "//test/mocks/runtime:runtime_mocks",
         "//test/mocks/server:factory_context_mocks",
         "//test/mocks/upstream:cluster_info_mocks",
@@ -40,9 +53,10 @@ envoy_cc_test(
         "//source/common/access_log:access_log_manager_lib",
         "//source/common/stats:stats_lib",
         "//test/common/stats:stat_test_utility_lib",
-        "//test/mocks/access_log:access_log_mocks",
         "//test/mocks/api:api_mocks",
         "//test/mocks/event:event_mocks",
         "//test/mocks/filesystem:filesystem_mocks",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:thread_factory_for_test_lib",
     ],
 )

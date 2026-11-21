@@ -11,7 +11,11 @@ envoy_extension_package()
 
 envoy_cc_extension(
     name = "config",
-    srcs = ["config.h"],
+    hdrs = ["config.h"],
+    extra_visibility = [
+        "//test/common:__subpackages__",
+        "//test/integration:__subpackages__",
+    ],
     deps = [
         ":io_handle_impl_lib",
     ],
@@ -21,9 +25,11 @@ envoy_cc_library(
     name = "io_handle_lib",
     hdrs = ["io_handle.h"],
     deps = [
+        "//envoy/stream_info:filter_state_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/buffer:watermark_buffer_lib",
         "//source/common/common:empty_string",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )
 

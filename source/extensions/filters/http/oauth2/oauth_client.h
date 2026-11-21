@@ -5,6 +5,7 @@
 #include "envoy/common/pure.h"
 #include "envoy/config/core/v3/http_uri.pb.h"
 #include "envoy/http/async_client.h"
+#include "envoy/http/filter.h"
 #include "envoy/http/message.h"
 #include "envoy/upstream/cluster_manager.h"
 
@@ -18,6 +19,9 @@ namespace Extensions {
 namespace HttpFilters {
 namespace Oauth2 {
 
+using RouteRetryPolicy = envoy::config::route::v3::RetryPolicy;
+using HttpUri = envoy::config::core::v3::HttpUri;
+
 /**
  * An OAuth client abstracts away everything regarding how to communicate with
  * the OAuth server. The filter should only need to invoke the functions here,
@@ -25,9 +29,34 @@ namespace Oauth2 {
  */
 class OAuth2Client : public Http::AsyncClient::Callbacks {
 public:
+  // Tracks the state of the OAuth client across a single request lifecycle.
+  enum class OAuthState {
+    Idle,
+    PendingAccessToken,               // Async request for access token is in-flight.
+    PendingAccessTokenByRefreshToken, // Async request to refresh access token is in-flight.
+    FailureContinue, // Request failed; caller should continue decoding (allow-failed path).
+    FailureStop,     // Request failed; caller should stop (local reply or redirect already sent).
+  };
+
   virtual void asyncGetAccessToken(const std::string& auth_code, const std::string& client_id,
-                                   const std::string& secret, const std::string& cb_url) PURE;
+                                   const std::string& secret, const std::string& cb_url,
+                                   const std::string& code_verifier,
+                                   AuthType auth_type = AuthType::UrlEncodedBody) PURE;
+
+  virtual void asyncRefreshAccessToken(const std::string& refresh_token,
+                                       const std::string& client_id, const std::string& secret,
+                                       AuthType auth_type = AuthType::UrlEncodedBody) PURE;
+
   virtual void setCallbacks(FilterCallbacks& callbacks) PURE;
+  virtual void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) PURE;
+
+  virtual OAuthState getState() const PURE;
+
+  /**
+   * Cancels any in-flight token request and detaches from the filter so late async completions
+   * cannot invoke filter callbacks or decoder callbacks after stream teardown.
+   */
+  virtual void cancel() PURE;
 
   // Http::AsyncClient::Callbacks
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&& m) override PURE;
@@ -35,29 +64,39 @@ public:
                  Http::AsyncClient::FailureReason f) override PURE;
 };
 
-class OAuth2ClientImpl : public OAuth2Client, Logger::Loggable<Logger::Id::upstream> {
+class OAuth2ClientImpl : public OAuth2Client, Logger::Loggable<Logger::Id::oauth2> {
 public:
-  OAuth2ClientImpl(Upstream::ClusterManager& cm, const envoy::config::core::v3::HttpUri& uri)
-      : cm_(cm), uri_(uri) {}
+  // `uri` is owned by the filter config, which outlives the client, so it is referenced rather
+  // than copied: copying the proto message on every client creation is not free.
+  OAuth2ClientImpl(Upstream::ClusterManager& cm, const HttpUri& uri,
+                   Router::RetryPolicyConstSharedPtr retry_policy,
+                   const std::chrono::seconds default_expires_in)
+      : cm_(cm), uri_(uri), retry_policy_(std::move(retry_policy)),
+        default_expires_in_(default_expires_in) {}
 
-  ~OAuth2ClientImpl() override {
-    if (in_flight_request_ != nullptr) {
-      in_flight_request_->cancel();
-    }
-  }
+  ~OAuth2ClientImpl() override { cancel(); }
 
   // OAuth2Client
-  /**
-   * Request the access token from the OAuth server. Calls the `onSuccess` on `onFailure` callbacks.
-   */
   void asyncGetAccessToken(const std::string& auth_code, const std::string& client_id,
-                           const std::string& secret, const std::string& cb_url) override;
+                           const std::string& secret, const std::string& cb_url,
+                           const std::string& code_verifier, AuthType auth_type) override;
+
+  void asyncRefreshAccessToken(const std::string& refresh_token, const std::string& client_id,
+                               const std::string& secret, AuthType auth_type) override;
 
   void setCallbacks(FilterCallbacks& callbacks) override { parent_ = &callbacks; }
+  void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override {
+    decoder_callbacks_ = &callbacks;
+  }
+
+  OAuthState getState() const override { return state_; }
+
+  void cancel() override;
 
   // AsyncClient::Callbacks
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&& m) override;
   void onFailure(const Http::AsyncClient::Request&, Http::AsyncClient::FailureReason f) override;
+
   void onBeforeFinalizeUpstreamSpan(Envoy::Tracing::Span&,
                                     const Http::ResponseHeaderMap*) override {}
 
@@ -65,15 +104,16 @@ private:
   friend class OAuth2ClientTest;
 
   FilterCallbacks* parent_{nullptr};
+  Http::StreamDecoderFilterCallbacks* decoder_callbacks_{nullptr};
 
   Upstream::ClusterManager& cm_;
-  const envoy::config::core::v3::HttpUri uri_;
+  const HttpUri& uri_;
+  const Router::RetryPolicyConstSharedPtr retry_policy_;
+  const std::chrono::seconds default_expires_in_;
 
   // Tracks any outstanding in-flight requests, allowing us to cancel the request
   // if the filter ends before the request completes.
   Http::AsyncClient::Request* in_flight_request_{nullptr};
-
-  enum class OAuthState { Idle, PendingAccessToken };
 
   // Due to the asynchronous nature of this functionality, it is helpful to have managed state which
   // is tracked here.
@@ -85,6 +125,15 @@ private:
    * @param request the HTTP request to be executed.
    */
   void dispatchRequest(Http::RequestMessagePtr&& request);
+
+  // Calls handleOAuthFailure and either calls continueDecoding() (async path) or sets state_
+  // (sync path) depending on whether the request was already dispatched.
+  void handleOAuthFailure(bool is_request_dispatched, const std::string& reason,
+                          const std::string& extra_details = "");
+
+  // Calls onRefreshAccessTokenFailure and either calls continueDecoding() (async path) or sets
+  // state_ (sync path) depending on whether the request was already dispatched.
+  void handleRefreshTokenFailure(bool is_request_dispatched);
 
   Http::RequestMessagePtr createPostRequest() {
     auto request = Http::Utility::prepareHeaders(uri_);

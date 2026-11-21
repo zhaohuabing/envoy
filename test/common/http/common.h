@@ -7,7 +7,6 @@
 #include "source/common/http/codec_client.h"
 
 #include "test/mocks/common.h"
-#include "test/mocks/event/mocks.h"
 
 namespace Envoy {
 /**
@@ -31,6 +30,7 @@ public:
   }
   void raiseGoAway(Http::GoAwayErrorCode error_code) { onGoAway(error_code); }
   Event::Timer* idleTimer() { return idle_timer_.get(); }
+  void triggerIdleTimeout() { onIdleTimeout(); }
   using Http::CodecClient::onSettings;
 
   DestroyCb destroy_cb_;
@@ -41,20 +41,23 @@ public:
  */
 struct ConnPoolCallbacks : public Http::ConnectionPool::Callbacks {
   void onPoolReady(Http::RequestEncoder& encoder, Upstream::HostDescriptionConstSharedPtr host,
-                   const StreamInfo::StreamInfo&, absl::optional<Http::Protocol>) override {
+                   StreamInfo::StreamInfo&, std::optional<Http::Protocol>) override {
     outer_encoder_ = &encoder;
     host_ = host;
     pool_ready_.ready();
   }
 
-  void onPoolFailure(ConnectionPool::PoolFailureReason reason, absl::string_view,
+  void onPoolFailure(ConnectionPool::PoolFailureReason reason,
+                     absl::string_view transport_failure_reason,
                      Upstream::HostDescriptionConstSharedPtr host) override {
     host_ = host;
     reason_ = reason;
+    transport_failure_reason_ = transport_failure_reason;
     pool_failure_.ready();
   }
 
   ConnectionPool::PoolFailureReason reason_;
+  std::string transport_failure_reason_;
   testing::NiceMock<ReadyWatcher> pool_failure_;
   testing::NiceMock<ReadyWatcher> pool_ready_;
   Http::RequestEncoder* outer_encoder_{};

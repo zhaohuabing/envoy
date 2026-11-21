@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "envoy/common/exception.h"
+#include "envoy/common/optref.h"
 #include "envoy/common/platform.h"
 #include "envoy/network/address.h"
 
@@ -41,6 +42,7 @@ constexpr size_t MaxLcTrieNodes = (1 << 20);
  */
 template <class T> class LcTrie {
 public:
+  LcTrie() = default;
   /**
    * @param data supplies a vector of data and CIDR ranges.
    * @param exclusive if true then only data for the most specific subnet will be returned
@@ -137,8 +139,8 @@ public:
     // step 1. But it has a useful new property: now that all the prefixes
     // are at the leaves, they are disjoint: no prefix is nested under another.
 
-    std::vector<IpPrefix<Ipv4>> ipv4_prefixes = ipv4_temp.push_leaves();
-    std::vector<IpPrefix<Ipv6>> ipv6_prefixes = ipv6_temp.push_leaves();
+    std::vector<IpPrefix<Ipv4>> ipv4_prefixes = ipv4_temp.pushLeaves();
+    std::vector<IpPrefix<Ipv6>> ipv6_prefixes = ipv6_temp.pushLeaves();
 
     // Step 3: take the disjoint prefixes from the leaves of each Binary Trie
     // and use them to construct an LC Trie.
@@ -183,12 +185,26 @@ public:
    * version of the ip_address.
    */
   std::vector<T> getData(const Network::Address::InstanceConstSharedPtr& ip_address) const {
+    const OptRef<const DataSet> data = getDataSet(ip_address);
+    return data.has_value() ? std::vector<T>(data->begin(), data->end()) : std::vector<T>();
+  }
+
+  using DataSet = absl::node_hash_set<T>;
+
+  /**
+   * As getData(), but without copying the data out of the trie.
+   * @param  ip_address supplies the IP address.
+   * @return the data from the CIDR ranges and IP addresses that contain 'ip_address', owned by the
+   * trie, or no value where getData() would return an empty vector.
+   */
+  OptRef<const DataSet>
+  getDataSet(const Network::Address::InstanceConstSharedPtr& ip_address) const {
     if (ip_address->ip()->version() == Address::IpVersion::v4) {
       Ipv4 ip = ntohl(ip_address->ip()->ipv4()->address());
-      return ipv4_trie_->getData(ip);
+      return ipv4_trie_->getDataSet(ip);
     } else {
       Ipv6 ip = Utility::Ip6ntohl(ip_address->ip()->ipv6()->address());
-      return ipv6_trie_->getData(ip);
+      return ipv6_trie_->getDataSet(ip);
     }
   }
 
@@ -232,7 +248,6 @@ private:
   using Ipv4 = uint32_t;
   using Ipv6 = absl::uint128;
 
-  using DataSet = absl::node_hash_set<T>;
   using DataSetSharedPtr = std::shared_ptr<DataSet>;
 
   /**
@@ -345,7 +360,7 @@ private:
      *     trie can be nested under another leaf)
      * @return the prefixes associated with the leaf nodes.
      */
-    std::vector<IpPrefix<IpType>> push_leaves() {
+    std::vector<IpPrefix<IpType>> pushLeaves() {
       std::vector<IpPrefix<IpType>> prefixes;
       std::function<void(Node*, DataSetSharedPtr, unsigned, IpType)> visit =
           [&](Node* node, DataSetSharedPtr data, unsigned depth, IpType prefix) {
@@ -429,10 +444,10 @@ private:
     /**
      * Retrieve the data associated with the CIDR range that contains `ip_address`.
      * @param  ip_address supplies the IP address in host byte order.
-     * @return a vector of data from the CIDR ranges and IP addresses that encompasses the input.
-     * An empty vector is returned if the LC Trie is empty.
+     * @return the data from the CIDR ranges and IP addresses that encompass the input, or no
+     * value if there is none, including when the LC Trie is empty.
      */
-    std::vector<T> getData(const IpType& ip_address) const;
+    OptRef<const DataSet> getDataSet(const IpType& ip_address) const;
 
   private:
     /**
@@ -709,11 +724,10 @@ LcTrie<T>::LcTrieInternal<IpType, address_size>::LcTrieInternal(std::vector<IpPr
 
 template <class T>
 template <class IpType, uint32_t address_size>
-std::vector<T>
-LcTrie<T>::LcTrieInternal<IpType, address_size>::getData(const IpType& ip_address) const {
-  std::vector<T> return_vector;
+OptRef<const typename LcTrie<T>::DataSet>
+LcTrie<T>::LcTrieInternal<IpType, address_size>::getDataSet(const IpType& ip_address) const {
   if (trie_.empty()) {
-    return return_vector;
+    return {};
   }
 
   LcNode node = trie_[0];
@@ -736,10 +750,10 @@ LcTrie<T>::LcTrieInternal<IpType, address_size>::getData(const IpType& ip_addres
   // so it is necessary to check whether the matched prefix really contains the
   // ip_address.
   const auto& prefix = ip_prefixes_[address];
-  if (prefix.contains(ip_address)) {
-    return std::vector<T>(prefix.data_.begin(), prefix.data_.end());
+  if (prefix.contains(ip_address) && !prefix.data_.empty()) {
+    return prefix.data_;
   }
-  return std::vector<T>();
+  return {};
 }
 
 } // namespace LcTrie

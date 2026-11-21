@@ -7,38 +7,69 @@ Building an Envoy Docker image
 The following steps guide you through building your own Envoy binary, and
 putting that in a clean Ubuntu container.
 
+.. tip::
+   These instructions run commands in Docker using ``ci/run_envoy_docker.sh``.
+
+   By default this will place bazel run files and any artefacts in ``/tmp/envoy-docker-build``.
+
+   You can override this by setting the ``ENVOY_DOCKER_BUILD_DIR`` env var to a path of your choosing.
+
 **Step 1: Build Envoy**
 
 Using ``envoyproxy/envoy-build`` you will compile Envoy.
-This image has all software needed to build Envoy. From your Envoy directory::
+This image has all software needed to build Envoy. From your Envoy directory:
+
+.. code-block:: console
 
   $ pwd
   src/envoy
-  $ ./ci/run_envoy_docker.sh './ci/do_ci.sh bazel.release'
+  $ ./ci/run_envoy_docker.sh './ci/do_ci.sh release'
 
 That command will take some time to run because it is compiling an Envoy binary and running tests.
+
+If your system has limited resources, or you wish to build without running the tests, you can
+also build as follows:
+
+.. code-block:: console
+
+  $ pwd
+  src/envoy
+  $ ./ci/run_envoy_docker.sh './ci/do_ci.sh release.server'
 
 For more information on building and different build targets, please refer to :repo:`ci/README.md`.
 
 .. warning::
-
-   These instructions for building Envoy use
-   `envoyproxy/envoy-build-ubuntu <https://hub.docker.com/r/envoyproxy/envoy-build-ubuntu/tags>`_ image.
-   You will need 4-5GB of disk space to accommodate this image.
+   These instructions for building Envoy use the
+   `envoyproxy/envoy-build <https://hub.docker.com/r/envoyproxy/envoy-build/tags>`_ image.
+   The image itself is small, but Bazel fetches the toolchains and dependencies into the
+   build directory, which needs several GB of disk space.
 
    This script runs as effective root on your host system.
 
 **Step 2: Build image with only Envoy binary**
 
-In this step we'll build an image that only has the Envoy binary, and none
-of the software used to build it.::
+In this step we'll build the Envoy deployment images.
+
+.. code-block:: console
 
   $ pwd
   src/envoy/
-  $ docker build -f ci/Dockerfile-envoy -t envoy .
+  $ ./ci/run_envoy_docker.sh './ci/do_ci.sh release.containers'
 
-Now you can use this ``envoy`` image to build the any of the sandboxes if you change
-the ``FROM`` line in any Dockerfile.
+The images are built with Bazel, with the release binaries, each as an OCI tarball in
+``envoy/<arch>/build_images`` of the build directory, eg
+``/tmp/envoy-docker-build/envoy/x64/build_images/envoy.amd64.tar``.
 
-This will be particularly useful if you are interested in modifying Envoy, and testing
+A tarball can be loaded into Docker with a tool that reads OCI archives, eg with ``skopeo``:
+
+.. code-block:: console
+
+  $ skopeo copy \
+      oci-archive:/tmp/envoy-docker-build/envoy/x64/build_images/envoy.amd64.tar \
+      docker-daemon:envoyproxy/envoy:local
+
+Now you can use the Envoy image to build the any of the sandboxes by changing
+the ``FROM`` line in a related Dockerfile.
+
+This can be particularly useful if you are interested in modifying Envoy, and testing
 your changes.

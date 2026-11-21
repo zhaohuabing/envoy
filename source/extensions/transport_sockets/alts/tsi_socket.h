@@ -5,6 +5,7 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/buffer/watermark_buffer.h"
 #include "source/common/network/raw_buffer_socket.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/extensions/transport_sockets/alts/noop_transport_socket_callbacks.h"
 #include "source/extensions/transport_sockets/alts/tsi_frame_protector.h"
 #include "source/extensions/transport_sockets/alts/tsi_handshaker.h"
@@ -15,7 +16,7 @@ namespace TransportSockets {
 namespace Alts {
 
 struct TsiInfo {
-  std::string name_;
+  std::string peer_identity_;
 };
 
 /**
@@ -23,20 +24,19 @@ struct TsiInfo {
  * @param dispatcher the dispatcher for the thread where the socket is running on.
  * @param local_address the local address of the connection.
  * @param remote_address the remote address of the connection.
+ * @param target_name the unresolved name of the connection target.
  */
 using HandshakerFactory = std::function<TsiHandshakerPtr(
     Event::Dispatcher& dispatcher, const Network::Address::InstanceConstSharedPtr& local_address,
-    const Network::Address::InstanceConstSharedPtr& remote_address)>;
+    const Network::Address::InstanceConstSharedPtr& remote_address, absl::string_view target_name)>;
 
 /**
  * A function to validate the peer of the connection.
- * @param peer the detail peer information of the connection.
  * @param err an error message to indicate why the peer is invalid. This is an
  * output param that should be populated by the function implementation.
  * @return true if the peer is valid or false if the peer is invalid.
  */
-using HandshakeValidator =
-    std::function<bool(const tsi_peer& peer, TsiInfo& tsi_info, std::string& err)>;
+using HandshakeValidator = std::function<bool(TsiInfo& tsi_info, std::string& err)>;
 
 /* Forward declaration */
 class TsiTransportSocketCallbacks;
@@ -50,15 +50,19 @@ class TsiSocket : public Network::TransportSocket,
 public:
   // For Test
   TsiSocket(HandshakerFactory handshaker_factory, HandshakeValidator handshake_validator,
-            Network::TransportSocketPtr&& raw_socket_ptr);
+            Network::TransportSocketPtr&& raw_socket_ptr, bool downstream,
+            absl::string_view target_name = "");
 
   /**
    * @param handshaker_factory a function to initiate a TsiHandshaker
    * @param handshake_validator a function to validate the peer. Called right
    * after the handshake completed with peer data to do the peer validation.
    * The connection will be closed immediately if it returns false.
+   * @param downstream is true for downstream transport socket.
+   * @param target_name the unresolved name of the connection target.
    */
-  TsiSocket(HandshakerFactory handshaker_factory, HandshakeValidator handshake_validator);
+  TsiSocket(HandshakerFactory handshaker_factory, HandshakeValidator handshake_validator,
+            bool downstream, absl::string_view target_name = "");
   ~TsiSocket() override;
 
   // Network::TransportSocket
@@ -68,8 +72,9 @@ public:
   bool canFlushClose() override { return handshake_complete_; }
   Envoy::Ssl::ConnectionInfoConstSharedPtr ssl() const override { return nullptr; }
   bool startSecureTransport() override { return false; }
+  void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
   Network::IoResult doWrite(Buffer::Instance& buffer, bool end_stream) override;
-  void closeSocket(Network::ConnectionEvent event) override;
+  void closeSocket(Network::ConnectionEvent event, bool abort_reset) override;
   Network::IoResult doRead(Buffer::Instance& buffer) override;
   void onConnected() override;
 
@@ -85,7 +90,7 @@ public:
 
 private:
   Network::PostIoAction doHandshake();
-  void doHandshakeNext();
+  Network::PostIoAction doHandshakeNext();
   Network::PostIoAction doHandshakeNextDone(NextResultPtr&& next_result);
 
   // Helper function to perform repeated read and unprotect operations.
@@ -97,7 +102,7 @@ private:
 
   HandshakerFactory handshaker_factory_;
   HandshakeValidator handshake_validator_;
-  TsiHandshakerPtr handshaker_{};
+  TsiHandshakerPtr handshaker_;
   bool handshaker_next_calling_{};
 
   TsiFrameProtectorPtr frame_protector_;
@@ -116,6 +121,8 @@ private:
   Envoy::Network::TransportSocketCallbacks* callbacks_{};
   std::unique_ptr<TsiTransportSocketCallbacks> tsi_callbacks_;
   Network::TransportSocketPtr raw_buffer_socket_;
+  const bool downstream_;
+  const std::string target_name_;
 
   Buffer::WatermarkBuffer raw_read_buffer_{[]() {}, []() {}, []() {}};
   Envoy::Buffer::OwnedImpl raw_write_buffer_;
@@ -126,16 +133,21 @@ private:
 };
 
 /**
- * An implementation of Network::TransportSocketFactory for TsiSocket
+ * An implementation of Network::UpstreamTransportSocketFactory for TsiSocket
  */
-class TsiSocketFactory : public Network::TransportSocketFactory {
+class TsiSocketFactory : public Network::DownstreamTransportSocketFactory,
+                         public Network::CommonUpstreamTransportSocketFactory {
 public:
   TsiSocketFactory(HandshakerFactory handshaker_factory, HandshakeValidator handshake_validator);
 
   bool implementsSecureTransport() const override;
-  bool usesProxyProtocolOptions() const override { return false; }
+  absl::string_view defaultServerNameIndication() const override { return ""; }
+
   Network::TransportSocketPtr
-  createTransportSocket(Network::TransportSocketOptionsConstSharedPtr options) const override;
+  createTransportSocket(Network::TransportSocketOptionsConstSharedPtr options,
+                        Upstream::HostDescriptionConstSharedPtr) const override;
+
+  Network::TransportSocketPtr createDownstreamTransportSocket() const override;
 
 private:
   HandshakerFactory handshaker_factory_;

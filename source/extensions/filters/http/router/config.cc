@@ -11,24 +11,27 @@ namespace Extensions {
 namespace HttpFilters {
 namespace RouterFilter {
 
-Http::FilterFactoryCb RouterFilterConfig::createFilterFactoryFromProtoTyped(
+absl::StatusOr<Http::FilterFactoryCb> RouterFilterConfig::createHttpFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::router::v3::Router& proto_config,
-    const std::string& stat_prefix, Server::Configuration::FactoryContext& context) {
-  Stats::StatNameManagedStorage prefix(stat_prefix, context.scope().symbolTable());
-  Router::FilterConfigSharedPtr filter_config(new Router::FilterConfig(
-      prefix.statName(), context,
-      std::make_unique<Router::ShadowWriterImpl>(context.clusterManager()), proto_config));
+    Server::Configuration::ServerFactoryContext& context,
+    Server::Configuration::ExtraFactoryContext& extra_context) {
+  auto config_or_error = Router::FilterConfig::create(
+      context, extra_context, std::make_unique<Router::ShadowWriterImpl>(context.clusterManager()),
+      proto_config);
+  RETURN_IF_NOT_OK_REF(config_or_error.status());
+  Router::FilterConfigSharedPtr filter_config(std::move(*config_or_error));
 
   return [filter_config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
-    callbacks.addStreamDecoderFilter(std::make_shared<Router::ProdFilter>(*filter_config));
+    callbacks.addStreamDecoderFilter(
+        std::make_shared<Router::ProdFilter>(filter_config, filter_config->default_stats_));
   };
 }
 
 /**
  * Static registration for the router filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(RouterFilterConfig,
-                 Server::Configuration::NamedHttpFilterConfigFactory){"envoy.router"};
+LEGACY_REGISTER_FACTORY(RouterFilterConfig, Server::Configuration::NamedHttpFilterConfigFactory,
+                        "envoy.router");
 
 } // namespace RouterFilter
 } // namespace HttpFilters

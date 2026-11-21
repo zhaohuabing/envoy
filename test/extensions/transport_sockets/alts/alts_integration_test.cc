@@ -1,9 +1,24 @@
+#include <chrono>
+#include <cstddef>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/extensions/transport_sockets/alts/v3/alts.pb.h"
+#include "envoy/network/connection.h"
 
 #include "source/common/common/thread.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/extensions/transport_sockets/alts/config.h"
 #include "source/extensions/transport_sockets/alts/tsi_socket.h"
+
+#include "src/proto/grpc/gcp/handshaker.grpc.pb.h"
+#include "src/proto/grpc/gcp/handshaker.pb.h"
+#include "src/proto/grpc/gcp/transport_security_common.pb.h"
 
 #ifdef major
 #undef major
@@ -12,27 +27,31 @@
 #undef minor
 #endif
 
-#include "test/core/tsi/alts/fake_handshaker/fake_handshaker_server.h"
-#include "test/core/tsi/alts/fake_handshaker/handshaker.grpc.pb.h"
-#include "test/core/tsi/alts/fake_handshaker/handshaker.pb.h"
-#include "test/core/tsi/alts/fake_handshaker/transport_security_common.pb.h"
-
 #include "test/integration/http_integration.h"
 #include "test/integration/integration.h"
 #include "test/integration/server.h"
 #include "test/integration/utility.h"
-#include "test/mocks/server/transport_socket_factory_context.h"
-
+#include "test/mocks/server/server_factory_context.h"
+#include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
+#include "absl/base/thread_annotations.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "gmock/gmock.h"
 #include "grpcpp/grpcpp.h"
-#include "grpcpp/impl/codegen/service_type.h"
+#include "grpcpp/impl/service_type.h"
+#include "grpcpp/security/server_credentials.h"
+#include "grpcpp/server_builder.h"
+#include "grpcpp/server_context.h"
+#include "grpcpp/support/sync_stream.h"
 #include "gtest/gtest.h"
 
+using ::grpc::Service;
+using ::grpc::gcp::HandshakerService;
 using ::testing::ReturnRef;
 
 namespace Envoy {
@@ -41,8 +60,13 @@ namespace TransportSockets {
 namespace Alts {
 namespace {
 
-// Fake handshaker message, copied from grpc::gcp::FakeHandshakerService implementation.
+// Fake handshake messages.
 constexpr char kClientInitFrame[] = "ClientInit";
+constexpr char kServerFrame[] = "ServerInitAndFinished";
+constexpr char kClientFinishFrame[] = "ClientFinished";
+// Error messages.
+constexpr char kInvalidFrameError[] = "Invalid input frame.";
+constexpr char kWrongStateError[] = "Wrong handshake state.";
 
 // Hollowed out implementation of HandshakerService that is dysfunctional, but
 // responds correctly to the first client request, capturing client and server
@@ -61,6 +85,7 @@ public:
       if (request.has_client_start()) {
         client_versions = request.client_start().rpc_versions();
         client_max_frame_size = request.client_start().max_frame_size();
+        client_target_name = request.client_start().target_name();
         // Sets response to make first request successful.
         response.set_out_frames(kClientInitFrame);
         response.set_bytes_consumed(0);
@@ -85,7 +110,247 @@ public:
 
   size_t client_max_frame_size{0};
   size_t server_max_frame_size{0};
+  std::string client_target_name;
 };
+
+// Holds the fake handshaker service's handling of StartServerHandshakeReq
+// messages while closed, as if the handshaker service were slow to respond to
+// the server side of ALTS handshakes, i.e. to Envoy's side. It is thread-safe.
+class ServerStartGate {
+public:
+  void close() {
+    absl::MutexLock lock(mu_);
+    open_ = false;
+  }
+
+  void open() {
+    absl::MutexLock lock(mu_);
+    open_ = true;
+  }
+
+  // Called by the handshaker service for each StartServerHandshakeReq. Blocks
+  // while the gate is closed.
+  void pass() {
+    absl::MutexLock lock(mu_);
+    if (!open_) {
+      ++held_;
+    }
+    mu_.Await(absl::Condition(&open_));
+  }
+
+  // Returns the number of StartServerHandshakeReq messages held so far.
+  int held() {
+    absl::MutexLock lock(mu_);
+    return held_;
+  }
+
+private:
+  absl::Mutex mu_;
+  bool open_ ABSL_GUARDED_BY(mu_) = true;
+  int held_ ABSL_GUARDED_BY(mu_) = 0;
+};
+
+// FakeHandshakeService implements a fake handshaker service using a fake key
+// exchange protocol. The fake key exchange protocol is a 3-message protocol:
+// - Client first sends ClientInit message to Server.
+// - Server then sends ServerInitAndFinished message back to Client.
+// - Client finally sends ClientFinished message to Server.
+// This fake handshaker service is intended for ALTS integration testing without
+// relying on real ALTS handshaker service inside GCE.
+// It is thread-safe.
+class FakeHandshakerService : public HandshakerService::Service {
+public:
+  FakeHandshakerService(const std::string& peer_identity, ServerStartGate* server_start_gate)
+      : peer_identity_(peer_identity), server_start_gate_(server_start_gate) {}
+
+  grpc::Status
+  DoHandshake(grpc::ServerContext* /*server_context*/,
+              grpc::ServerReaderWriter<grpc::gcp::HandshakerResp, grpc::gcp::HandshakerReq>* stream)
+      override {
+    grpc::Status status;
+    HandshakerContext context;
+    grpc::gcp::HandshakerReq request;
+    grpc::gcp::HandshakerResp response;
+    while (stream->Read(&request)) {
+      if (request.has_server_start() && server_start_gate_ != nullptr) {
+        server_start_gate_->pass();
+      }
+      status = processRequest(&context, request, &response);
+      if (!status.ok()) {
+        return writeErrorResponse(stream, status);
+      }
+      stream->Write(response);
+      if (context.state == HandshakeState::COMPLETED) {
+        return grpc::Status::OK;
+      }
+      request.Clear();
+    }
+    return grpc::Status::OK;
+  }
+
+private:
+  // HandshakeState is used by fake handshaker server to keep track of client's
+  // handshake status. In the beginning of a handshake, the state is INITIAL.
+  // If start_client or start_server request is called, the state becomes at
+  // least STARTED. When the handshaker server produces the first fame, the
+  // state becomes SENT. After the handshaker server processes the final frame
+  // from the peer, the state becomes COMPLETED.
+  enum class HandshakeState { INITIAL, STARTED, SENT, COMPLETED };
+
+  struct HandshakerContext {
+    bool is_client = true;
+    HandshakeState state = HandshakeState::INITIAL;
+  };
+
+  grpc::Status processRequest(HandshakerContext* context, const grpc::gcp::HandshakerReq& request,
+                              grpc::gcp::HandshakerResp* response) {
+    response->Clear();
+    if (request.has_client_start()) {
+      return processClientStart(context, request.client_start(), response);
+    } else if (request.has_server_start()) {
+      return processServerStart(context, request.server_start(), response);
+    } else if (request.has_next()) {
+      return processNext(context, request.next(), response);
+    }
+    return {grpc::StatusCode::INVALID_ARGUMENT, "Request is empty."};
+  }
+
+  grpc::Status processClientStart(HandshakerContext* context,
+                                  const grpc::gcp::StartClientHandshakeReq& request,
+                                  grpc::gcp::HandshakerResp* response) {
+    // Checks request.
+    if (context->state != HandshakeState::INITIAL) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, kWrongStateError};
+    }
+    if (request.application_protocols_size() == 0) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "At least one application protocol needed."};
+    }
+    if (request.record_protocols_size() == 0) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "At least one record protocol needed."};
+    }
+    // Sets response.
+    response->set_out_frames(kClientInitFrame);
+    response->set_bytes_consumed(0);
+    response->mutable_status()->set_code(grpc::StatusCode::OK);
+    // Updates handshaker context.
+    context->is_client = true;
+    context->state = HandshakeState::SENT;
+    return grpc::Status::OK;
+  }
+
+  grpc::Status processServerStart(HandshakerContext* context,
+                                  const grpc::gcp::StartServerHandshakeReq& request,
+                                  grpc::gcp::HandshakerResp* response) {
+    // Checks request.
+    if (context->state != HandshakeState::INITIAL) {
+      return {grpc::StatusCode::FAILED_PRECONDITION, kWrongStateError};
+    }
+    if (request.application_protocols_size() == 0) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, "At least one application protocol needed."};
+    }
+    if (request.handshake_parameters().empty()) {
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "At least one set of handshake parameters needed."};
+    }
+    // Sets response.
+    if (request.in_bytes().empty()) {
+      // start_server request does not have in_bytes.
+      response->set_bytes_consumed(0);
+      context->state = HandshakeState::STARTED;
+    } else {
+      // start_server request has in_bytes.
+      if (request.in_bytes() == kClientInitFrame) {
+        response->set_out_frames(kServerFrame);
+        response->set_bytes_consumed(strlen(kClientInitFrame));
+        context->state = HandshakeState::SENT;
+      } else {
+        return {grpc::StatusCode::UNKNOWN, kInvalidFrameError};
+      }
+    }
+    response->mutable_status()->set_code(grpc::StatusCode::OK);
+    context->is_client = false;
+    return grpc::Status::OK;
+  }
+
+  grpc::Status processNext(HandshakerContext* context,
+                           const grpc::gcp::NextHandshakeMessageReq& request,
+                           grpc::gcp::HandshakerResp* response) {
+    if (context->is_client) {
+      // Processes next request on client side.
+      if (context->state != HandshakeState::SENT) {
+        return {grpc::StatusCode::FAILED_PRECONDITION, kWrongStateError};
+      }
+      if (request.in_bytes() != kServerFrame) {
+        return {grpc::StatusCode::UNKNOWN, kInvalidFrameError};
+      }
+      response->set_out_frames(kClientFinishFrame);
+      response->set_bytes_consumed(strlen(kServerFrame));
+      context->state = HandshakeState::COMPLETED;
+    } else {
+      // Processes next request on server side.
+      HandshakeState current_state = context->state;
+      if (current_state == HandshakeState::STARTED) {
+        if (request.in_bytes() != kClientInitFrame) {
+          return {grpc::StatusCode::UNKNOWN, kInvalidFrameError};
+        }
+        response->set_out_frames(kServerFrame);
+        response->set_bytes_consumed(strlen(kClientInitFrame));
+        context->state = HandshakeState::SENT;
+      } else if (current_state == HandshakeState::SENT) {
+        // Client finish frame may be sent along with the first payload from the
+        // client, handshaker only consumes the client finish frame.
+        if (request.in_bytes().substr(0, strlen(kClientFinishFrame)) != kClientFinishFrame) {
+          return {grpc::StatusCode::UNKNOWN, kInvalidFrameError};
+        }
+        response->set_bytes_consumed(strlen(kClientFinishFrame));
+        context->state = HandshakeState::COMPLETED;
+      } else {
+        return {grpc::StatusCode::FAILED_PRECONDITION, kWrongStateError};
+      }
+    }
+    // At this point, processing next request succeeded.
+    response->mutable_status()->set_code(grpc::StatusCode::OK);
+    if (context->state == HandshakeState::COMPLETED) {
+      *response->mutable_result() = getHandshakerResult();
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status writeErrorResponse(
+      grpc::ServerReaderWriter<grpc::gcp::HandshakerResp, grpc::gcp::HandshakerReq>* stream,
+      const grpc::Status& status) {
+    EXPECT_TRUE(status.ok());
+    grpc::gcp::HandshakerResp response;
+    response.mutable_status()->set_code(status.error_code());
+    response.mutable_status()->set_details(status.error_message());
+    stream->Write(response);
+    return status;
+  }
+
+  grpc::gcp::HandshakerResult getHandshakerResult() {
+    grpc::gcp::HandshakerResult result;
+    result.set_application_protocol("grpc");
+    result.set_record_protocol("ALTSRP_GCM_AES128_REKEY");
+    result.mutable_peer_identity()->set_service_account(peer_identity_);
+    result.mutable_local_identity()->set_service_account("local_identity");
+    std::string key(1024, '\0');
+    result.set_key_data(key);
+    result.set_max_frame_size(16384);
+    result.mutable_peer_rpc_versions()->mutable_max_rpc_version()->set_major(2);
+    result.mutable_peer_rpc_versions()->mutable_max_rpc_version()->set_minor(1);
+    result.mutable_peer_rpc_versions()->mutable_min_rpc_version()->set_major(2);
+    result.mutable_peer_rpc_versions()->mutable_min_rpc_version()->set_minor(1);
+    return result;
+  }
+
+  const std::string peer_identity_;
+  ServerStartGate* const server_start_gate_;
+};
+
+std::unique_ptr<Service> createFakeHandshakerService(const std::string& peer_identity,
+                                                     ServerStartGate* server_start_gate) {
+  return std::unique_ptr<Service>{new FakeHandshakerService(peer_identity, server_start_gate)};
+}
 
 class AltsIntegrationTestBase : public Event::TestUsingSimulatedTime,
                                 public testing::TestWithParam<Network::Address::IpVersion>,
@@ -112,13 +377,13 @@ public:
         alts_config.add_peer_service_accounts(server_peer_identity_);
       }
       alts_config.set_handshaker_service(fakeHandshakerServerAddress(server_connect_handshaker_));
-      transport_socket->mutable_typed_config()->PackFrom(alts_config);
+      std::ignore = transport_socket->mutable_typed_config()->PackFrom(alts_config);
     });
 
     config_helper_.prependFilter(R"EOF(
     name: decode-dynamic-metadata-filter
     typed_config:
-      "@type": type.googleapis.com/google.protobuf.Empty
+      "@type": type.googleapis.com/test.integration.filters.DecodeDynamicMetadataFilterConfig
     )EOF");
 
     HttpIntegrationTest::initialize();
@@ -133,9 +398,7 @@ public:
         service = std::unique_ptr<grpc::Service>{capturing_handshaker_service_};
       } else {
         capturing_handshaker_service_ = nullptr;
-        // If max_expected_concurrent_rpcs is zero, the fake handshaker service will not track
-        // concurrent RPCs and abort if it exceeds the value.
-        service = grpc::gcp::CreateFakeHandshakerService(/* max_expected_concurrent_rpcs */ 0);
+        service = createFakeHandshakerService("peer_identity", &server_start_gate_);
       }
 
       std::string server_address = Network::Test::getLoopbackAddressUrlString(version_) + ":0";
@@ -154,15 +417,20 @@ public:
     NiceMock<Server::Configuration::MockTransportSocketFactoryContext> mock_factory_ctx;
     // We fake the singleton manager for the client, since it doesn't need to manage ALTS global
     // state, this is done by the test server instead.
-    // TODO(htuch): Make this a proper mock.
     class FakeSingletonManager : public Singleton::Manager {
     public:
-      Singleton::InstanceSharedPtr get(const std::string&, Singleton::SingletonFactoryCb) override {
-        return nullptr;
+      Singleton::InstanceSharedPtr get(const std::string&, Singleton::SingletonFactoryCb cb,
+                                       bool pin) override {
+        auto singleton = cb();
+        if (pin) {
+          pinned_singletons_.push_back(singleton);
+        }
+        return singleton;
       }
+      std::vector<Singleton::InstanceSharedPtr> pinned_singletons_;
     };
     FakeSingletonManager fsm;
-    ON_CALL(mock_factory_ctx, singletonManager()).WillByDefault(ReturnRef(fsm));
+    ON_CALL(mock_factory_ctx.server_context_, singletonManager()).WillByDefault(ReturnRef(fsm));
     UpstreamAltsTransportSocketConfigFactory factory;
 
     envoy::extensions::transport_sockets::alts::v3::Alts alts_config;
@@ -174,10 +442,12 @@ public:
     TestUtility::jsonConvert(alts_config, *config);
     ENVOY_LOG_MISC(info, "{}", config->DebugString());
 
-    client_alts_ = factory.createTransportSocketFactory(*config, mock_factory_ctx);
+    client_alts_ = factory.createTransportSocketFactory(*config, mock_factory_ctx).value();
   }
 
   void TearDown() override {
+    // Release any handshake that a test left waiting at the handshaker service.
+    server_start_gate_.open();
     HttpIntegrationTest::cleanupUpstreamAndDownstream();
     dispatcher_->clearDeferredDeleteList();
     if (fake_handshaker_server_ != nullptr) {
@@ -186,19 +456,19 @@ public:
     fake_handshaker_server_thread_->join();
   }
 
-  Network::TransportSocketPtr makeAltsTransportSocket() {
-    auto client_transport_socket = client_alts_->createTransportSocket(nullptr);
-    client_tsi_socket_ = dynamic_cast<TsiSocket*>(client_transport_socket.get());
-    client_tsi_socket_->setActualFrameSizeToUse(16384);
-    client_tsi_socket_->setFrameOverheadSize(4);
-    return client_transport_socket;
+  Network::TransportSocketPtr
+  makeAltsTransportSocket(Network::TransportSocketOptionsConstSharedPtr options = nullptr) {
+    return client_alts_->createTransportSocket(options,
+                                               /*host=*/nullptr);
   }
 
-  Network::ClientConnectionPtr makeAltsConnection() {
-    auto client_transport_socket = makeAltsTransportSocket();
+  Network::ClientConnectionPtr
+  makeAltsConnection(Network::TransportSocketOptionsConstSharedPtr options = nullptr) {
+    auto client_transport_socket = makeAltsTransportSocket(options);
     Network::Address::InstanceConstSharedPtr address = getAddress(version_, lookupPort("http"));
     return dispatcher_->createClientConnection(address, Network::Address::InstanceConstSharedPtr(),
-                                               std::move(client_transport_socket), nullptr);
+                                               std::move(client_transport_socket), nullptr,
+                                               nullptr);
   }
 
   std::string fakeHandshakerServerAddress(bool connect_to_handshaker) {
@@ -215,7 +485,7 @@ public:
                                                       int port) {
     std::string url =
         "tcp://" + Network::Test::getLoopbackAddressUrlString(version) + ":" + std::to_string(port);
-    return Network::Utility::resolveUrl(url);
+    return *Network::Utility::resolveUrl(url);
   }
 
   bool tsiPeerIdentitySet() {
@@ -242,10 +512,11 @@ public:
   std::unique_ptr<grpc::Server> fake_handshaker_server_;
   ConditionalInitializer fake_handshaker_server_ci_;
   int fake_handshaker_server_port_{};
-  Network::TransportSocketFactoryPtr client_alts_;
+  Network::UpstreamTransportSocketFactoryPtr client_alts_;
   TsiSocket* client_tsi_socket_{nullptr};
   bool capturing_handshaker_;
   CapturingHandshakerService* capturing_handshaker_service_;
+  ServerStartGate server_start_gate_;
 };
 
 class AltsIntegrationTestValidPeer : public AltsIntegrationTestBase {
@@ -325,7 +596,7 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, AltsIntegrationTestClientInvalidPeer,
 // any account in config, the handshake will fail and client closes connection.
 TEST_P(AltsIntegrationTestClientInvalidPeer, ClientValidationFail) {
   initialize();
-  codec_client_ = makeRawHttpConnection(makeAltsConnection(), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(makeAltsConnection(), std::nullopt);
   EXPECT_FALSE(codec_client_->connected());
 }
 
@@ -353,7 +624,7 @@ TEST_P(AltsIntegrationTestServerInvalidPeer, ServerValidationFail) {
   client_conn->connect();
 
   EXPECT_CALL(client_callbacks, onEvent(Network::ConnectionEvent::RemoteClose))
-      .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); }));
+      .WillOnce([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); });
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 }
 
@@ -373,7 +644,7 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, AltsIntegrationTestClientWrongHandshaker,
 // and connection closes.
 TEST_P(AltsIntegrationTestClientWrongHandshaker, ConnectToWrongHandshakerAddress) {
   initialize();
-  codec_client_ = makeRawHttpConnection(makeAltsConnection(), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(makeAltsConnection(), std::nullopt);
   EXPECT_FALSE(codec_client_->connected());
 }
 
@@ -393,7 +664,7 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, AltsIntegrationTestCapturingHandshaker,
 // Verifies that handshake request should include ALTS version.
 TEST_P(AltsIntegrationTestCapturingHandshaker, CheckAltsVersion) {
   initialize();
-  codec_client_ = makeRawHttpConnection(makeAltsConnection(), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(makeAltsConnection(), std::nullopt);
   EXPECT_FALSE(codec_client_->connected());
   EXPECT_EQ(capturing_handshaker_service_->client_versions.max_rpc_version().major(),
             capturing_handshaker_service_->server_versions.max_rpc_version().major());
@@ -412,10 +683,108 @@ TEST_P(AltsIntegrationTestCapturingHandshaker, CheckAltsVersion) {
 // Verifies that handshake request should include max frame size.
 TEST_P(AltsIntegrationTestCapturingHandshaker, CheckMaxFrameSize) {
   initialize();
-  codec_client_ = makeRawHttpConnection(makeAltsConnection(), absl::nullopt);
+  codec_client_ = makeRawHttpConnection(makeAltsConnection(), std::nullopt);
   EXPECT_FALSE(codec_client_->connected());
-  EXPECT_EQ(capturing_handshaker_service_->client_max_frame_size, 16384);
-  EXPECT_EQ(capturing_handshaker_service_->server_max_frame_size, 16384);
+  EXPECT_EQ(capturing_handshaker_service_->client_max_frame_size, 1024 * 1024);
+  EXPECT_EQ(capturing_handshaker_service_->server_max_frame_size, 1024 * 1024);
+}
+
+// Verifies that StartClientHandshakeReq includes target_name when serverNameOverride is configured.
+TEST_P(AltsIntegrationTestCapturingHandshaker, CheckTargetNameOverride) {
+  initialize();
+  auto options =
+      std::make_shared<Network::TransportSocketOptionsImpl>("custom.alts.target.googleapis.com");
+  codec_client_ = makeRawHttpConnection(makeAltsConnection(options), std::nullopt);
+  EXPECT_FALSE(codec_client_->connected());
+  EXPECT_EQ("custom.alts.target.googleapis.com", capturing_handshaker_service_->client_target_name);
+}
+
+// Runs Envoy's handshakes with the previous, blocking calls to the handshaker
+// service, which the runtime guard restores.
+class AltsIntegrationTestBlockingHandshaker : public AltsIntegrationTestBase {
+public:
+  AltsIntegrationTestBlockingHandshaker()
+      : AltsIntegrationTestBase("peer_identity", "",
+                                /* server_connect_handshaker */ true,
+                                /* client_connect_handshaker */ true) {}
+
+  void initialize() override {
+    config_helper_.addRuntimeOverride("envoy.reloadable_features.alts_async_handshaker", "false");
+    AltsIntegrationTestBase::initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, AltsIntegrationTestBlockingHandshaker,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+TEST_P(AltsIntegrationTestBlockingHandshaker, RouterRequestAndResponseWithBodyNoBuffer) {
+  ConnectionCreationFunction creator = [this]() -> Network::ClientConnectionPtr {
+    return makeAltsConnection();
+  };
+  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+  EXPECT_TRUE(tsiPeerIdentitySet());
+}
+
+class AltsIntegrationTestSlowHandshaker : public AltsIntegrationTestBase {
+public:
+  AltsIntegrationTestSlowHandshaker()
+      : AltsIntegrationTestBase("peer_identity", "",
+                                /* server_connect_handshaker */ true,
+                                /* client_connect_handshaker */ true) {}
+
+  // Runs the test's dispatcher until condition holds. The fake handshaker
+  // service runs on its own gRPC threads, so this has to wait in real time.
+  testing::AssertionResult runUntil(const std::function<bool()>& condition) {
+    for (std::chrono::milliseconds waited{0}; !condition();
+         waited += std::chrono::milliseconds(1)) {
+      if (waited > TestUtility::DefaultTimeout) {
+        return testing::AssertionFailure() << "condition not reached";
+      }
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+      timeSystem().realSleepDoNotUseWithoutScrutiny(std::chrono::milliseconds(1));
+    }
+    return testing::AssertionSuccess();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, AltsIntegrationTestSlowHandshaker,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+// Verifies that while one connection's handshake waits for the handshaker
+// service, the worker thread that runs it keeps serving its other connections.
+TEST_P(AltsIntegrationTestSlowHandshaker, WaitingHandshakeDoesNotBlockWorker) {
+  // Envoy runs a single worker thread, so both connections below share it.
+  ASSERT_EQ(concurrency_, 1);
+  initialize();
+  codec_client_ = makeHttpConnection(makeAltsConnection());
+  auto response =
+      sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0);
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  // Start a second connection, whose handshake waits for the handshaker
+  // service on Envoy's side.
+  server_start_gate_.close();
+  ConnectionStatusCallbacks waiting_connection_callbacks;
+  Network::ClientConnectionPtr waiting_connection = makeAltsConnection();
+  waiting_connection->addConnectionCallbacks(waiting_connection_callbacks);
+  waiting_connection->connect();
+  ASSERT_TRUE(runUntil([this]() { return server_start_gate_.held() == 1; }));
+
+  // The first connection is still served.
+  response =
+      sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0);
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_FALSE(waiting_connection_callbacks.connected());
+
+  // Once the handshaker service responds, the second handshake completes.
+  server_start_gate_.open();
+  ASSERT_TRUE(runUntil([&waiting_connection_callbacks]() {
+    return waiting_connection_callbacks.connected() || waiting_connection_callbacks.closed();
+  }));
+  EXPECT_TRUE(waiting_connection_callbacks.connected());
+  waiting_connection->close(Network::ConnectionCloseType::NoFlush);
 }
 
 } // namespace

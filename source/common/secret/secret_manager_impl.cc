@@ -17,12 +17,16 @@
 namespace Envoy {
 namespace Secret {
 
-SecretManagerImpl::SecretManagerImpl(Server::ConfigTracker& config_tracker)
-    : config_tracker_entry_(
-          config_tracker.add("secrets", [this](const Matchers::StringMatcher& name_matcher) {
-            return dumpSecretConfigs(name_matcher);
-          })) {}
-void SecretManagerImpl::addStaticSecret(
+SecretManagerImpl::SecretManagerImpl(OptRef<Server::ConfigTracker> config_tracker) {
+  if (config_tracker.has_value()) {
+    config_tracker_entry_ =
+        config_tracker->add("secrets", [this](const Matchers::StringMatcher& name_matcher) {
+          return dumpSecretConfigs(name_matcher);
+        });
+  }
+}
+
+absl::Status SecretManagerImpl::addStaticSecret(
     const envoy::extensions::transport_sockets::tls::v3::Secret& secret) {
   switch (secret.type_case()) {
   case envoy::extensions::transport_sockets::tls::v3::Secret::TypeCase::kTlsCertificate: {
@@ -30,7 +34,7 @@ void SecretManagerImpl::addStaticSecret(
         std::make_shared<TlsCertificateConfigProviderImpl>(secret.tls_certificate());
     if (!static_tls_certificate_providers_.insert(std::make_pair(secret.name(), secret_provider))
              .second) {
-      throw EnvoyException(
+      return absl::InvalidArgumentError(
           absl::StrCat("Duplicate static TlsCertificate secret name ", secret.name()));
     }
     break;
@@ -41,7 +45,7 @@ void SecretManagerImpl::addStaticSecret(
     if (!static_certificate_validation_context_providers_
              .insert(std::make_pair(secret.name(), secret_provider))
              .second) {
-      throw EnvoyException(absl::StrCat(
+      return absl::InvalidArgumentError(absl::StrCat(
           "Duplicate static CertificateValidationContext secret name ", secret.name()));
     }
     break;
@@ -52,7 +56,7 @@ void SecretManagerImpl::addStaticSecret(
     if (!static_session_ticket_keys_providers_
              .insert(std::make_pair(secret.name(), secret_provider))
              .second) {
-      throw EnvoyException(
+      return absl::InvalidArgumentError(
           absl::StrCat("Duplicate static TlsSessionTicketKeys secret name ", secret.name()));
     }
     break;
@@ -62,14 +66,15 @@ void SecretManagerImpl::addStaticSecret(
         std::make_shared<GenericSecretConfigProviderImpl>(secret.generic_secret());
     if (!static_generic_secret_providers_.insert(std::make_pair(secret.name(), secret_provider))
              .second) {
-      throw EnvoyException(
+      return absl::InvalidArgumentError(
           absl::StrCat("Duplicate static GenericSecret secret name ", secret.name()));
     }
     break;
   }
   default:
-    throw EnvoyException("Secret type not implemented");
+    return absl::InvalidArgumentError("Secret type not implemented");
   }
+  return absl::OkStatus();
 }
 
 TlsCertificateConfigProviderSharedPtr
@@ -124,32 +129,58 @@ GenericSecretConfigProviderSharedPtr SecretManagerImpl::createInlineGenericSecre
 
 TlsCertificateConfigProviderSharedPtr SecretManagerImpl::findOrCreateTlsCertificateProvider(
     const envoy::config::core::v3::ConfigSource& sds_config_source, const std::string& config_name,
-    Server::Configuration::TransportSocketFactoryContext& secret_provider_context) {
-  return certificate_providers_.findOrCreate(sds_config_source, config_name,
-                                             secret_provider_context);
+    Server::Configuration::ServerFactoryContext& server_context, OptRef<Init::Manager> init_manager,
+    bool warm) {
+  return certificate_providers_.findOrCreate(sds_config_source, config_name, server_context,
+                                             init_manager, warm);
 }
 
 CertificateValidationContextConfigProviderSharedPtr
 SecretManagerImpl::findOrCreateCertificateValidationContextProvider(
     const envoy::config::core::v3::ConfigSource& sds_config_source, const std::string& config_name,
-    Server::Configuration::TransportSocketFactoryContext& secret_provider_context) {
-  return validation_context_providers_.findOrCreate(sds_config_source, config_name,
-                                                    secret_provider_context);
+    Server::Configuration::ServerFactoryContext& server_context, Init::Manager& init_manager) {
+  return validation_context_providers_.findOrCreate(sds_config_source, config_name, server_context,
+                                                    init_manager, true);
 }
 
 TlsSessionTicketKeysConfigProviderSharedPtr
 SecretManagerImpl::findOrCreateTlsSessionTicketKeysContextProvider(
     const envoy::config::core::v3::ConfigSource& sds_config_source, const std::string& config_name,
-    Server::Configuration::TransportSocketFactoryContext& secret_provider_context) {
-  return session_ticket_keys_providers_.findOrCreate(sds_config_source, config_name,
-                                                     secret_provider_context);
+    Server::Configuration::ServerFactoryContext& server_context, Init::Manager& init_manager) {
+  return session_ticket_keys_providers_.findOrCreate(sds_config_source, config_name, server_context,
+                                                     init_manager, true);
 }
 
 GenericSecretConfigProviderSharedPtr SecretManagerImpl::findOrCreateGenericSecretProvider(
     const envoy::config::core::v3::ConfigSource& sds_config_source, const std::string& config_name,
-    Server::Configuration::TransportSocketFactoryContext& secret_provider_context) {
-  return generic_secret_providers_.findOrCreate(sds_config_source, config_name,
-                                                secret_provider_context);
+    Server::Configuration::ServerFactoryContext& server_context, OptRef<Init::Manager> init_manager,
+    bool warm) {
+  return generic_secret_providers_.findOrCreate(sds_config_source, config_name, server_context,
+                                                init_manager, warm);
+}
+
+namespace {
+
+template <class SecretType>
+void appendActiveSecretNames(const std::vector<std::shared_ptr<SecretType>>& providers,
+                             std::vector<absl::string_view>& names) {
+  for (const auto& provider : providers) {
+    // A provider whose secret has not yet been delivered is warming, not active.
+    if (provider->secret() != nullptr) {
+      names.push_back(provider->secretData().resource_name_);
+    }
+  }
+}
+
+} // namespace
+
+std::vector<absl::string_view> SecretManagerImpl::dynamicActiveSecretNames() const {
+  std::vector<absl::string_view> names;
+  appendActiveSecretNames(certificate_providers_.allSecretProviders(), names);
+  appendActiveSecretNames(validation_context_providers_.allSecretProviders(), names);
+  appendActiveSecretNames(session_ticket_keys_providers_.allSecretProviders(), names);
+  appendActiveSecretNames(generic_secret_providers_.allSecretProviders(), names);
+  return names;
 }
 
 ProtobufTypes::MessagePtr
@@ -168,7 +199,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     MessageUtil::redact(dump_secret);
     auto static_secret = config_dump->mutable_static_secrets()->Add();
     static_secret->set_name(cert_iter.first);
-    static_secret->mutable_secret()->PackFrom(dump_secret);
+    std::ignore = static_secret->mutable_secret()->PackFrom(dump_secret);
   }
 
   // Handle static certificate validation context providers.
@@ -183,7 +214,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     }
     auto static_secret = config_dump->mutable_static_secrets()->Add();
     static_secret->set_name(context_iter.first);
-    static_secret->mutable_secret()->PackFrom(dump_secret);
+    std::ignore = static_secret->mutable_secret()->PackFrom(dump_secret);
   }
 
   // Handle static session keys providers.
@@ -201,7 +232,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     MessageUtil::redact(dump_secret);
     auto static_secret = config_dump->mutable_static_secrets()->Add();
     static_secret->set_name(context_iter.first);
-    static_secret->mutable_secret()->PackFrom(dump_secret);
+    std::ignore = static_secret->mutable_secret()->PackFrom(dump_secret);
   }
 
   // Handle static generic secret providers.
@@ -217,7 +248,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     auto static_secret = config_dump->mutable_static_secrets()->Add();
     static_secret->set_name(secret_iter.first);
     MessageUtil::redact(dump_secret);
-    static_secret->mutable_secret()->PackFrom(dump_secret);
+    std::ignore = static_secret->mutable_secret()->PackFrom(dump_secret);
   }
 
   // Handle dynamic tls_certificate providers.
@@ -228,7 +259,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     const bool secret_ready = tls_cert != nullptr;
     envoy::extensions::transport_sockets::tls::v3::Secret secret;
     secret.set_name(secret_data.resource_name_);
-    ProtobufWkt::Timestamp last_updated_ts;
+    Protobuf::Timestamp last_updated_ts;
     TimestampUtil::systemClockToTimestamp(secret_data.last_updated_, last_updated_ts);
     secret.set_name(secret_data.resource_name_);
     if (secret_ready) {
@@ -247,7 +278,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     dump_secret->set_name(secret_data.resource_name_);
     dump_secret->set_version_info(secret_data.version_info_);
     *dump_secret->mutable_last_updated() = last_updated_ts;
-    dump_secret->mutable_secret()->PackFrom(secret);
+    std::ignore = dump_secret->mutable_secret()->PackFrom(secret);
   }
 
   // Handling dynamic cert validation context providers.
@@ -266,7 +297,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     if (!name_matcher.match(secret.name())) {
       continue;
     }
-    ProtobufWkt::Timestamp last_updated_ts;
+    Protobuf::Timestamp last_updated_ts;
     envoy::admin::v3::SecretsConfigDump::DynamicSecret* dump_secret;
     TimestampUtil::systemClockToTimestamp(secret_data.last_updated_, last_updated_ts);
     if (secret_ready) {
@@ -277,7 +308,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     dump_secret->set_version_info(secret_data.version_info_);
     *dump_secret->mutable_last_updated() = last_updated_ts;
     dump_secret->set_name(secret_data.resource_name_);
-    dump_secret->mutable_secret()->PackFrom(secret);
+    std::ignore = dump_secret->mutable_secret()->PackFrom(secret);
   }
 
   // Handle dynamic session keys providers providers.
@@ -294,7 +325,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     if (!name_matcher.match(secret.name())) {
       continue;
     }
-    ProtobufWkt::Timestamp last_updated_ts;
+    Protobuf::Timestamp last_updated_ts;
     TimestampUtil::systemClockToTimestamp(secret_data.last_updated_, last_updated_ts);
     envoy::admin::v3::SecretsConfigDump::DynamicSecret* dump_secret;
     if (secret_ready) {
@@ -306,7 +337,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     dump_secret->set_version_info(secret_data.version_info_);
     *dump_secret->mutable_last_updated() = last_updated_ts;
     MessageUtil::redact(secret);
-    dump_secret->mutable_secret()->PackFrom(secret);
+    std::ignore = dump_secret->mutable_secret()->PackFrom(secret);
   }
 
   // Handle dynamic generic secret providers.
@@ -323,7 +354,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     if (!name_matcher.match(secret.name())) {
       continue;
     }
-    ProtobufWkt::Timestamp last_updated_ts;
+    Protobuf::Timestamp last_updated_ts;
     TimestampUtil::systemClockToTimestamp(secret_data.last_updated_, last_updated_ts);
     envoy::admin::v3::SecretsConfigDump::DynamicSecret* dump_secret;
     if (secret_ready) {
@@ -335,7 +366,7 @@ SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher
     dump_secret->set_version_info(secret_data.version_info_);
     *dump_secret->mutable_last_updated() = last_updated_ts;
     MessageUtil::redact(secret);
-    dump_secret->mutable_secret()->PackFrom(secret);
+    std::ignore = dump_secret->mutable_secret()->PackFrom(secret);
   }
 
   return config_dump;

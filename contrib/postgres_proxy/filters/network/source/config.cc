@@ -1,5 +1,12 @@
 #include "contrib/postgres_proxy/filters/network/source/config.h"
 
+#include <format>
+
+#include "envoy/common/exception.h"
+
+#include "source/extensions/filters/common/rbac/engine_impl.h"
+#include "source/extensions/filters/common/rbac/utility.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace NetworkFilters {
@@ -8,20 +15,35 @@ namespace PostgresProxy {
 /**
  * Config registration for the Postgres proxy filter. @see NamedNetworkFilterConfigFactory.
  */
-Network::FilterFactoryCb
+absl::StatusOr<Network::FilterFactoryCb>
 NetworkFilters::PostgresProxy::PostgresConfigFactory::createFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy& proto_config,
     Server::Configuration::FactoryContext& context) {
   ASSERT(!proto_config.stat_prefix().empty());
 
   PostgresFilterConfig::PostgresFilterConfigOptions config_options;
-  config_options.stats_prefix_ = fmt::format("postgres.{}", proto_config.stat_prefix());
+  config_options.stats_prefix_ = std::format("postgres.{}", proto_config.stat_prefix());
   config_options.enable_sql_parsing_ =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto_config, enable_sql_parsing, true);
   config_options.terminate_ssl_ = proto_config.terminate_ssl();
+  if (config_options.terminate_ssl_) {
+    ENVOY_LOG(info,
+              "postgres_proxy: terminate_ssl is deprecated, please use downstream_ssl instead.");
+  }
+  config_options.upstream_ssl_ = proto_config.upstream_ssl();
+  config_options.downstream_ssl_ = proto_config.downstream_ssl();
 
   PostgresFilterConfigSharedPtr filter_config(
       std::make_shared<PostgresFilterConfig>(config_options, context.scope()));
+  if (proto_config.has_rules()) {
+    RETURN_IF_NOT_OK(Filters::Common::RBAC::validateRbacRules(proto_config.rules()));
+    filter_config->engine_ =
+        std::make_unique<Filters::Common::RBAC::RoleBasedAccessControlEngineImpl>(
+            proto_config.rules(), context.messageValidationVisitor(),
+            context.serverFactoryContext());
+    filter_config->authorization_enforced_ =
+        proto_config.rules().action() != envoy::config::rbac::v3::RBAC::LOG;
+  }
   return [filter_config](Network::FilterManager& filter_manager) -> void {
     filter_manager.addFilter(std::make_shared<PostgresFilter>(filter_config));
   };

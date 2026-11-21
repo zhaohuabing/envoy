@@ -1,10 +1,12 @@
 #pragma once
 
+#include "envoy/event/dispatcher.h"
 #include "envoy/extensions/filters/http/aws_request_signing/v3/aws_request_signing.pb.h"
 #include "envoy/http/filter.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 
+#include "source/common/common/cancel_wrapper.h"
 #include "source/extensions/common/aws/signer.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
@@ -34,9 +36,9 @@ struct FilterStats {
 /**
  * Abstract filter configuration.
  */
-class FilterConfig {
+class FilterConfig : public Router::RouteSpecificFilterConfig {
 public:
-  virtual ~FilterConfig() = default;
+  ~FilterConfig() override = default;
 
   /**
    * @return the config's signer.
@@ -54,7 +56,7 @@ public:
   virtual const std::string& hostRewrite() const PURE;
 
   /**
-   * @return  whether or not to buffer and sign the payload.
+   * @return whether or not to buffer and sign the payload.
    */
   virtual bool useUnsignedPayload() const PURE;
 };
@@ -67,7 +69,9 @@ using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
 class FilterConfigImpl : public FilterConfig {
 public:
   FilterConfigImpl(Extensions::Common::Aws::SignerPtr&& signer, const std::string& stats_prefix,
-                   Stats::Scope& scope, const std::string& host_rewrite, bool use_unsigned_payload);
+                   Stats::Scope& scope, const std::string& host_rewrite, bool use_unsigned_payload,
+                   Event::Dispatcher& main_dispatcher);
+  ~FilterConfigImpl() override;
 
   Extensions::Common::Aws::Signer& signer() override;
   FilterStats& stats() override;
@@ -75,6 +79,7 @@ public:
   bool useUnsignedPayload() const override;
 
 private:
+  Event::Dispatcher& main_dispatcher_;
   Extensions::Common::Aws::SignerPtr signer_;
   FilterStats stats_;
   std::string host_rewrite_;
@@ -87,16 +92,26 @@ private:
 class Filter : public Http::PassThroughDecoderFilter, Logger::Loggable<Logger::Id::filter> {
 public:
   Filter(const std::shared_ptr<FilterConfig>& config);
+  ~Filter() override { cancel_callback_(); }
 
   static FilterStats generateStats(const std::string& prefix, Stats::Scope& scope);
 
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
                                           bool end_stream) override;
+
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
 
 private:
+  FilterConfig& getConfig() const;
+  void continueDecodeHeaders(FilterConfig& config);
+  void continueDecodeData(FilterConfig& config, const std::string hash);
+
+  void addSigningStats(FilterConfig& config, absl::Status status) const;
+  void addSigningPayloadStats(FilterConfig& config, absl::Status status) const;
+
   std::shared_ptr<FilterConfig> config_;
   Http::RequestHeaderMap* request_headers_{};
+  Envoy::CancelWrapper::CancelFunction cancel_callback_ = []() {};
 };
 
 } // namespace AwsRequestSigningFilter

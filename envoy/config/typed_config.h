@@ -1,5 +1,8 @@
 #pragma once
 
+#include <set>
+#include <string>
+
 #include "envoy/common/pure.h"
 
 #include "source/common/common/assert.h"
@@ -29,9 +32,10 @@ public:
   virtual std::string category() const PURE;
 
   /**
-   * @return configuration proto full name, or empty for untyped factories.
+   * @return all full names of configuration protos that used by the factory. Empty set
+   * will be returned for untyped factories.
    */
-  virtual std::string configType() { return ""; }
+  virtual std::set<std::string> configTypes() { return {}; }
 };
 
 /**
@@ -48,10 +52,11 @@ public:
    */
   virtual ProtobufTypes::MessagePtr createEmptyConfigProto() PURE;
 
-  std::string configType() override {
+  std::set<std::string> configTypes() override {
     auto ptr = createEmptyConfigProto();
     ASSERT(ptr != nullptr);
-    return ptr->GetDescriptor()->full_name();
+    Protobuf::ReflectableMessage reflectable_message = createReflectableMessage(*ptr);
+    return {std::string(reflectable_message->GetDescriptor()->full_name())};
   }
 };
 

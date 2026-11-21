@@ -17,21 +17,23 @@ TEST(GrpcHttp1BridgeFilterConfigTest, GrpcHttp1BridgeFilter) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   GrpcHttp1BridgeFilterConfig factory;
   envoy::extensions::filters::http::grpc_http1_bridge::v3::Config config;
-  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context);
+  Http::FilterFactoryCb cb = factory.createFilterFactoryFromProto(config, "stats", context).value();
   Http::MockFilterChainFactoryCallbacks filter_callback;
   EXPECT_CALL(filter_callback, addStreamFilter(_));
   cb(filter_callback);
 }
 
-// Test that the deprecated extension name is disabled by default.
-// TODO(zuercher): remove when envoy.deprecated_features.allow_deprecated_extension_names is removed
-TEST(GrpcHttp1BridgeFilterConfigTest, DEPRECATED_FEATURE_TEST(DeprecatedExtensionFilterName)) {
-  const std::string deprecated_name = "envoy.grpc_http1_bridge";
-
-  ASSERT_EQ(
-      nullptr,
-      Registry::FactoryRegistry<Server::Configuration::NamedHttpFilterConfigFactory>::getFactory(
-          deprecated_name));
+TEST(GrpcHttp1BridgeFilterConfigTest, GrpcHttp1BridgeFilterWithServerContext) {
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  GrpcHttp1BridgeFilterConfig factory;
+  envoy::extensions::filters::http::grpc_http1_bridge::v3::Config config;
+  Server::Configuration::ExtraFactoryContext extra_context{context.messageValidationVisitor(),
+                                                           "stats"};
+  Http::FilterFactoryCb cb =
+      factory.createHttpFilterFactoryFromProto(config, context, extra_context).value();
+  Http::MockFilterChainFactoryCallbacks filter_callback;
+  EXPECT_CALL(filter_callback, addStreamFilter(_));
+  cb(filter_callback);
 }
 
 } // namespace

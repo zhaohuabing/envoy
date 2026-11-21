@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "envoy/admin/v3/init_dump.pb.h"
@@ -19,8 +18,7 @@ class InitDumpHandler : public HandlerContextBase {
 public:
   InitDumpHandler(Server::Instance& server);
 
-  Http::Code handlerInitDump(absl::string_view path_and_query,
-                             Http::ResponseHeaderMap& response_headers, Buffer::Instance& response,
+  Http::Code handlerInitDump(Http::ResponseHeaderMap& response_headers, Buffer::Instance& response,
                              AdminStream&) const;
 
 private:
@@ -28,7 +26,7 @@ private:
    * Helper methods for the /init_dump url handler to add unready targets information.
    */
   std::unique_ptr<envoy::admin::v3::UnreadyTargetsDumps>
-  dumpUnreadyTargets(const absl::optional<std::string>& target) const;
+  dumpUnreadyTargets(const std::optional<std::string>& target) const;
 
   /**
    * Helper methods for the /init_dump url handler to add unready targets config of listeners.

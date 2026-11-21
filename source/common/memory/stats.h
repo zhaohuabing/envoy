@@ -2,8 +2,25 @@
 
 #include <cstdint>
 
+#include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/event/dispatcher.h"
+
+#include "source/common/common/thread.h"
+#include "source/common/protobuf/utility.h"
+
 namespace Envoy {
 namespace Memory {
+
+constexpr absl::string_view TCMALLOC_ROUTINE_THREAD_ID = "TcmallocProcessBackgroundActions";
+constexpr absl::string_view GPERFTOOLS_RELEASE_THREAD_ID = "gperf_release";
+constexpr uint64_t DEFAULT_MAX_UNFREED_MEMORY_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Accessors for the configurable max unfreed memory threshold. This value controls when
+ * tryShrinkHeap releases memory back to the OS. Defaults to 100 MB.
+ */
+uint64_t maxUnfreedMemoryBytes();
+void setMaxUnfreedMemoryBytes(uint64_t value);
 
 /**
  * Runtime stats for process memory usage.
@@ -49,6 +66,38 @@ public:
    * Log detailed stats about current memory allocation. Intended for debugging purposes.
    */
   static void dumpStatsToLog();
+
+  /**
+   * Get detailed stats about current memory allocation. Returns nullopt if not supported.
+   */
+  static std::optional<std::string> dumpStats();
+};
+
+/**
+ * Manages tcmalloc background memory release. With Google's tcmalloc a dedicated thread runs
+ * ProcessBackgroundActions. With `gperftools` tcmalloc a dispatcher thread releases the configured
+ * number of bytes every interval.
+ */
+class AllocatorManager {
+public:
+  AllocatorManager(Api::Api& api,
+                   const envoy::config::bootstrap::v3::MemoryAllocatorManager& config);
+
+  ~AllocatorManager();
+
+private:
+  const uint64_t bytes_to_release_;
+  const std::chrono::milliseconds memory_release_interval_msec_;
+  const size_t background_release_rate_bytes_per_second_;
+  Api::Api& api_;
+  Thread::ThreadPtr tcmalloc_thread_;
+  // Declared after the dispatcher so the timer is destroyed first.
+  Event::DispatcherPtr tcmalloc_routine_dispatcher_;
+  Event::TimerPtr memory_release_timer_;
+  void configureBackgroundMemoryRelease();
+  void configureTcmallocOptions(const envoy::config::bootstrap::v3::MemoryAllocatorManager& config);
+  // Used for testing.
+  friend class AllocatorManagerPeer;
 };
 
 } // namespace Memory

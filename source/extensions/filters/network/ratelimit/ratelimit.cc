@@ -1,14 +1,22 @@
 #include "source/extensions/filters/network/ratelimit/ratelimit.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <string>
+#include <vector>
 
 #include "envoy/extensions/filters/network/ratelimit/v3/rate_limit.pb.h"
 #include "envoy/stats/scope.h"
 
 #include "source/common/common/fmt.h"
+#include "source/common/config/well_known_names.h"
+#include "source/common/formatter/substitution_formatter.h"
+#include "source/common/stats/utility.h"
 #include "source/common/tracing/http_tracer_impl.h"
 #include "source/extensions/filters/network/well_known_names.h"
+
+#include "absl/strings/str_cat.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -18,20 +26,52 @@ namespace RateLimitFilter {
 Config::Config(const envoy::extensions::filters::network::ratelimit::v3::RateLimit& config,
                Stats::Scope& scope, Runtime::Loader& runtime)
     : domain_(config.domain()), stats_(generateStats(config.stat_prefix(), scope)),
-      runtime_(runtime), failure_mode_deny_(config.failure_mode_deny()) {
+      runtime_(runtime), failure_mode_deny_(config.failure_mode_deny()),
+      request_headers_(Http::RequestHeaderMapImpl::create()),
+      response_headers_(Http::ResponseHeaderMapImpl::create()),
+      response_trailers_(Http::ResponseTrailerMapImpl::create()) {
   for (const auto& descriptor : config.descriptors()) {
     RateLimit::Descriptor new_descriptor;
     for (const auto& entry : descriptor.entries()) {
       new_descriptor.entries_.push_back({entry.key(), entry.value()});
+      substitution_formatters_.push_back(
+          THROW_OR_RETURN_VALUE(Formatter::FormatterImpl::create(entry.value(), false),
+                                std::unique_ptr<Formatter::FormatterImpl>));
     }
-    descriptors_.push_back(new_descriptor);
+    original_descriptors_.push_back(new_descriptor);
   }
 }
 
+std::vector<RateLimit::Descriptor>
+Config::applySubstitutionFormatter(StreamInfo::StreamInfo& stream_info) {
+
+  std::vector<RateLimit::Descriptor> dynamic_descriptors;
+  dynamic_descriptors.reserve(descriptors().size());
+  std::vector<std::unique_ptr<Formatter::FormatterImpl>>::iterator formatter_it =
+      substitution_formatters_.begin();
+  for (const RateLimit::Descriptor& descriptor : descriptors()) {
+    RateLimit::Descriptor new_descriptor;
+    new_descriptor.entries_.reserve(descriptor.entries_.size());
+    for (const RateLimit::DescriptorEntry& descriptor_entry : descriptor.entries_) {
+
+      std::string value = descriptor_entry.value_;
+      value = formatter_it->get()->format(
+          {request_headers_.get(), response_headers_.get(), response_trailers_.get(), value},
+          stream_info);
+      formatter_it++;
+      new_descriptor.entries_.push_back({descriptor_entry.key_, value});
+    }
+    dynamic_descriptors.push_back(new_descriptor);
+  }
+  return dynamic_descriptors;
+}
+
 InstanceStats Config::generateStats(const std::string& name, Stats::Scope& scope) {
-  std::string final_prefix = fmt::format("ratelimit.{}.", name);
-  return {ALL_TCP_RATE_LIMIT_STATS(POOL_COUNTER_PREFIX(scope, final_prefix),
-                                   POOL_GAUGE_PREFIX(scope, final_prefix))};
+  // ratelimit.(<stat_prefix>.)*: the stat prefix is the tag of every stat.
+  const Stats::TagStringView tag{Envoy::Config::TagNames::get().RATELIMIT_PREFIX, name};
+  Stats::LiteScopeHelper helper(scope, "ratelimit", {tag}, absl::StrCat("ratelimit.", name),
+                                /*sanitize=*/false);
+  return {ALL_TCP_RATE_LIMIT_STATS(POOL_COUNTER(helper), POOL_GAUGE(helper))};
 }
 
 Network::FilterStatus Filter::onData(Buffer::Instance&, bool) {
@@ -50,8 +90,10 @@ Network::FilterStatus Filter::onNewConnection() {
     config_->stats().active_.inc();
     config_->stats().total_.inc();
     calling_limit_ = true;
-    client_->limit(*this, config_->domain(), config_->descriptors(), Tracing::NullSpan::instance(),
-                   filter_callbacks_->connection().streamInfo());
+    client_->limit(
+        *this, config_->domain(),
+        config_->applySubstitutionFormatter(filter_callbacks_->connection().streamInfo()),
+        Tracing::NullSpan::instance(), filter_callbacks_->connection().streamInfo(), 0);
     calling_limit_ = false;
   }
 
@@ -72,7 +114,7 @@ void Filter::onEvent(Network::ConnectionEvent event) {
 }
 
 void Filter::complete(Filters::Common::RateLimit::LimitStatus status,
-                      Filters::Common::RateLimit::DescriptorStatusListPtr&&,
+                      Filters::Common::RateLimit::DescriptorStatusListPtr&& descriptor_statuses,
                       Http::ResponseHeaderMapPtr&&, Http::RequestHeaderMapPtr&&, const std::string&,
                       Filters::Common::RateLimit::DynamicMetadataPtr&& dynamic_metadata) {
   if (dynamic_metadata != nullptr && !dynamic_metadata->fields().empty()) {
@@ -82,6 +124,13 @@ void Filter::complete(Filters::Common::RateLimit::LimitStatus status,
 
   status_ = Status::Complete;
   config_->stats().active_.dec();
+
+  if (descriptor_statuses != nullptr &&
+      std::any_of(
+          descriptor_statuses->begin(), descriptor_statuses->end(),
+          [](const auto& descriptor_status) { return descriptor_status.shadow_over_limit(); })) {
+    config_->stats().shadow_over_limit_.inc();
+  }
 
   switch (status) {
   case Filters::Common::RateLimit::LimitStatus::OK:
@@ -98,7 +147,8 @@ void Filter::complete(Filters::Common::RateLimit::LimitStatus status,
   if (status == Filters::Common::RateLimit::LimitStatus::OverLimit &&
       config_->runtime().snapshot().featureEnabled("ratelimit.tcp_filter_enforcing", 100)) {
     config_->stats().cx_closed_.inc();
-    filter_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+    filter_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush,
+                                          "ratelimit_close_over_limit");
   } else if (status == Filters::Common::RateLimit::LimitStatus::Error) {
     if (config_->failureModeAllow()) {
       config_->stats().failure_mode_allowed_.inc();
@@ -107,7 +157,8 @@ void Filter::complete(Filters::Common::RateLimit::LimitStatus status,
       }
     } else {
       config_->stats().cx_closed_.inc();
-      filter_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+      filter_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush,
+                                            "ratelimit_error_failure_mode_connection_close");
     }
   } else {
     // We can get completion inline, so only call continue if that isn't happening.

@@ -3,6 +3,7 @@
 #include <functional>
 #include <list>
 
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/http/filter.h"
 #include "envoy/server/admin.h"
 
@@ -28,7 +29,13 @@ public:
       absl::string_view path_and_query, Http::ResponseHeaderMap& response_headers,
       Buffer::OwnedImpl& response, AdminFilter& filter)>;
 
-  AdminFilter(AdminServerCallbackFunction admin_server_run_callback_func);
+  /**
+   * Instantiates an AdminFilter.
+   *
+   * @param admin the admin context from which to create the filter. This is used
+   *        to create a request object based on the path.
+   */
+  AdminFilter(const Admin& admin);
 
   // Http::StreamFilterBase
   // Handlers relying on the reference should use addOnDestroyCallback()
@@ -51,16 +58,37 @@ public:
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
     return encoder_callbacks_->http1StreamEncoderOptions();
   }
+  Http::Utility::QueryParamsMulti queryParams() const override;
 
 private:
   /**
    * Called when an admin request has been completely received.
    */
   void onComplete();
-  AdminServerCallbackFunction admin_server_callback_func_;
+
+  /**
+   * Encodes the next chunk of request_.
+   * @return true if there are more chunks to encode and the stream is still alive.
+   */
+  bool encodeNextChunk();
+
+  /**
+   * Schedules encodeNextChunk() on the next event loop iteration, so a large response does not
+   * block the main thread.
+   */
+  void scheduleNextChunk();
+
+  const Admin& admin_;
+  // Latched at construction so the runtime guard is not re-read for every request chunk.
+  const bool yield_between_chunks_;
   Http::RequestHeaderMap* request_headers_{};
   std::list<std::function<void()>> on_destroy_callbacks_;
   bool end_stream_on_complete_ = true;
+
+  // The request whose response is still being streamed, if any.
+  Admin::RequestPtr request_;
+  Event::SchedulableCallbackPtr next_chunk_cb_;
+  bool destroyed_{false};
 };
 
 } // namespace Server
