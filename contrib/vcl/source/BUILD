@@ -4,60 +4,12 @@ load(
     "envoy_cc_library",
     "envoy_contrib_package",
 )
-load("@rules_cc//cc:defs.bzl", "cc_library")
-load("@rules_python//python:defs.bzl", "py_binary")
-load("@base_pip3//:requirements.bzl", "requirement")
 
 licenses(["notice"])  # Apache 2
 
 # VPP Comms Lib (VCL) adaptor.
 
 envoy_contrib_package()
-
-cc_library(
-    name = "vpp_vcl",
-    srcs = [
-        "external/libsvm.a",
-        "external/libvlibmemoryclient.a",
-        "external/libvppcom.a",
-        "external/libvppinfra.a",
-    ],
-    hdrs = ["external/vppcom.h"],
-    defines = ["VPP_VCL"],
-    includes = ["external/"],
-    tags = ["skip_on_windows"],
-    visibility = ["//visibility:public"],
-)
-
-genrule(
-    name = "build",
-    srcs = [
-        "@com_github_fdio_vpp_vcl//:all",
-    ],
-    outs = [
-        "external/libvppcom.a",
-        "external/libvppinfra.a",
-        "external/libsvm.a",
-        "external/libvlibmemoryclient.a",
-        "external/vppcom.h",
-    ],
-    cmd = """
-        ./$(location :vcl_build_launcher) vpp_vcl_build.sh $(location external/libvppcom.a)
-    """,
-    tools = [
-        ":vcl_build_launcher",
-    ],
-)
-
-py_binary(
-    name = "vcl_build_launcher",
-    srcs = ["vcl_build_launcher.py"],
-    data = [
-        "vpp_vcl_build.sh",
-    ],
-    main = "vcl_build_launcher.py",
-    deps = [requirement("ply")],
-)
 
 envoy_cc_library(
     name = "vcl_interface_lib",
@@ -73,7 +25,7 @@ envoy_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        ":vpp_vcl",
+        "//bazel/deps:vpp_vcl",
         "//envoy/event:dispatcher_interface",
         "//envoy/network:socket_interface",
         "//source/common/common:minimal_logger_lib",

@@ -11,13 +11,13 @@ envoy_package()
 envoy_cc_library(
     name = "async_client_interface",
     hdrs = ["async_client.h"],
-    external_deps = ["abseil_optional"],
     deps = [
         ":status",
         "//envoy/buffer:buffer_interface",
         "//envoy/http:async_client_interface",
         "//envoy/http:header_map_interface",
-        "//envoy/tracing:http_tracer_interface",
+        "//envoy/stream_info:stream_info_interface",
+        "//envoy/tracing:tracer_interface",
         "//source/common/common:assert_lib",
         "//source/common/protobuf",
     ],
@@ -29,6 +29,8 @@ envoy_cc_library(
     deps = [
         ":async_client_interface",
         "//envoy/stats:stats_interface",
+        "//source/common/common:hash_lib",
+        "//source/common/protobuf:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )
@@ -45,9 +47,7 @@ envoy_cc_library(
 envoy_cc_library(
     name = "google_grpc_creds_interface",
     hdrs = ["google_grpc_creds.h"],
-    external_deps = [
-        "grpc",
-    ],
+    external_deps = ["grpc"],
     deps = [
         "//envoy/api:api_interface",
         "//envoy/config:typed_config_interface",

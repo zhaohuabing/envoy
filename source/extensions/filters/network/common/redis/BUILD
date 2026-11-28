@@ -20,7 +20,25 @@ envoy_cc_library(
 envoy_cc_library(
     name = "utility_interface",
     hdrs = ["utility.h"],
-    deps = [":codec_interface"],
+    deps = [
+        ":codec_interface",
+        "@abseil-cpp//absl/strings:string_view",
+    ],
+)
+
+envoy_cc_library(
+    name = "aws_iam_authenticator_lib",
+    srcs = ["aws_iam_authenticator_impl.cc"],
+    hdrs = ["aws_iam_authenticator_impl.h"],
+    deps = [
+        ":utility_lib",
+        "//source/extensions/common/aws:credential_provider_chains_lib",
+        "//source/extensions/common/aws:region_provider_impl_lib",
+        "//source/extensions/common/aws:signer_interface",
+        "//source/extensions/common/aws/signers:sigv4_signer_impl_lib",
+        "@envoy_api//envoy/extensions/common/aws/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/redis_proxy/v3:pkg_cc_proto",
+    ],
 )
 
 envoy_cc_library(
@@ -32,14 +50,20 @@ envoy_cc_library(
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/common:utility_lib",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/strings:string_view",
+        "@abseil-cpp//absl/types:span",
     ],
 )
 
 envoy_cc_library(
     name = "supported_commands_lib",
+    srcs = ["supported_commands.cc"],
     hdrs = ["supported_commands.h"],
     deps = [
         "//source/common/common:macros",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/container:flat_hash_set",
     ],
 )
 
@@ -47,9 +71,14 @@ envoy_cc_library(
     name = "client_interface",
     hdrs = ["client.h"],
     deps = [
+        ":aws_iam_authenticator_lib",
         ":codec_lib",
         ":redis_command_stats_lib",
+        "//envoy/common:optref_lib",
+        "//envoy/stats:stats_interface",
         "//envoy/upstream:cluster_manager_interface",
+        "//source/extensions/common/aws/signers:sigv4_signer_impl_lib",
+        "@envoy_api//envoy/extensions/filters/network/redis_proxy/v3:pkg_cc_proto",
     ],
 )
 
@@ -58,6 +87,7 @@ envoy_cc_library(
     srcs = ["client_impl.cc"],
     hdrs = ["client_impl.h"],
     deps = [
+        ":aws_iam_authenticator_lib",
         ":client_interface",
         ":codec_lib",
         ":utility_lib",
@@ -69,8 +99,9 @@ envoy_cc_library(
         "//source/common/common:assert_lib",
         "//source/common/network:filter_lib",
         "//source/common/protobuf:utility_lib",
-        "//source/common/upstream:load_balancer_lib",
+        "//source/common/upstream:load_balancer_context_base_lib",
         "//source/common/upstream:upstream_lib",
+        "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/extensions/filters/network/redis_proxy/v3:pkg_cc_proto",
     ],
 )
@@ -82,6 +113,7 @@ envoy_cc_library(
     deps = [
         ":codec_lib",
         "//source/common/common:utility_lib",
+        "@abseil-cpp//absl/strings:string_view",
     ],
 )
 

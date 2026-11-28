@@ -18,6 +18,10 @@ envoy_extension_cc_test(
         "starttls_socket_test.cc",
     ],
     extension_names = ["envoy.transport_sockets.starttls"],
+    rbe_pool = {
+        "gcc": {"build": "linux_x64_small"},
+        "coverage": {"link": "linux_x64_small"},
+    },
     deps = [
         "//source/common/network:transport_socket_options_lib",
         "//source/extensions/transport_sockets/starttls:config",
@@ -33,6 +37,7 @@ envoy_proto_library(
 
 envoy_extension_cc_test(
     name = "starttls_integration_test",
+    size = "large",
     srcs = [
         "starttls_integration_test.cc",
     ],
@@ -40,6 +45,11 @@ envoy_extension_cc_test(
         "//test/config/integration/certs",
     ],
     extension_names = ["envoy.transport_sockets.starttls"],
+    rbe_pool = {
+        "openssl": {"link": "linux_x64_small"},
+        "coverage": {"link": "linux_x64_large"},
+        "tsan": {"link": "linux_x64_small"},
+    },
     deps = [
         ":starttls_integration_proto_cc_proto",
         "//source/extensions/filters/network/tcp_proxy:config",
@@ -53,6 +63,7 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "upstream_starttls_integration_test",
+    size = "large",
     srcs = [
         "upstream_starttls_integration_test.cc",
     ],
@@ -60,10 +71,28 @@ envoy_extension_cc_test(
         "//test/config/integration/certs",
     ],
     extension_names = ["envoy.transport_sockets.starttls"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "openssl": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_large",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
     deps = [
         ":starttls_integration_proto_cc_proto",
+        "//source/extensions/filters/network/common:factory_base_lib",
         "//source/extensions/transport_sockets/starttls:config",
         "//test/integration:integration_lib",
+        "//test/mocks/network:connection_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/test_common:registry_lib",
     ],
 )

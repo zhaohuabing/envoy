@@ -8,6 +8,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "contrib/common/sqlutils/source/sqlutils.h"
+#include "contrib/postgres/protocol/postgres_protocol.h"
 #include "contrib/postgres_proxy/filters/network/source/postgres_message.h"
 #include "contrib/postgres_proxy/filters/network/source/postgres_session.h"
 
@@ -43,7 +44,23 @@ public:
 
   virtual void processQuery(const std::string&) PURE;
 
+  enum class StartupPacketType { StartupMessage, CancelRequest, SSLRequest, GSSENCRequest };
+  virtual bool authorizationEnabled() const PURE;
+  virtual bool authorizationEnforced() const PURE;
+  virtual bool authorizeStartup(StartupPacketType packet_type) PURE;
+  virtual void rejectInvalidStartup() PURE;
+  virtual bool shouldPassthroughSSL() const PURE;
+  virtual void rejectEncryptionNegotiation(absl::string_view reason) PURE;
+  virtual void declineGSSEncryption() PURE;
   virtual bool onSSLRequest() PURE;
+  virtual bool shouldEncryptUpstream() const PURE;
+  virtual void sendUpstream(Buffer::Instance&) PURE;
+  virtual bool encryptUpstream(bool, Buffer::Instance&) PURE;
+  /**
+   * If downstream SSL is required but client didn't initiate SSL,
+   * close the downstream connection and return false.
+   */
+  virtual bool verifyDownstreamSSL() PURE;
 };
 
 // Postgres message decoder.
@@ -54,11 +71,11 @@ public:
   // The following values are returned by the decoder, when filter
   // passes bytes of data via onData method:
   enum class Result {
-    ReadyForNext, // Decoder processed previous message and is ready for the next message.
-    NeedMoreData, // Decoder needs more data to reconstruct the message.
-    Stopped // Received and processed message disrupts the current flow. Decoder stopped accepting
-            // data. This happens when decoder wants filter to perform some action, for example to
-            // call starttls transport socket to enable TLS.
+    ReadyForNext,        // Decoder processed previous message and is ready for the next message.
+    NeedMoreData,        // Decoder needs more data to reconstruct the message.
+    NeedMoreStartupData, // Initial message is incomplete; retain its original bytes until complete.
+    Stopped              // Don't forward data to the next filter; the message was consumed locally
+                         // or the filter must perform an action (e.g., start TLS).
   };
   virtual Result onData(Buffer::Instance& data, bool frontend) PURE;
   virtual PostgresSession& getSession() PURE;
@@ -88,7 +105,15 @@ public:
 
   bool encrypted() const { return encrypted_; }
 
-  enum class State { InitState, InSyncState, OutOfSyncState, EncryptedState };
+  enum class State {
+    InitState,
+    InSyncState,
+    OutOfSyncState,
+    EncryptedState,
+    AwaitingSSLPassthroughReply,
+    NegotiatingUpstreamSSL,
+    RejectedState
+  };
   State state() const { return state_; }
   void state(State state) { state_ = state; }
 
@@ -98,6 +123,10 @@ protected:
   Result onDataInit(Buffer::Instance& data, bool frontend);
   Result onDataInSync(Buffer::Instance& data, bool frontend);
   Result onDataIgnore(Buffer::Instance& data, bool frontend);
+  Result onDataAwaitingSSLPassthroughReply(Buffer::Instance& data, bool frontend);
+  Result onDataInNegotiating(Buffer::Instance& data, bool frontend);
+  void sendUpstreamSSLRequest(State state_after_ssl);
+  Result rejectEncryptionNegotiation(Buffer::Instance& data, absl::string_view reason);
 
   // MsgAction defines the Decoder's method which will be invoked
   // when a specific message has been decoded.
@@ -171,6 +200,8 @@ protected:
   uint32_t message_len_{};
 
   bool encrypted_{false}; // tells if exchange is encrypted
+  bool gss_declined_{false};
+  bool ssl_passthrough_requested_{false};
 
   // Dispatchers for Backend (BE) and Frontend (FE) messages.
   MsgGroup FE_messages_;
@@ -188,10 +219,11 @@ protected:
   MsgParserDict BE_errors_;
   MsgParserDict BE_notices_;
 
-  // MAX_STARTUP_PACKET_LENGTH is defined in Postgres source code
-  // as maximum size of initial packet.
-  // https://github.com/postgres/postgres/search?q=MAX_STARTUP_PACKET_LENGTH&type=code
-  static constexpr uint64_t MAX_STARTUP_PACKET_LENGTH = 10000;
+  // Buffer used to temporarily store a downstream postgres packet
+  // while sending other packets. Currently used only when negotiating
+  // upstream SSL.
+  Buffer::OwnedImpl temp_storage_;
+  State state_after_upstream_ssl_{State::InSyncState};
 };
 
 } // namespace PostgresProxy

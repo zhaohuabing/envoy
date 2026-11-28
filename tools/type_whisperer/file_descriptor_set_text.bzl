@@ -1,22 +1,42 @@
-load("@rules_proto//proto:defs.bzl", "ProtoInfo")
+load("@protobuf//bazel/common:proto_info.bzl", "ProtoInfo")
+load(":utils.bzl", "normalize_workspace_name")
 
 def _file_descriptor_set_text(ctx):
-    file_descriptor_sets = depset()
-    for dep in ctx.attr.deps:
-        file_descriptor_sets = depset(transitive = [
-            file_descriptor_sets,
-            dep[ProtoInfo].transitive_descriptor_sets,
-        ])
+    file_descriptor_sets = depset(
+        transitive = [dep[ProtoInfo].transitive_descriptor_sets for dep in ctx.attr.deps],
+    )
+    proto_repositories = ctx.attr.proto_repositories
+    with_external_deps = ctx.attr.with_external_deps
 
-    args = [ctx.outputs.pb_text.path]
-    for dep in file_descriptor_sets.to_list():
+    def _descriptor_set(dep):
         ws_name = dep.owner.workspace_name
-        if (not ws_name) or ws_name in ctx.attr.proto_repositories or ctx.attr.with_external_deps:
-            args.append(dep.path)
+
+        # TODO(phlax): Cleanup once bzlmod migration is complete
+        # In bzlmod mode, the main workspace is named "_main" instead of being empty
+        # In WORKSPACE mode, the main workspace name is empty
+        # In bzlmod mode, workspace names may have canonical suffixes such as
+        # "envoy_api~" or "envoy_api+". Normalize to the base module name.
+        ws_name_normalized = normalize_workspace_name(ws_name)
+        add_dep = (
+            (not ws_name) or
+            ws_name == "_main" or
+            ws_name_normalized in proto_repositories or
+            with_external_deps
+        )
+        if add_dep:
+            return dep.path
+
+    args = ctx.actions.args()
+    args.add(ctx.outputs.pb_text)
+    args.add_all(
+        file_descriptor_sets,
+        map_each = _descriptor_set,
+        allow_closure = True,
+    )
 
     ctx.actions.run(
         executable = ctx.executable._file_descriptor_set_text_gen,
-        arguments = args,
+        arguments = [args],
         inputs = file_descriptor_sets,
         outputs = [ctx.outputs.pb_text],
         mnemonic = "FileDescriptorSetTextGen",

@@ -20,11 +20,13 @@ Output
   exit with status EXIT_SUCCESS.
 
 Building
+  The tool is included in the :ref:`tools image <install_tools>`.
+
   The tool can be built locally using Bazel. ::
 
-    bazel build //test/tools/config_load_check:config_load_check_tool
+    bazel build //tools/config_load_check:config_load_check_tool
 
 Running
   The tool takes a path as described above. ::
 
-    bazel-bin/test/tools/config_load_check/config_load_check_tool PATH
+    bazel-bin/tools/config_load_check/config_load_check_tool PATH

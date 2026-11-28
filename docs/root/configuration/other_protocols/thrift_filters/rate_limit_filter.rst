@@ -4,8 +4,8 @@ Rate limit
 ==========
 
 * Global rate limiting :ref:`architecture overview <arch_overview_global_rate_limit>`
+* This filter should be configured with the type URL ``type.googleapis.com/envoy.extensions.filters.network.thrift_proxy.filters.ratelimit.v3.RateLimit``.
 * :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.network.thrift_proxy.filters.ratelimit.v3.RateLimit>`
-* This filter should be configured with the name *envoy.filters.thrift.rate_limit*.
 
 The Thrift rate limit filter will call the rate limit service when the request's route has one or
 more :ref:`rate limit configurations
@@ -35,6 +35,7 @@ The filter outputs statistics in the *cluster.<route target cluster>.ratelimit.*
   ok, Counter, Total under limit responses from the rate limit service.
   error, Counter, Total errors contacting the rate limit service.
   over_limit, Counter, Total over limit responses from the rate limit service.
+  shadow_over_limit, Counter, Total responses from the rate limit service with a descriptor over limit in shadow mode.
   failure_mode_allowed, Counter, "Total requests that were error(s) but were allowed through because
   of :ref:`failure_mode_deny
   <envoy_v3_api_field_extensions.filters.network.thrift_proxy.filters.ratelimit.v3.RateLimit.failure_mode_deny>` set to

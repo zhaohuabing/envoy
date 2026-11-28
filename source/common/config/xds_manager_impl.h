@@ -1,0 +1,157 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include "envoy/config/xds_config_tracker.h"
+#include "envoy/config/xds_manager.h"
+
+#include "source/common/common/thread.h"
+#include "source/common/config/subscription_factory_impl.h"
+#include "source/common/config/xds_resource.h"
+
+#include "absl/functional/function_ref.h"
+
+namespace Envoy {
+namespace Config {
+
+class XdsConfigTrackers : public XdsConfigTracker {
+public:
+  ABSL_MUST_USE_RESULT Common::CallbackHandlePtr add(XdsConfigTracker& tracker);
+
+  // Config::XdsConfigTracker
+  bool enabled() const override;
+  void onConfigAccepted(absl::string_view type_url,
+                        const std::vector<DecodedResourcePtr>& resources) override;
+  void
+  onConfigAccepted(absl::string_view type_url,
+                   absl::Span<const envoy::service::discovery::v3::Resource* const> added_resources,
+                   const Protobuf::RepeatedPtrField<std::string>& removed_resources) override;
+  void onConfigAcceptedWithResponse(const envoy::service::discovery::v3::DiscoveryResponse& message,
+                                    const std::vector<DecodedResourcePtr>& resources) override;
+  void onConfigAcceptedWithResponse(
+      const envoy::service::discovery::v3::DeltaDiscoveryResponse& message,
+      absl::Span<const envoy::service::discovery::v3::Resource* const> added_resources,
+      const Protobuf::RepeatedPtrField<std::string>& removed_resources) override;
+  void onConfigRejected(const envoy::service::discovery::v3::DiscoveryResponse& message,
+                        absl::string_view error_detail) override;
+  void onConfigRejected(const envoy::service::discovery::v3::DeltaDiscoveryResponse& message,
+                        absl::string_view error_detail) override;
+  void onResourceUnsubscribed(absl::string_view type_url, absl::string_view resource) override;
+
+private:
+  class Registration;
+  struct Trackers {
+    std::vector<Registration*> entries_;
+    uint32_t iteration_depth_{0};
+    bool has_removed_entries_{false};
+  };
+
+  void forEach(absl::FunctionRef<void(XdsConfigTracker&)> callback);
+
+  // registration handles can outlive the manager during server teardown
+  const std::shared_ptr<Trackers> trackers_{std::make_shared<Trackers>()};
+};
+
+class XdsManagerImpl : public XdsManager {
+public:
+  XdsManagerImpl(Event::Dispatcher& main_thread_dispatcher, Api::Api& api, Stats::Store& stats,
+                 const LocalInfo::LocalInfo& local_info,
+                 ProtobufMessage::ValidationContext& validation_context, Server::Instance& server)
+      : server_(server), main_thread_dispatcher_(main_thread_dispatcher), api_(api),
+        random_(api.randomGenerator()), stats_(stats), local_info_(local_info),
+        validation_context_(validation_context) {}
+
+  // Config::XdsManager
+  absl::Status initialize(const envoy::config::bootstrap::v3::Bootstrap& bootstrap,
+                          Upstream::ClusterManager* cm) override;
+  absl::Status
+  initializeAdsConnections(const envoy::config::bootstrap::v3::Bootstrap& bootstrap) override;
+  void startXdstpAdsMuxes() override;
+  ABSL_MUST_USE_RESULT Common::CallbackHandlePtr
+  addXdsConfigTracker(XdsConfigTracker& tracker) override {
+    return xds_config_trackers_.add(tracker);
+  }
+  absl::StatusOr<SubscriptionPtr> subscribeToSingletonResource(
+      absl::string_view resource_name, OptRef<const envoy::config::core::v3::ConfigSource> config,
+      absl::string_view type_url, Stats::Scope& scope, SubscriptionCallbacks& callbacks,
+      OpaqueResourceDecoderSharedPtr resource_decoder, const SubscriptionOptions& options) override;
+  absl::StatusOr<std::unique_ptr<SingletonSubscription>> subscribeToSingletonResource(
+      absl::string_view resource_name, OptRef<const envoy::config::core::v3::ConfigSource> config,
+      absl::string_view type_url, Stats::Scope& scope, SingletonSubscriptionCallbacks& callbacks,
+      OpaqueResourceDecoderSharedPtr resource_decoder, const SubscriptionOptions& options) override;
+  ScopedResume pause(const std::string& type_url) override {
+    return pause(std::vector<std::string>{type_url});
+  }
+  ScopedResume pause(const std::vector<std::string>& type_urls) override;
+  void shutdown() override { ads_mux_.reset(); }
+  absl::Status
+  setAdsConfigSource(const envoy::config::core::v3::ApiConfigSource& config_source) override;
+
+  Config::GrpcMuxSharedPtr adsMux() override { return ads_mux_; }
+  SubscriptionFactory& subscriptionFactory() override { return *subscription_factory_; }
+
+private:
+  class AuthorityData {
+  public:
+    AuthorityData(const envoy::config::core::v3::ConfigSource& config,
+                  absl::flat_hash_set<std::string>&& authority_names, GrpcMuxSharedPtr&& grpc_mux)
+        : config_(config), authority_names_(std::move(authority_names)),
+          grpc_mux_(std::move(grpc_mux)) {}
+
+    const envoy::config::core::v3::ConfigSource config_;
+    // The set of authority names this config-source supports.
+    // Note that only the `default_config_source` may have an empty list of authority names.
+    absl::flat_hash_set<std::string> authority_names_;
+    // The ADS gRPC mux to the server.
+    Config::GrpcMuxSharedPtr grpc_mux_;
+  };
+
+  // Creates an authority based on a given config source.
+  // Returns the new authority, or an error if one occurred.
+  absl::StatusOr<AuthorityData>
+  createAuthority(const envoy::config::core::v3::ConfigSource& config_source,
+                  bool allow_no_authority_names);
+
+  // Validates (syntactically) the config_source by doing the PGV validation.
+  absl::Status validateAdsConfig(const envoy::config::core::v3::ApiConfigSource& config_source);
+
+  /**
+   * Replaces the current ADS mux with a new one based on the given config.
+   * Assumes that the given ads_config is syntactically valid (according to the PGV constraints).
+   * @param ads_config an ADS config source to use.
+   * @return the status of the operation.
+   */
+  absl::Status replaceAdsMux(const envoy::config::core::v3::ApiConfigSource& ads_config);
+
+  Server::Instance& server_;
+  Event::Dispatcher& main_thread_dispatcher_;
+  Api::Api& api_;
+  Random::RandomGenerator& random_;
+  Stats::Store& stats_;
+  const LocalInfo::LocalInfo& local_info_;
+  ProtobufMessage::ValidationContext& validation_context_;
+  XdsResourcesDelegatePtr xds_resources_delegate_;
+  XdsConfigTrackerPtr xds_config_tracker_;
+  XdsConfigTrackers xds_config_trackers_;
+  Common::CallbackHandlePtr xds_config_tracker_handle_;
+  std::unique_ptr<SubscriptionFactoryImpl> subscription_factory_;
+  // The cm_ will only be valid after the cluster-manager is initialized.
+  // Note that this implies that the xDS-manager must be shut down properly
+  // prior to the cluster-manager deletion.
+  Upstream::ClusterManager* cm_;
+  GrpcMuxSharedPtr ads_mux_;
+
+  // Stores all authorities as configured in the bootstrap under config_sources.
+  // It does not include the default config-source.
+  std::vector<AuthorityData> authorities_;
+
+  // The default authority that will be used for cases where the authority in a resource doesn't
+  // exist, or doesn't match. This will only be populated if default_config_source
+  // is defined in the bootstrap.
+  std::unique_ptr<AuthorityData> default_authority_;
+};
+
+} // namespace Config
+} // namespace Envoy

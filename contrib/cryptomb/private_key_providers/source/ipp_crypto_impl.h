@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "contrib/cryptomb/private_key_providers/source/ipp_crypto.h"
 #include "crypto_mb/cpu_features.h"
 #include "crypto_mb/ec_nistp256.h"
@@ -14,6 +16,13 @@ class IppCryptoImpl : public virtual IppCrypto {
 public:
   int mbxIsCryptoMbApplicable(uint64_t features) override {
     return ::mbx_is_crypto_mb_applicable(features);
+  }
+  uint32_t mbxNistp256EcdsaSignSslMb8(uint8_t* pa_sign_r[8], uint8_t* pa_sign_s[8],
+                                      const uint8_t* const pa_msg[8],
+                                      const BIGNUM* const pa_eph_skey[8],
+                                      const BIGNUM* const pa_reg_skey[8]) override {
+    return ::mbx_nistp256_ecdsa_sign_ssl_mb8(pa_sign_r, pa_sign_s, pa_msg, pa_eph_skey, pa_reg_skey,
+                                             nullptr);
   }
   uint32_t mbxRsaPrivateCrtSslMb8(const uint8_t* const from_pa[8], uint8_t* const to_pa[8],
                                   const BIGNUM* const p_pa[8], const BIGNUM* const q_pa[8],

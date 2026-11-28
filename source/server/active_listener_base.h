@@ -4,39 +4,14 @@
 #include "envoy/network/listener.h"
 #include "envoy/stats/scope.h"
 
+#include "source/common/stats/prefix_utility.h"
+#include "source/common/stats/utility.h"
+#include "source/server/listener_stats.h"
+
+#include "absl/strings/strip.h"
+
 namespace Envoy {
 namespace Server {
-
-#define ALL_LISTENER_STATS(COUNTER, GAUGE, HISTOGRAM)                                              \
-  COUNTER(downstream_cx_destroy)                                                                   \
-  COUNTER(downstream_cx_overflow)                                                                  \
-  COUNTER(downstream_cx_total)                                                                     \
-  COUNTER(downstream_cx_transport_socket_connect_timeout)                                          \
-  COUNTER(downstream_cx_overload_reject)                                                           \
-  COUNTER(downstream_global_cx_overflow)                                                           \
-  COUNTER(downstream_pre_cx_timeout)                                                               \
-  COUNTER(no_filter_chain_match)                                                                   \
-  GAUGE(downstream_cx_active, Accumulate)                                                          \
-  GAUGE(downstream_pre_cx_active, Accumulate)                                                      \
-  HISTOGRAM(downstream_cx_length_ms, Milliseconds)
-
-/**
- * Wrapper struct for listener stats. @see stats_macros.h
- */
-struct ListenerStats {
-  ALL_LISTENER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
-};
-
-#define ALL_PER_HANDLER_LISTENER_STATS(COUNTER, GAUGE)                                             \
-  COUNTER(downstream_cx_total)                                                                     \
-  GAUGE(downstream_cx_active, Accumulate)
-
-/**
- * Wrapper struct for per-handler listener stats. @see stats_macros.h
- */
-struct PerHandlerListenerStats {
-  ALL_PER_HANDLER_LISTENER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
-};
 
 /**
  * Wrapper for an active listener owned by this handler.
@@ -47,9 +22,7 @@ public:
       : stats_({ALL_LISTENER_STATS(POOL_COUNTER(config->listenerScope()),
                                    POOL_GAUGE(config->listenerScope()),
                                    POOL_HISTOGRAM(config->listenerScope()))}),
-        per_worker_stats_({ALL_PER_HANDLER_LISTENER_STATS(
-            POOL_COUNTER_PREFIX(config->listenerScope(), parent.statPrefix()),
-            POOL_GAUGE_PREFIX(config->listenerScope(), parent.statPrefix()))}),
+        per_worker_stats_(generatePerWorkerStats(parent, config->listenerScope())),
         config_(config) {}
 
   // Network::ConnectionHandler::ActiveListener.
@@ -58,6 +31,19 @@ public:
   ListenerStats stats_;
   PerHandlerListenerStats per_worker_stats_;
   Network::ListenerConfig* config_{};
+
+private:
+  static PerHandlerListenerStats generatePerWorkerStats(Network::ConnectionHandler& parent,
+                                                        Stats::Scope& scope) {
+    // listener.<address>.(worker_<id>.)*: the handler's stat prefix is its dispatcher's name
+    // with a trailing dot (strip it), and a worker handler contributes the envoy.worker_id tag.
+    // TODO(wbpcode): Consider to expose the dispatcher name directly from the parent connection
+    // handler.
+    const auto prefix = Stats::workerStatPrefix(scope.symbolTable(), {},
+                                                absl::StripSuffix(parent.statPrefix(), "."));
+    Stats::LiteScopeHelper helper(scope, prefix.baseName(), prefix.tags(), prefix.name());
+    return {ALL_PER_HANDLER_LISTENER_STATS(POOL_COUNTER(helper), POOL_GAUGE(helper))};
+  }
 };
 
 } // namespace Server

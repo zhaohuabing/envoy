@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "envoy/common/pure.h"
@@ -10,7 +12,6 @@
 #include "source/common/common/thread_annotations.h"
 
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Thread {
@@ -55,10 +56,23 @@ using ThreadPtr = std::unique_ptr<Thread>;
 
 // Options specified during thread creation.
 struct Options {
-  std::string name_; // A name supplied for the thread. On Linux this is limited to 15 chars.
+  // A name supplied for the thread. On Linux this is limited to 15 chars.
+  std::string name_;
+  // An optional thread priority for the thread. The value will mean different things on different
+  // platforms. For example, on Linux or Android, the values can range from -20 to 19. On Apple
+  // platforms, the value can range from 1 to 100, which is used to divide by 100 to get a [0,1]
+  // value that can be used on Apple's NSThread.setThreadPriority method.
+  //
+  // If no value is set, the thread will be created with the default thread priority for the
+  // platform.
+  std::optional<int> priority_{std::nullopt};
+
+  // An optional CPU index to pin the thread to. When set, the thread sets its affinity to this
+  // single CPU at start. Supported on Linux, ignored on other platforms.
+  std::optional<uint32_t> cpu_affinity_{std::nullopt};
 };
 
-using OptionsOptConstRef = const absl::optional<Options>&;
+using OptionsOptConstRef = const std::optional<Options>&;
 
 /**
  * Interface providing a mechanism for creating threads.
@@ -74,12 +88,12 @@ public:
    * @param options supplies options specified on thread creation.
    */
   virtual ThreadPtr createThread(std::function<void()> thread_routine,
-                                 OptionsOptConstRef options = absl::nullopt) PURE;
+                                 OptionsOptConstRef options = std::nullopt) PURE;
 
   /**
    * Return the current system thread ID
    */
-  virtual ThreadId currentThreadId() PURE;
+  virtual ThreadId currentThreadId() const PURE;
 };
 
 using ThreadFactoryPtr = std::unique_ptr<ThreadFactory>;

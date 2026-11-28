@@ -3,6 +3,8 @@
 #include "envoy/config/route/v3/scoped_route.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 
+#include "source/common/protobuf/utility.h"
+
 namespace Envoy {
 namespace Router {
 
@@ -27,14 +29,14 @@ HeaderValueExtractorImpl::HeaderValueExtractorImpl(
       ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::HeaderValueExtractor::kIndex) {
     if (header_value_extractor_config_.index() != 0 &&
         header_value_extractor_config_.element_separator().empty()) {
-      throw ProtoValidationException("Index > 0 for empty string element separator.",
-                                     header_value_extractor_config_);
+      ProtoExceptionUtil::throwProtoValidationException(
+          "Index > 0 for empty string element separator.", config_);
     }
   }
   if (header_value_extractor_config_.extract_type_case() ==
       ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::HeaderValueExtractor::EXTRACT_TYPE_NOT_SET) {
-    throw ProtoValidationException("HeaderValueExtractor extract_type not set.",
-                                   header_value_extractor_config_);
+    ProtoExceptionUtil::throwProtoValidationException("HeaderValueExtractor extract_type not set.",
+                                                      config_);
   }
 }
 
@@ -49,7 +51,7 @@ HeaderValueExtractorImpl::computeFragment(const Http::HeaderMap& headers) const 
   // This is an implicitly untrusted header, so per the API documentation only the first
   // value is used.
   std::vector<absl::string_view> elements{header_entry[0]->value().getStringView()};
-  if (header_value_extractor_config_.element_separator().length() > 0) {
+  if (!header_value_extractor_config_.element_separator().empty()) {
     elements = absl::StrSplit(header_entry[0]->value().getStringView(),
                               header_value_extractor_config_.element_separator());
   }
@@ -68,39 +70,42 @@ HeaderValueExtractorImpl::computeFragment(const Http::HeaderMap& headers) const 
       return std::make_unique<StringKeyFragment>(elements[header_value_extractor_config_.index()]);
     }
     break;
-  default:                       // EXTRACT_TYPE_NOT_SET
-    NOT_REACHED_GCOVR_EXCL_LINE; // Caught in constructor already.
+  case ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::HeaderValueExtractor::EXTRACT_TYPE_NOT_SET:
+    PANIC("not reached"); // LCOV_EXCL_LINE
   }
 
   return nullptr;
 }
 
-ScopedRouteInfo::ScopedRouteInfo(envoy::config::route::v3::ScopedRouteConfiguration config_proto,
+ScopedRouteInfo::ScopedRouteInfo(envoy::config::route::v3::ScopedRouteConfiguration&& config_proto,
                                  ConfigConstSharedPtr route_config)
-    : config_proto_(config_proto), route_config_(route_config) {
+    : config_proto_(std::move(config_proto)), route_config_(route_config),
+      config_hash_(MessageUtil::hash(config_proto_)) {
   // TODO(stevenzzzz): Maybe worth a KeyBuilder abstraction when there are more than one type of
   // Fragment.
+  using Fragment = envoy::config::route::v3::ScopedRouteConfiguration::Key::Fragment;
   for (const auto& fragment : config_proto_.key().fragments()) {
     switch (fragment.type_case()) {
-    case envoy::config::route::v3::ScopedRouteConfiguration::Key::Fragment::TypeCase::kStringKey:
+    case Fragment::TypeCase::kStringKey:
       scope_key_.addFragment(std::make_unique<StringKeyFragment>(fragment.string_key()));
       break;
-    default:
-      NOT_REACHED_GCOVR_EXCL_LINE;
+    case Fragment::TypeCase::TYPE_NOT_SET: // LCOV_EXCL_LINE
+      PANIC("not implemented");            // LCOV_EXCL_LINE
     }
   }
 }
 
 ScopeKeyBuilderImpl::ScopeKeyBuilderImpl(ScopedRoutes::ScopeKeyBuilder&& config)
     : ScopeKeyBuilderBase(std::move(config)) {
+  fragment_builders_.reserve(config_.fragments().size());
   for (const auto& fragment_builder : config_.fragments()) {
     switch (fragment_builder.type_case()) {
     case ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::kHeaderValueExtractor:
       fragment_builders_.emplace_back(std::make_unique<HeaderValueExtractorImpl>(
           ScopedRoutes::ScopeKeyBuilder::FragmentBuilder(fragment_builder)));
       break;
-    default:
-      NOT_REACHED_GCOVR_EXCL_LINE;
+    case ScopedRoutes::ScopeKeyBuilder::FragmentBuilder::TYPE_NOT_SET: // LCOV_EXCL_LINE
+      PANIC("not implemented");                                        // LCOV_EXCL_LINE
     }
   }
 }
@@ -120,13 +125,33 @@ ScopeKeyPtr ScopeKeyBuilderImpl::computeScopeKey(const Http::HeaderMap& headers)
 
 void ScopedConfigImpl::addOrUpdateRoutingScopes(
     const std::vector<ScopedRouteInfoConstSharedPtr>& scoped_route_infos) {
+  if (scoped_route_infos.size() > 1) {
+    size_t net_added = 0;
+    if (scoped_route_info_by_name_.empty()) {
+      net_added = scoped_route_infos.size();
+    } else {
+      for (const auto& scoped_route_info : scoped_route_infos) {
+        if (!scoped_route_info_by_name_.contains(scoped_route_info->scopeName())) {
+          ++net_added;
+        }
+      }
+    }
+    // Reserves sufficient space for the new scoped route info; this avoids repeated memory
+    // allocation and rehashing while updating the maps.
+    if (net_added > 0) {
+      scoped_route_info_by_name_.reserve(scoped_route_info_by_name_.size() + net_added);
+      scoped_route_info_by_key_.reserve(scoped_route_info_by_key_.size() + net_added);
+    }
+  }
   for (auto& scoped_route_info : scoped_route_infos) {
     const auto iter = scoped_route_info_by_name_.find(scoped_route_info->scopeName());
     if (iter != scoped_route_info_by_name_.end()) {
       ASSERT(scoped_route_info_by_key_.contains(iter->second->scopeKey().hash()));
       scoped_route_info_by_key_.erase(iter->second->scopeKey().hash());
+      // Explicitly erase from _name_ map to avoid dangling string_view on overwrite.
+      scoped_route_info_by_name_.erase(iter);
     }
-    scoped_route_info_by_name_[scoped_route_info->scopeName()] = scoped_route_info;
+    scoped_route_info_by_name_.emplace(scoped_route_info->scopeName(), scoped_route_info);
     scoped_route_info_by_key_[scoped_route_info->scopeKey().hash()] = scoped_route_info;
   }
 }
@@ -142,24 +167,13 @@ void ScopedConfigImpl::removeRoutingScopes(const std::vector<std::string>& scope
   }
 }
 
-Router::ConfigConstSharedPtr
-ScopedConfigImpl::getRouteConfig(const Http::HeaderMap& headers) const {
-  ScopeKeyPtr scope_key = scope_key_builder_.computeScopeKey(headers);
+Router::ConfigConstSharedPtr ScopedConfigImpl::getRouteConfig(const ScopeKeyPtr& scope_key) const {
   if (scope_key == nullptr) {
     return nullptr;
   }
   auto iter = scoped_route_info_by_key_.find(scope_key->hash());
   if (iter != scoped_route_info_by_key_.end()) {
     return iter->second->routeConfig();
-  }
-  return nullptr;
-}
-
-ScopeKeyPtr ScopedConfigImpl::computeScopeKey(const Http::HeaderMap& headers) const {
-  ScopeKeyPtr scope_key = scope_key_builder_.computeScopeKey(headers);
-  if (scope_key &&
-      scoped_route_info_by_key_.find(scope_key->hash()) != scoped_route_info_by_key_.end()) {
-    return scope_key;
   }
   return nullptr;
 }

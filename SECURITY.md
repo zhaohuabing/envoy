@@ -1,7 +1,11 @@
 # Security Reporting Process
 
-Please report any security issue or Envoy crash report to
-envoy-security@googlegroups.com where the issue will be triaged appropriately.
+If you have found a security issue or an Envoy crash, please
+[open a GitHub Security Advisory](https://github.com/envoyproxy/envoy/security/advisories/new).
+This is the preferred reporting channel, as reports can be triaged directly on GitHub.
+
+Alternatively, you may email [envoy-security@googlegroups.com](mailto:envoy-security@googlegroups.com).
+
 Thank you in advance for helping to keep Envoy secure.
 
 # Security Release Process
@@ -44,11 +48,20 @@ the reporter denies the request for private disclosure, the PST will move swiftl
 release process. In extreme cases GitHub can be asked to delete the issue but this generally isn't
 necessary and is unlikely to make a public disclosure less damaging.
 
+### Handling of Easily or Widely Discovered Vulnerabilities
+
+The PST may, at it's discretion, decide that a privately disclosed vulnerability should be immediately
+made public, if it is decided that the vulnerability is likely to be found by others. Some examples
+are if the same issue is reported multiple times, or if the issue appears obvious to the PST and likely
+to quickly be discovered by others. In this case, the vulnerability will be published and handled
+in the same way as a zero day vulnerability.
+
 ## Patch, Release, and Public Communication
 
 For each vulnerability a member of the PST will volunteer to lead coordination with the "Fix Team"
 and is responsible for sending disclosure emails to the rest of the community. This lead will be
-referred to as the "Fix Lead."
+referred to as the "Fix Lead." The detailed list of responsibilities is outlined on the
+[Fix Lead Checklist](https://docs.google.com/document/d/1cuU0m9hTQ73Te3i06-8LjQkFVn83IL22FbCoc_4IFEY/edit#heading=h.c6thx0zc0gtz)
 
 The role of Fix Lead should rotate round-robin across the PST.
 
@@ -67,8 +80,9 @@ best protect our users.
 
 If the vulnerability affects the last point release version, e.g. 1.10, then the full security
 release process described in this document will be activated. A security point release will be
-created for 1.10, e.g. 1.10.1, together with a fix to main if necessary. Older point releases,
-e.g. 1.9, are not supported by the Envoy project and will not have any security release created.
+created for each currently supported Envoy version, as described in [stable releases](RELEASES.md#stable-releases),
+together with a fix to main if necessary. Older point releases,
+e.g. 1.5, are not supported by the Envoy project and will not have any security release created.
 
 If a security vulnerability affects only these older versions but not main or the last supported
 point release, the Envoy security team will share this information with the private distributor
@@ -112,8 +126,6 @@ These steps should be completed within the first 24 hours of disclosure.
 
 ### Fix Development Process
 
-These steps should be completed within the 1-7 days of Disclosure.
-
 - The Fix Lead and the Fix Team will create a
   [CVSS](https://www.first.org/cvss/specification-document) using the [CVSS
   Calculator](https://www.first.org/cvss/calculator/3.0). The Fix Lead makes the final call on the
@@ -137,8 +149,8 @@ holiday periods or end-of-quarter (e.g. impacting downstream Istio releases), wh
 
 ### Fix and disclosure SLOs
 
-* All reports to envoy-security@googlegroups.com will be triaged and have an
-  initial response within 1 business day.
+* All reports to envoy-security@googlegroups.com or https://github.com/envoyproxy/envoy/security/advisories/new
+  will be triaged and have an initial response within 15 business days.
 
 * Privately disclosed issues will be fixed or publicly disclosed within 90 days
   by the Envoy security team. In exceptional circumstances we reserve the right
@@ -155,9 +167,14 @@ holiday periods or end-of-quarter (e.g. impacting downstream Istio releases), wh
 * Three weeks notice will be provided to private distributors from patch
   availability until the embargo deadline.
 
-* Public zero days will be fixed ASAP, but there is no SLO for this, since this
-  will depend on the severity and impact to the organizations backing the Envoy
-  security team.
+* Public zero days which affect the optimized binary will be fixed ASAP, but there is
+  no SLO for this, since this will depend on the severity and impact to the
+  organizations backing the Envoy security team. After a zero day bug fix is in, the
+  PST will kick off point releases unless the bug is deemed unlikely to be encountered
+  in production (e.g. only triggered by trace logs) at which point there will instead be an email
+  to envoy-announce and users can request point releases if they believe they will be affected.
+  Publicly announced bugs which only affect debug binaries will neither trigger point
+  releases nor announce emails.
 
 ### Fix Disclosure Process
 
@@ -214,18 +231,6 @@ List for the purpose of testing and internal vulnerability mitigation. They must
 accept the embargo policy below in order for this to occur. If the vulnerability
 reporter is also responsible for developing fix patches, they may make use of
 the patches internally in their organization at any point in the fix cycle.
-
-### Retrospective
-
-These steps should be completed 1-3 days after the Release Date. The retrospective process
-[should be blameless](https://landing.google.com/sre/book/chapters/postmortem-culture.html).
-
-- The Fix Lead will send a retrospective of the process to envoy-dev@googlegroups.com including
-  details on everyone involved, the timeline of the process, links to relevant PRs that introduced
-  the issue, if relevant, and any critiques of the response and release process.
-- Maintainers and Fix Team are also encouraged to send their own feedback on the process to
-  envoy-dev@googlegroups.com. Honest critique is the only way we are going to get good at this as a
-  community.
 
 ## Private Distributors List
 
@@ -334,6 +339,11 @@ use of Envoy should:
           **10** slots. Periodic review (see below) may allow new slots to open, so please continue
           to apply if it seems your organization would otherwise qualify. The security team also
           reserves the right to change this limit in the future.
+       5. Note that in this context "end user" is defined as an organization that *directly*
+          operates Envoy in order to serve traffic for 1st party use cases. The 1st party use case
+          can be either internal or external facing. Critically, vendors of cloud native software
+          and solutions can *also* be end users. Being a vendor does not preclude an organization
+          from being an end user as long as it satisfies the 1st party usage criteria.
 2. Have a user or customer base not limited to your own organization (except for option 3 above).
    We will use the size of the user or customer base as part of the criteria to determine
    eligibility.
@@ -353,7 +363,7 @@ use of Envoy should:
     an individual user address, but instead a list that can be maintained by your organization as
     individuals come and go. A good example is envoy-security@seven.com, a bad example is
     acidburn@seven.com. You must accept the invite sent to this address or you will not receive any
-    e-mail updates. This e-mail address will be [shared with the Envoy community](#Members).
+    e-mail updates. This e-mail address will be [shared with the Envoy community](#members).
 
 Note that Envoy maintainers are members of the Envoy security team. [Members of the Envoy security
 team](OWNERS.md#envoy-security-team) and the organizations that they represent are implicitly
@@ -453,22 +463,21 @@ and security team to ensure they still qualify for inclusion on the list.
 
 | Organization  | End User | Last Review |
 |:-------------:|:--------:|:-----------:|
-| Aspen Mesh    | No       | 06/21       |
-| AWS           | No       | 06/21       |
-| Cilium        | No       | 06/21       |
-| Cloud Foundry | No       | 06/21       |
-| Datawire      | No       | 06/21       |
-| Google        | No       | 06/21       |
-| IBM           | No       | 06/21       |
-| Istio         | No       | 06/21       |
-| Microsoft     | No       | 2/21        |
-| Red Hat       | No       | 06/21       |
-| solo.io       | No       | 06/21       |
-| Tetrate       | No       | 06/21       |
-| VMware        | No       | 06/21       |
-| Pinterest     | Yes      | 06/21       |
-| Dropbox       | Yes      | 01/20       |
-| Stripe        | Yes      | 01/20       |
-| Square        | Yes      | 05/21       |
-| Apple         | Yes      | 05/21       |
-| Spotify       | Yes      | 06/21       |
+| AWS           | No       | 07/24       |
+| Cilium        | No       | 07/24       |
+| Cloud Foundry | No       | 07/24       |
+| F5            | No       | 07/24       |
+| Google        | No       | 07/24       |
+| Istio         | No       | 07/24       |
+| Microsoft     | No       | 07/24       |
+| Red Hat       | No       | 07/24       |
+| VMware        | No       | 07/24       |
+| Tetrate       | No       | 07/24       |
+| solo.io       | No       | 07/24       |
+| Pinterest     | Yes      | 07/24       |
+| Dropbox       | Yes      | 07/24       |
+| Apple         | Yes      | 07/24       |
+| Spotify       | Yes      | 02/21       |
+| Netflix       | Yes      | 07/24       |
+| Slack         | Yes      | 07/24       |
+| Datadog       | Yes      | 07/26       |

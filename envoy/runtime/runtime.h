@@ -4,11 +4,13 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "envoy/common/callback.h"
 #include "envoy/common/pure.h"
-#include "envoy/stats/store.h"
+#include "envoy/stats/scope.h"
 #include "envoy/thread_local/thread_local_object.h"
 #include "envoy/type/v3/percent.pb.h"
 
@@ -17,7 +19,6 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_map.h"
-#include "absl/types/optional.h"
 
 namespace Envoy {
 
@@ -34,10 +35,10 @@ class Snapshot : public ThreadLocal::ThreadLocalObject {
 public:
   struct Entry {
     std::string raw_string_value_;
-    absl::optional<uint64_t> uint_value_;
-    absl::optional<double> double_value_;
-    absl::optional<envoy::type::v3::FractionalPercent> fractional_percent_value_;
-    absl::optional<bool> bool_value_;
+    std::optional<uint64_t> uint_value_;
+    std::optional<double> double_value_;
+    std::optional<envoy::type::v3::FractionalPercent> fractional_percent_value_;
+    std::optional<bool> bool_value_;
   };
 
   using EntryMap = absl::flat_hash_map<std::string, Entry>;
@@ -165,11 +166,11 @@ public:
                               const envoy::type::v3::FractionalPercent& default_value,
                               uint64_t random_value) const PURE;
 
-  using ConstStringOptRef = absl::optional<std::reference_wrapper<const std::string>>;
+  using ConstStringOptRef = OptRef<const std::string>;
   /**
    * Fetch raw runtime data based on key.
    * @param key supplies the key to fetch.
-   * @return absl::nullopt if the key does not exist or reference to the value std::string.
+   * @return std::nullopt if the key does not exist or reference to the value std::string.
    */
   virtual ConstStringOptRef get(absl::string_view key) const PURE;
 
@@ -221,21 +222,31 @@ public:
   virtual ~Loader() = default;
 
   using ReadyCallback = std::function<void()>;
+  using UpdateCallback = std::function<void()>;
 
   /**
    * Post-construction initialization. Runtime will be generally available after
    * the constructor is finished, with the exception of dynamic RTDS layers,
    * which require ClusterManager.
    * @param cm cluster manager reference.
+   * @return a status indicating if initialization was successful.
    */
-  virtual void initialize(Upstream::ClusterManager& cm) PURE;
+  virtual absl::Status initialize(Upstream::ClusterManager& cm) PURE;
+
+  /**
+   * Called from server initialization once worker dispatchers are registered with ThreadLocal
+   * (ListenerManager construction), before those worker threads start running their event loops.
+   * Implementations may use this for any setup that depends on worker threads being registered
+   * (e.g. publishing thread-local state to all registered dispatchers).
+   */
+  virtual absl::Status onWorkerThreadsRegistered() PURE;
 
   /**
    * @return const Snapshot& the current snapshot. This reference is safe to use for the duration of
    *         the calling routine, but may be overwritten on a future event loop cycle so should be
    *         fetched again when needed. This may only be called from worker threads.
    */
-  virtual const Snapshot& snapshot() PURE;
+  virtual const Snapshot& snapshot() const PURE;
 
   /**
    * @return shared_ptr<const Snapshot> the current snapshot. This function may safely be called
@@ -247,8 +258,10 @@ public:
    * Merge the given map of key-value pairs into the runtime's state. To remove a previous merge for
    * a key, use an empty string as the value.
    * @param values the values to merge
+   * @return a status indicating success or failure.
    */
-  virtual void mergeValues(const absl::node_hash_map<std::string, std::string>& values) PURE;
+  virtual absl::Status
+  mergeValues(const absl::node_hash_map<std::string, std::string>& values) PURE;
 
   /**
    * Initiate all RTDS subscriptions. The `on_done` callback is invoked when all RTDS requests
@@ -265,19 +278,23 @@ public:
    * Updates deprecated feature use stats.
    */
   virtual void countDeprecatedFeatureUse() const PURE;
+
+  /**
+   * Add a callback that is invoked on the main thread every time a new snapshot is loaded, after
+   * the main thread and threadsafeSnapshot() on threads not registered with thread local storage
+   * observe it. Registered worker threads observe it once their posted update runs. A snapshot is
+   * loaded on each accepted RTDS update or removal, each swap of a disk layer's symlink root and
+   * each successful mergeValues(), and also when nothing changed, for example once the worker
+   * threads are registered. The callback must not modify the runtime or destroy another callback's
+   * handle. Both this and the destruction of the returned handle must happen on the main thread.
+   * @param callback supplies the callback to invoke.
+   * @return Common::CallbackHandlePtr a handle that removes the callback when destroyed.
+   */
+  ABSL_MUST_USE_RESULT virtual Common::CallbackHandlePtr
+  addUpdateCallback(UpdateCallback callback) PURE;
 };
 
 using LoaderPtr = std::unique_ptr<Loader>;
-
-// To make the runtime generally accessible, we make use of the dreaded
-// singleton class. For Envoy, the runtime will be created and cleaned up by the
-// Server::InstanceImpl initialize() and destructor, respectively.
-//
-// This makes it possible for call sites to easily make use of runtime values to
-// determine if a given feature is on or off, as well as various deprecated configuration
-// protos being enabled or disabled by default.
-using LoaderSingleton = InjectableSingleton<Loader>;
-using ScopedLoaderSingleton = ScopedInjectableLoader<Loader>;
 
 } // namespace Runtime
 } // namespace Envoy

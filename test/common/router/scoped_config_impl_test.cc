@@ -382,6 +382,28 @@ TEST_F(ScopedRouteInfoTest, Creation) {
   EXPECT_EQ(info_->scopeKey(), makeKey({"foo", "bar"}));
 }
 
+// Tests that config hash changes if ScopedRouteConfiguration of the ScopedRouteInfo changes.
+TEST_F(ScopedRouteInfoTest, Hash) {
+  envoy::config::route::v3::ScopedRouteConfiguration scoped_route_config1 = scoped_route_config_;
+  info_ = std::make_unique<ScopedRouteInfo>(std::move(scoped_route_config1), route_config_);
+  EXPECT_EQ(info_->routeConfig().get(), route_config_.get());
+  EXPECT_TRUE(TestUtility::protoEqual(info_->configProto(), scoped_route_config_));
+  EXPECT_EQ(info_->scopeName(), "foo_scope");
+  EXPECT_EQ(info_->scopeKey(), makeKey({"foo", "bar"}));
+
+  envoy::config::route::v3::ScopedRouteConfiguration scoped_route_config2 = scoped_route_config_;
+  const auto info2 =
+      std::make_unique<ScopedRouteInfo>(std::move(scoped_route_config2), route_config_);
+  ASSERT_EQ(info2->configHash(), info_->configHash());
+
+  // Mutate the config and hash should be different now.
+  envoy::config::route::v3::ScopedRouteConfiguration scoped_route_config3 = scoped_route_config_;
+  scoped_route_config3.set_on_demand(true);
+  const auto info3 =
+      std::make_unique<ScopedRouteInfo>(std::move(scoped_route_config3), route_config_);
+  ASSERT_NE(info3->configHash(), info_->configHash());
+}
+
 class ScopedConfigImplTest : public testing::Test {
 public:
   void SetUp() override {
@@ -439,79 +461,164 @@ public:
   std::shared_ptr<ScopedRouteInfo> scope_info_a_v2_;
   std::shared_ptr<ScopedRouteInfo> scope_info_b_;
   ScopedRoutes::ScopeKeyBuilder key_builder_config_;
+  std::unique_ptr<ScopeKeyBuilderImpl> scoped_key_builder_impl_;
   std::unique_ptr<ScopedConfigImpl> scoped_config_impl_;
 };
 
 // Test a ScopedConfigImpl returns the correct route Config.
 TEST_F(ScopedConfigImplTest, PickRoute) {
-  scoped_config_impl_ = std::make_unique<ScopedConfigImpl>(std::move(key_builder_config_));
+  scoped_key_builder_impl_ = std::make_unique<ScopeKeyBuilderImpl>(std::move(key_builder_config_));
+  scoped_config_impl_ = std::make_unique<ScopedConfigImpl>();
   scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_a_});
   scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_b_});
 
   // Key (foo, bar) maps to scope_info_a_.
-  ConfigConstSharedPtr route_config = scoped_config_impl_->getRouteConfig(TestRequestHeaderMapImpl{
-      {"foo_header", ",,key=value,bar=foo,"},
-      {"bar_header", ";val1;bar;val3"},
-  });
+  ConfigConstSharedPtr route_config = scoped_config_impl_->getRouteConfig(
+      scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+          {"foo_header", ",,key=value,bar=foo,"},
+          {"bar_header", ";val1;bar;val3"},
+      }));
   EXPECT_EQ(route_config, scope_info_a_->routeConfig());
 
   // Key (bar, baz) maps to scope_info_b_.
-  route_config = scoped_config_impl_->getRouteConfig(TestRequestHeaderMapImpl{
-      {"foo_header", ",,key=value,bar=bar,"},
-      {"bar_header", ";val1;baz;val3"},
-  });
+  route_config = scoped_config_impl_->getRouteConfig(
+      scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+          {"foo_header", ",,key=value,bar=bar,"},
+          {"bar_header", ";val1;baz;val3"},
+      }));
   EXPECT_EQ(route_config, scope_info_b_->routeConfig());
 
   // No such key (bar, NOT_BAZ).
-  route_config = scoped_config_impl_->getRouteConfig(TestRequestHeaderMapImpl{
-      {"foo_header", ",key=value,bar=bar,"},
-      {"bar_header", ";val1;NOT_BAZ;val3"},
-  });
+  route_config = scoped_config_impl_->getRouteConfig(
+      scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+          {"foo_header", ",key=value,bar=bar,"},
+          {"bar_header", ";val1;NOT_BAZ;val3"},
+      }));
   EXPECT_EQ(route_config, nullptr);
+
+  // Null scope key returns nullptr.
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(nullptr), nullptr);
+
+  // NullScopedConfigImpl returns a NullConfigImpl.
+  NullScopedConfigImpl null_scoped_config;
+  ConfigConstSharedPtr null_route_config = null_scoped_config.getRouteConfig(nullptr);
+  ASSERT_NE(null_route_config, nullptr);
+  EXPECT_EQ(null_route_config->name(), "");
 }
 
 // Test a ScopedConfigImpl returns the correct route Config before and after scope config update.
 TEST_F(ScopedConfigImplTest, Update) {
-  scoped_config_impl_ = std::make_unique<ScopedConfigImpl>(std::move(key_builder_config_));
+  scoped_key_builder_impl_ = std::make_unique<ScopeKeyBuilderImpl>(std::move(key_builder_config_));
+  scoped_config_impl_ = std::make_unique<ScopedConfigImpl>();
 
   TestRequestHeaderMapImpl headers{
       {"foo_header", ",,key=value,bar=foo,"},
       {"bar_header", ";val1;bar;val3"},
   };
   // Empty ScopeConfig.
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(headers), nullptr);
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(scoped_key_builder_impl_->computeScopeKey(headers)),
+            nullptr);
 
   // Add scope_key (bar, baz).
   scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_b_});
   // scope_info_a_ not found
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(headers), nullptr);
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(scoped_key_builder_impl_->computeScopeKey(headers)),
+            nullptr);
   // scope_info_b_ found
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(TestRequestHeaderMapImpl{
-                {"foo_header", ",,key=v,bar=bar,"}, {"bar_header", ";val1;baz"}}),
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(
+                scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+                    {"foo_header", ",,key=v,bar=bar,"}, {"bar_header", ";val1;baz"}})),
             scope_info_b_->routeConfig());
 
   // Add scope_key (foo, bar).
   scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_a_});
   // Found scope_info_a_.
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(headers), scope_info_a_->routeConfig());
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(scoped_key_builder_impl_->computeScopeKey(headers)),
+            scope_info_a_->routeConfig());
 
   // Update scope foo_scope.
   scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_a_v2_});
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(headers), nullptr);
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(scoped_key_builder_impl_->computeScopeKey(headers)),
+            nullptr);
 
   // foo_scope now is keyed by (xyz, xyz).
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(TestRequestHeaderMapImpl{
-                {"foo_header", ",bar=xyz,foo=bar"}, {"bar_header", ";;xyz"}}),
-            scope_info_a_v2_->routeConfig());
+  EXPECT_EQ(
+      scoped_config_impl_->getRouteConfig(scoped_key_builder_impl_->computeScopeKey(
+          TestRequestHeaderMapImpl{{"foo_header", ",bar=xyz,foo=bar"}, {"bar_header", ";;xyz"}})),
+      scope_info_a_v2_->routeConfig());
 
   // Remove scope "foo_scope".
   scoped_config_impl_->removeRoutingScopes({"foo_scope"});
   // scope_info_a_ is gone.
-  EXPECT_EQ(scoped_config_impl_->getRouteConfig(headers), nullptr);
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(scoped_key_builder_impl_->computeScopeKey(headers)),
+            nullptr);
 
   // Now delete some non-existent scopes.
   EXPECT_NO_THROW(scoped_config_impl_->removeRoutingScopes(
       {"foo_scope1", "base_scope", "bluh_scope", "xyz_scope"}));
+}
+
+// Verify multi-scope initial additions, incremental net-new additions, and in-place updates
+// pre-reserve map capacity and preserve routing table entries.
+TEST_F(ScopedConfigImplTest, BulkAddAndInPlaceUpdateReservesCapacity) {
+  scoped_key_builder_impl_ = std::make_unique<ScopeKeyBuilderImpl>(std::move(key_builder_config_));
+  scoped_config_impl_ = std::make_unique<ScopedConfigImpl>();
+
+  // 1. Initial multi-scope load into an empty ScopedConfigImpl (fast-paths empty() check).
+  scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_a_, scope_info_b_});
+
+  auto key_a = scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+      {"foo_header", "bar=foo"},
+      {"bar_header", ";;bar"},
+  });
+  auto key_b = scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+      {"foo_header", "bar=bar"},
+      {"bar_header", ";;baz"},
+  });
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_a), scope_info_a_->routeConfig());
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_b), scope_info_b_->routeConfig());
+
+  // 2. Incremental multi-scope update mixing an existing scope update and net-new scopes.
+  auto scope_info_c = makeScopedRouteInfo(R"EOF(
+    name: baz_scope
+    route_configuration_name: baz_route
+    key:
+      fragments:
+        - string_key: baz
+        - string_key: qux
+)EOF");
+  auto scope_info_d = makeScopedRouteInfo(R"EOF(
+    name: qux_scope
+    route_configuration_name: qux_route
+    key:
+      fragments:
+        - string_key: qux
+        - string_key: corge
+)EOF");
+  scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_a_v2_, scope_info_c, scope_info_d});
+
+  auto key_a_v2 = scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+      {"foo_header", "bar=xyz"},
+      {"bar_header", ";;xyz"},
+  });
+  auto key_c = scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+      {"foo_header", "bar=baz"},
+      {"bar_header", ";;qux"},
+  });
+  auto key_d = scoped_key_builder_impl_->computeScopeKey(TestRequestHeaderMapImpl{
+      {"foo_header", "bar=qux"},
+      {"bar_header", ";;corge"},
+  });
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_a), nullptr);
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_a_v2), scope_info_a_v2_->routeConfig());
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_c), scope_info_c->routeConfig());
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_d), scope_info_d->routeConfig());
+
+  // 3. Multi-scope in-place update where net_added == 0.
+  scoped_config_impl_->addOrUpdateRoutingScopes({scope_info_a_, scope_info_b_});
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_a), scope_info_a_->routeConfig());
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_a_v2), nullptr);
+  EXPECT_EQ(scoped_config_impl_->getRouteConfig(key_b), scope_info_b_->routeConfig());
 }
 
 } // namespace

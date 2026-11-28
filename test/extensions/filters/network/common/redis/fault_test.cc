@@ -27,9 +27,9 @@ public:
 
   void
   createCommandFault(RedisProxy::RedisFault* fault, std::string command_str, int delay_seconds,
-                     absl::optional<int> fault_percentage,
-                     absl::optional<envoy::type::v3::FractionalPercent_DenominatorType> denominator,
-                     absl::optional<std::string> runtime_key) {
+                     std::optional<int> fault_percentage,
+                     std::optional<envoy::type::v3::FractionalPercent_DenominatorType> denominator,
+                     std::optional<std::string> runtime_key) {
     // We don't set fault type as it isn't used in the test
 
     auto* commands = fault->mutable_commands();
@@ -45,17 +45,17 @@ public:
 
   void
   createAllKeyFault(RedisProxy::RedisFault* fault, int delay_seconds,
-                    absl::optional<int> fault_percentage,
-                    absl::optional<envoy::type::v3::FractionalPercent_DenominatorType> denominator,
-                    absl::optional<std::string> runtime_key) {
+                    std::optional<int> fault_percentage,
+                    std::optional<envoy::type::v3::FractionalPercent_DenominatorType> denominator,
+                    std::optional<std::string> runtime_key) {
     addFaultPercentage(fault, fault_percentage, denominator, runtime_key);
     addDelay(fault, delay_seconds);
   }
 
   void
-  addFaultPercentage(RedisProxy::RedisFault* fault, absl::optional<int> fault_percentage,
-                     absl::optional<envoy::type::v3::FractionalPercent_DenominatorType> denominator,
-                     absl::optional<std::string> runtime_key) {
+  addFaultPercentage(RedisProxy::RedisFault* fault, std::optional<int> fault_percentage,
+                     std::optional<envoy::type::v3::FractionalPercent_DenominatorType> denominator,
+                     std::optional<std::string> runtime_key) {
     envoy::config::core::v3::RuntimeFractionalPercent* fault_enabled =
         fault->mutable_fault_enabled();
 
@@ -92,7 +92,6 @@ TEST_F(FaultTest, NoFaults) {
   RedisProxy redis_config;
   auto* faults = redis_config.mutable_faults();
 
-  TestScopedRuntime scoped_runtime;
   FaultManagerImpl fault_manager = FaultManagerImpl(random_, runtime_, *faults);
 
   const Fault* fault_ptr = fault_manager.getFaultForCommand("get");
@@ -104,7 +103,6 @@ TEST_F(FaultTest, SingleCommandFaultNotEnabled) {
   auto* faults = redis_config.mutable_faults();
   createCommandFault(faults->Add(), "get", 0, 0, FractionalPercent::HUNDRED, RUNTIME_KEY);
 
-  TestScopedRuntime scoped_runtime;
   FaultManagerImpl fault_manager = FaultManagerImpl(random_, runtime_, *faults);
 
   EXPECT_CALL(random_, random()).WillOnce(Return(0));
@@ -120,7 +118,6 @@ TEST_F(FaultTest, SingleCommandFault) {
   auto* faults = redis_config.mutable_faults();
   createCommandFault(faults->Add(), "ttl", 0, 5000, FractionalPercent::TEN_THOUSAND, RUNTIME_KEY);
 
-  TestScopedRuntime scoped_runtime;
   FaultManagerImpl fault_manager = FaultManagerImpl(random_, runtime_, *faults);
 
   EXPECT_CALL(random_, random()).WillOnce(Return(1));
@@ -134,9 +131,8 @@ TEST_F(FaultTest, SingleCommandFaultWithNoDefaultValueOrRuntimeValue) {
   // Inject a single fault with no default value or runtime value.
   RedisProxy redis_config;
   auto* faults = redis_config.mutable_faults();
-  createCommandFault(faults->Add(), "ttl", 0, absl::nullopt, absl::nullopt, absl::nullopt);
+  createCommandFault(faults->Add(), "ttl", 0, std::nullopt, std::nullopt, std::nullopt);
 
-  TestScopedRuntime scoped_runtime;
   FaultManagerImpl fault_manager = FaultManagerImpl(random_, runtime_, *faults);
 
   EXPECT_CALL(random_, random()).WillOnce(Return(1));
@@ -152,9 +148,8 @@ TEST_F(FaultTest, MultipleFaults) {
   RedisProxy redis_config;
   auto* faults = redis_config.mutable_faults();
   createCommandFault(faults->Add(), "get", 0, 25, FractionalPercent::HUNDRED, RUNTIME_KEY);
-  createAllKeyFault(faults->Add(), 2, 25, FractionalPercent::HUNDRED, absl::nullopt);
+  createAllKeyFault(faults->Add(), 2, 25, FractionalPercent::HUNDRED, std::nullopt);
 
-  TestScopedRuntime scoped_runtime;
   FaultManagerImpl fault_manager = FaultManagerImpl(random_, runtime_, *faults);
   const Fault* fault_ptr;
 

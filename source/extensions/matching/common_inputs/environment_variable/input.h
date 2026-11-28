@@ -10,12 +10,15 @@ namespace EnvironmentVariable {
 
 class Input : public Matcher::CommonProtocolInput {
 public:
-  explicit Input(absl::optional<std::string>&& value) : storage_(std::move(value)) {}
+  explicit Input(std::optional<absl::string_view> value) : storage_(value) {}
 
-  absl::optional<std::string> get() override { return storage_; }
+  Matcher::DataInputGetResult get() override {
+    return storage_ ? Matcher::DataInputGetResult::CreateStringView(*storage_)
+                    : Matcher::DataInputGetResult::NoData();
+  }
 
 private:
-  const absl::optional<std::string> storage_;
+  const std::optional<absl::string_view> storage_;
 };
 } // namespace EnvironmentVariable
 } // namespace CommonInputs

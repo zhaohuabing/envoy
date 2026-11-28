@@ -7,6 +7,7 @@
 #include "source/common/common/assert.h"
 #include "source/common/common/fmt.h"
 #include "source/common/common/macros.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/extensions/filters/network/thrift_proxy/buffer_helper.h"
 
 namespace Envoy {
@@ -29,6 +30,7 @@ bool BinaryProtocolImpl::readMessageBegin(Buffer::Instance& buffer, MessageMetad
 
   // The byte at offset 2 is unused and ignored.
 
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   MessageType type = static_cast<MessageType>(buffer.peekInt<int8_t>(3));
   if (type < MessageType::Call || type > MessageType::LastMessageType) {
     throw EnvoyException(
@@ -79,9 +81,6 @@ bool BinaryProtocolImpl::peekReplyPayload(Buffer::Instance& buffer, ReplyType& r
   }
 
   int16_t id = buffer.peekBEInt<int16_t>(1);
-  if (id < 0) {
-    throw EnvoyException(absl::StrCat("invalid binary protocol field id ", id));
-  }
   // successful response struct in field id 0, error (IDL exception) in field id greater than 0
   reply_type = id == 0 ? ReplyType::Success : ReplyType::Error;
   return true;
@@ -115,9 +114,6 @@ bool BinaryProtocolImpl::readFieldBegin(Buffer::Instance& buffer, std::string& n
       return false;
     }
     int16_t id = buffer.peekBEInt<int16_t>(1);
-    if (id < 0) {
-      throw EnvoyException(absl::StrCat("invalid binary protocol field id ", id));
-    }
     field_id = id;
     buffer.drain(3);
   }
@@ -393,10 +389,11 @@ bool LaxBinaryProtocolImpl::readMessageBegin(Buffer::Instance& buffer, MessageMe
 
   uint32_t name_len = buffer.peekBEInt<uint32_t>();
 
-  if (buffer.length() < 9 + name_len) {
+  if (buffer.length() < static_cast<uint64_t>(name_len) + 9) {
     return false;
   }
 
+  // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
   MessageType type = static_cast<MessageType>(buffer.peekInt<int8_t>(name_len + 4));
   if (type < MessageType::Call || type > MessageType::LastMessageType) {
     throw EnvoyException(

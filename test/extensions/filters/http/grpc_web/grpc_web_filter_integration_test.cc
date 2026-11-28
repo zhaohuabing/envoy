@@ -25,7 +25,11 @@ public:
 
   void SetUp() override {
     setUpstreamProtocol(Http::CodecType::HTTP2);
-    config_helper_.prependFilter("name: envoy.filters.http.grpc_web");
+    config_helper_.prependFilter(R"EOF(
+      name: envoy.filters.http.grpc_web
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb
+    )EOF");
   }
 
   void initialize() override {
@@ -212,7 +216,9 @@ body_format:
     inline_string: "{}"
 )EOF",
                                                           local_reply_body);
-  testUpstreamDisconnect(local_reply_body, local_reply_config_yaml);
+  // The single-chunk local reply body is limited to MAX_BUFFERED_PLAINTEXT_LENGTH as well.
+  testUpstreamDisconnect(local_reply_body.substr(0, MAX_BUFFERED_PLAINTEXT_LENGTH),
+                         local_reply_config_yaml);
 }
 
 TEST_P(GrpcWebFilterIntegrationTest, BadUpstreamResponse) {

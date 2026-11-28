@@ -1,6 +1,7 @@
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
+    "envoy_select_admin_functionality",
 )
 load(
     "//test/extensions:extensions_build_system.bzl",
@@ -15,11 +16,18 @@ envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
     extension_names = ["envoy.stat_sinks.hystrix"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
     deps = [
         "//envoy/registry",
         "//source/common/protobuf:utility_lib",
         "//source/extensions/stat_sinks/hystrix:config",
-        "//test/mocks/server:instance_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:network_utility_lib",
         "//test/test_common:utility_lib",
@@ -31,13 +39,20 @@ envoy_extension_cc_test(
     name = "hystrix_test",
     srcs = ["hystrix_test.cc"],
     extension_names = ["envoy.stat_sinks.hystrix"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
     deps = [
         "//source/common/json:json_loader_lib",
         "//source/common/stats:stats_lib",
         "//source/extensions/stat_sinks/hystrix:hystrix_lib",
         "//test/mocks/server:admin_mocks",
         "//test/mocks/server:admin_stream_mocks",
-        "//test/mocks/server:instance_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/stats:stats_mocks",
         "//test/mocks/upstream:cluster_info_mocks",
         "//test/mocks/upstream:cluster_manager_mocks",
@@ -47,8 +62,15 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "hystrix_integration_test",
-    srcs = ["hystrix_integration_test.cc"],
+    size = "large",
+    srcs = envoy_select_admin_functionality(["hystrix_integration_test.cc"]),
     extension_names = ["envoy.stat_sinks.hystrix"],
+    rbe_pool = {
+        "gcc": {"build": "linux_x64_small"},
+        "openssl": {"link": "linux_x64_small"},
+        "coverage": {"link": "linux_x64_large"},
+        "tsan": {"link": "linux_x64_small"},
+    },
     deps = [
         "//source/extensions/stat_sinks/hystrix:config",
         "//test/integration:http_protocol_integration_lib",

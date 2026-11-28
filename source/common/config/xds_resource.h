@@ -44,29 +44,33 @@ public:
     return encodeUrl(resource_locator, {});
   }
 
-  // Thrown when an exception occurs during URI decoding.
-  class DecodeException : public EnvoyException {
-  public:
-    DecodeException(const std::string& what) : EnvoyException(what) {}
-  };
-
   /**
    * Decode a xdstp:// URN string to a xds::core::v3::ResourceName.
    *
    * @param resource_urn xdstp:// resource URN.
    * @return xds::core::v3::ResourceName resource name message for resource_urn.
-   * @throws DecodeException when parsing fails.
+   * @throws EnvoyException when parsing fails.
    */
-  static xds::core::v3::ResourceName decodeUrn(absl::string_view resource_urn);
+  static absl::StatusOr<xds::core::v3::ResourceName> decodeUrn(absl::string_view resource_urn);
 
   /**
    * Decode a xdstp:// URL string to a xds::core::v3::ResourceLocator.
    *
    * @param resource_url xdstp:// resource URL.
    * @return xds::core::v3::ResourceLocator resource name message for resource_url.
-   * @throws DecodeException when parsing fails.
+   * @throws EnvoyException when parsing fails.
    */
-  static xds::core::v3::ResourceLocator decodeUrl(absl::string_view resource_url);
+  static absl::StatusOr<xds::core::v3::ResourceLocator> decodeUrl(absl::string_view resource_url);
+
+  /**
+   * Normalize an xDS resource name. If the resource name has an xdstp: scheme, decode and
+   * re-encode it with sorted context parameters; otherwise return it unchanged.
+   *
+   * @param resource_name resource name.
+   * @return absl::StatusOr<std::string> normalized resource name, or an error status if decoding
+   *         an xdstp: URN fails.
+   */
+  static absl::StatusOr<std::string> normalizeResourceName(absl::string_view resource_name);
 
   /**
    * @param resource_name resource name.

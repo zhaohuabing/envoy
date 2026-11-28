@@ -1,15 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <ctime>
+#include <memory>
+#include <optional>
 #include <string>
 
+#include "envoy/common/exception.h"
+#include "envoy/common/optref.h"
 #include "envoy/common/pure.h"
 #include "envoy/event/dispatcher.h"
-#include "envoy/stats/allocator.h"
+#include "envoy/network/address.h"
+#include "envoy/network/listener.h"
+#include "envoy/network/socket.h"
 #include "envoy/stats/store.h"
 #include "envoy/thread/thread.h"
 
-#include "source/server/hot_restart.pb.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Server {
@@ -42,14 +49,58 @@ public:
   virtual void drainParentListeners() PURE;
 
   /**
+   * @return whether this (child) instance has already asked the parent to stop accepting new
+   * connections, i.e. whether drainParentListeners() has sent the drain-listeners request. Returns
+   * true when there is no parent (fresh start) or hot restart is disabled. The drain request is
+   * fire-and-forget, so this reflects that the request was sent, not that the parent's listeners
+   * have stopped accepting. The parent processes the request asynchronously over the domain socket,
+   * so a brief window can remain where the parent still accepts after this returns true.
+   *
+   * This is deliberately distinct from parentDrainedCallbackRegistrar(): that fires only once the
+   * parent is fully drained at the parent-shutdown deadline (potentially minutes later), whereas
+   * this flips as soon as the parent is asked to stop accepting. Callers that must not race the
+   * parent's still-open listeners should combine this with a short propagation delay before acting
+   * (the reverse-tunnel initiator does this).
+   *
+   * Safe to call from any thread.
+   */
+  virtual bool parentStopAcceptingRequested() PURE;
+
+  /**
    * Retrieve a listening socket on the specified address from the parent process. The socket will
    * be duplicated across process boundaries.
    * @param address supplies the address of the socket to duplicate, e.g. tcp://127.0.0.1:5000.
    * @param worker_index supplies the socket/worker index to fetch. When using reuse_port sockets
    *        each socket is fetched individually to ensure no connection loss.
+   * @param network_namespace supplies the network namespace of the socket, if any.
    * @return int the fd or -1 if there is no bound listen port in the parent.
    */
-  virtual int duplicateParentListenSocket(const std::string& address, uint32_t worker_index) PURE;
+  virtual int duplicateParentListenSocket(const std::string& address, uint32_t worker_index,
+                                          absl::string_view network_namespace) PURE;
+
+  /**
+   * Registers a UdpListenerConfig as a possible receiver of udp packets forwarded from the
+   * parent process to the child process. This is used to forward QUIC packets that are not for
+   * connections belonging to the parent process during draining (in the absence of BPF delivery to
+   * the correct process), via its listenerWorkerRouter.
+   * The HotRestart instance is responsible for recognizing "any" addresses (e.g. "0.0.0.0").
+   * @param address supplies the address and port of the listening socket.
+   * @param listener_config is the UdpListenerConfig to receive packets forwarded for the given
+   * address.
+   */
+  virtual void
+  registerUdpForwardingListener(Network::Address::InstanceConstSharedPtr address,
+                                std::shared_ptr<Network::UdpListenerConfig> listener_config) PURE;
+
+  /**
+   * @return An interface on which registerParentDrainedCallback can be called during
+   *         creation of a listener, or nullopt if there is no parent instance.
+   *
+   *         If this is set, any UDP listener should start paused and only begin listening
+   *         when the parent instance is drained; this allows draining QUIC listeners to
+   *         catch their own packets and forward unrecognized packets to the child instance.
+   */
+  virtual OptRef<Network::ParentDrainedCallbackRegistrar> parentDrainedCallbackRegistrar() PURE;
 
   /**
    * Initialize the parent logic of our restarter. Meant to be called after initialization of a
@@ -63,7 +114,7 @@ public:
    * to start up in the new process.
    * @return response if the parent is alive.
    */
-  virtual absl::optional<AdminShutdownResponse> sendParentAdminShutdownRequest() PURE;
+  virtual std::optional<AdminShutdownResponse> sendParentAdminShutdownRequest() PURE;
 
   /**
    * Tell our parent process to gracefully terminate itself.
@@ -106,6 +157,11 @@ public:
    * @return Thread::BasicLockable& a lock for access logs.
    */
   virtual Thread::BasicLockable& accessLogLock() PURE;
+
+  /**
+   * @return bool whether the server is currently in the initializing state during hot restart.
+   */
+  virtual bool isInitializing() const PURE;
 };
 
 /**

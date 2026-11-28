@@ -50,10 +50,10 @@ TEST_F(QuicIoHandleWrapperTest, DelegateIoHandleCalls) {
   os_fd_t fd = socket_.ioHandle().fdDoNotUse();
   char data[5];
   Buffer::RawSlice slice{data, 5};
-  EXPECT_CALL(os_sys_calls_, readv(fd, _, 1)).WillOnce(Return(Api::SysCallSizeResult{5u, 0}));
+  EXPECT_CALL(os_sys_calls_, recv(fd, _, 5, 0)).WillOnce(Return(Api::SysCallSizeResult{5u, 0}));
   wrapper_->readv(5, &slice, 1);
 
-  EXPECT_CALL(os_sys_calls_, writev(fd, _, 1)).WillOnce(Return(Api::SysCallSizeResult{5u, 0}));
+  EXPECT_CALL(os_sys_calls_, send(fd, _, 5, 0)).WillOnce(Return(Api::SysCallSizeResult{5u, 0}));
   wrapper_->writev(&slice, 1);
 
   EXPECT_CALL(os_sys_calls_, socket(AF_INET6, SOCK_STREAM, 0))
@@ -67,46 +67,45 @@ TEST_F(QuicIoHandleWrapperTest, DelegateIoHandleCalls) {
   wrapper_->domain();
 
   EXPECT_CALL(os_sys_calls_, getsockname(_, _, _))
-      .WillOnce(Invoke([](os_fd_t, sockaddr* addr, socklen_t* addrlen) -> Api::SysCallIntResult {
+      .WillOnce([](os_fd_t, sockaddr* addr, socklen_t* addrlen) -> Api::SysCallIntResult {
         addr->sa_family = AF_INET6;
         *addrlen = sizeof(sockaddr_in6);
         return Api::SysCallIntResult{0, 0};
-      }));
-  addr = wrapper_->localAddress();
+      });
+  addr = *wrapper_->localAddress();
 
   EXPECT_CALL(os_sys_calls_, getpeername(_, _, _))
-      .WillOnce(Invoke([](os_fd_t, sockaddr* addr, socklen_t* addrlen) -> Api::SysCallIntResult {
+      .WillOnce([](os_fd_t, sockaddr* addr, socklen_t* addrlen) -> Api::SysCallIntResult {
         addr->sa_family = AF_INET6;
         *addrlen = sizeof(sockaddr_in6);
         return Api::SysCallIntResult{0, 0};
-      }));
-  addr = wrapper_->peerAddress();
+      });
+  addr = *wrapper_->peerAddress();
 
   Network::IoHandle::RecvMsgOutput output(1, nullptr);
-  EXPECT_CALL(os_sys_calls_, recvmsg(fd, _, MSG_TRUNC))
-      .WillOnce(Invoke([](os_fd_t, msghdr* msg, int) {
-        sockaddr_storage ss;
-        auto ipv6_addr = reinterpret_cast<sockaddr_in6*>(&ss);
-        memset(ipv6_addr, 0, sizeof(sockaddr_in6));
-        ipv6_addr->sin6_family = AF_INET6;
-        ipv6_addr->sin6_addr = in6addr_loopback;
-        ipv6_addr->sin6_port = htons(54321);
-        *reinterpret_cast<sockaddr_in6*>(msg->msg_name) = *ipv6_addr;
-        msg->msg_namelen = sizeof(sockaddr_in6);
-        msg->msg_controllen = 0;
-        return Api::SysCallSizeResult{5u, 0};
-      }));
-  wrapper_->recvmsg(&slice, 1, /*self_port=*/12345, output);
+  EXPECT_CALL(os_sys_calls_, recvmsg(fd, _, MSG_TRUNC)).WillOnce([](os_fd_t, msghdr* msg, int) {
+    sockaddr_storage ss;
+    auto ipv6_addr = reinterpret_cast<sockaddr_in6*>(&ss);
+    memset(ipv6_addr, 0, sizeof(sockaddr_in6));
+    ipv6_addr->sin6_family = AF_INET6;
+    ipv6_addr->sin6_addr = in6addr_loopback;
+    ipv6_addr->sin6_port = htons(54321);
+    *reinterpret_cast<sockaddr_in6*>(msg->msg_name) = *ipv6_addr;
+    msg->msg_namelen = sizeof(sockaddr_in6);
+    msg->msg_controllen = 0;
+    return Api::SysCallSizeResult{5u, 0};
+  });
+  wrapper_->recvmsg(&slice, 1, /*self_port=*/12345, {}, output);
 
   size_t num_packet_per_call = 1u;
   Network::IoHandle::RecvMsgOutput output2(num_packet_per_call, nullptr);
   RawSliceArrays slices(num_packet_per_call,
                         absl::FixedArray<Buffer::RawSlice>({Buffer::RawSlice{data, 5}}));
   EXPECT_CALL(os_sys_calls_, recvmmsg(fd, _, num_packet_per_call, _, nullptr))
-      .WillOnce(Invoke([](os_fd_t, struct mmsghdr*, unsigned int, int, struct timespec*) {
+      .WillOnce([](os_fd_t, struct mmsghdr*, unsigned int, int, struct timespec*) {
         return Api::SysCallIntResult{-1, SOCKET_ERROR_AGAIN};
-      }));
-  wrapper_->recvmmsg(slices, /*self_port=*/12345, output2);
+      });
+  wrapper_->recvmmsg(slices, /*self_port=*/12345, {}, output2);
 
   EXPECT_TRUE(wrapper_->close().ok());
 
@@ -114,9 +113,9 @@ TEST_F(QuicIoHandleWrapperTest, DelegateIoHandleCalls) {
   wrapper_->readv(5, &slice, 1);
   wrapper_->writev(&slice, 1);
   wrapper_->sendmsg(&slice, 1, 0, /*self_ip=*/nullptr, *addr);
-  EXPECT_DEBUG_DEATH(wrapper_->recvmsg(&slice, 1, /*self_port=*/12345, output),
+  EXPECT_DEBUG_DEATH(wrapper_->recvmsg(&slice, 1, /*self_port=*/12345, {}, output),
                      "recvmmsg is called after close");
-  EXPECT_DEBUG_DEATH(wrapper_->recvmmsg(slices, /*self_port=*/12345, output2),
+  EXPECT_DEBUG_DEATH(wrapper_->recvmmsg(slices, /*self_port=*/12345, {}, output2),
                      "recvmmsg is called after close");
 
   EXPECT_CALL(os_sys_calls_, supportsUdpGro());
@@ -189,6 +188,9 @@ TEST(QuicIoHandleWrapper, DelegateWithMocks) {
 
     EXPECT_CALL(mock_io, lastRoundTripTime()).Times(0);
     wrapper.lastRoundTripTime();
+
+    EXPECT_CALL(mock_io, interfaceName());
+    wrapper.interfaceName();
   }
 
   wrapper.close();

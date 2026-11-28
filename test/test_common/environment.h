@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,7 +13,6 @@
 #include "absl/container/node_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 #include "tools/cpp/runfiles/runfiles.h"
 
 namespace Envoy {
@@ -63,6 +63,13 @@ public:
   static std::vector<Network::Address::IpVersion> getIpVersionsForTest();
 
   /**
+   * Return a vector of spdlog loggers as parameters to test. Tests are mainly
+   * for the behavior consistency between default loggers and fine-grained loggers.
+   * @return std::vector<spdlog::logger*>
+   */
+  static std::vector<spdlog::logger*> getSpdLoggersForTest();
+
+  /**
    * Tests can be run with Envoy Grpc and Google Grpc or Envoy Grpc alone by setting compiler option
    * `--define google_grpc=disabled`.
    * @return a vector of Grpc versions to test.
@@ -77,9 +84,9 @@ public:
 
   /**
    * Obtain the value of an environment variable, null if not available.
-   * @return absl::optional<std::string> with the value of the environment variable.
+   * @return std::optional<std::string> with the value of the environment variable.
    */
-  static absl::optional<std::string> getOptionalEnvVar(const std::string& var);
+  static std::optional<std::string> getOptionalEnvVar(const std::string& var);
 
   /**
    * Obtain the value of an environment variable, die if not available.
@@ -115,17 +122,24 @@ public:
 
   /**
    * Obtain read-only test input data directory.
-   * @param workspace the name of the Bazel workspace where the input data is.
+   * @param workspace the apparent repository name where the input data lives.
+   *        When empty (the default), Envoy's repository name is resolved in this order:
+   *        1. the value passed to setMainWorkspace(),
+   *        2. BAZEL_CURRENT_REPOSITORY as expanded in environment.cc,
+   *        3. the TEST_WORKSPACE environment variable,
+   *        4. "envoy" as a last-resort fallback (e.g. bazel run without TEST_WORKSPACE).
+   *        Pass an explicit non-empty value for external repos (e.g. "aws-c-auth-testdata").
    * @return const std::string& with the path to the read-only test input directory.
    */
-  static std::string runfilesDirectory(const std::string& workspace = "envoy");
+  static std::string runfilesDirectory(const std::string& workspace = "");
 
   /**
    * Prefix a given path with the read-only test input data directory.
    * @param path path suffix.
+   * @param workspace see runfilesDirectory.
    * @return std::string path qualified with read-only test input data directory.
    */
-  static std::string runfilesPath(const std::string& path, const std::string& workspace = "envoy");
+  static std::string runfilesPath(const std::string& path, const std::string& workspace = "");
 
   /**
    * Obtain Unix Domain Socket temporary directory.
@@ -188,11 +202,14 @@ public:
   jsonLoadFromString(const std::string& json,
                      Network::Address::IpVersion version = Network::Address::IpVersion::v4);
 
+#ifndef TARGET_OS_IOS
   /**
    * Execute a program under ::system. Any failure is fatal.
    * @param args program path and arguments.
    */
+
   static void exec(const std::vector<std::string>& args);
+#endif
 
   /**
    * Dumps the contents of the string into a temporary file from temporaryDirectory() + filename.
@@ -200,11 +217,13 @@ public:
    * @param filename: the name of the file to use
    * @param contents: the data to go in the file.
    * @param fully_qualified_path: if true, will write to filename without prepending the tempdir.
+   * @param unlink: if true will delete any prior file before writing.
    * @return the fully qualified path of the output file.
    */
   static std::string writeStringToFileForTest(const std::string& filename,
                                               const std::string& contents,
-                                              bool fully_qualified_path = false);
+                                              bool fully_qualified_path = false,
+                                              bool unlink = true);
   /**
    * Dumps the contents of the file into the string.
    *
@@ -253,6 +272,12 @@ public:
    */
   static void setRunfiles(bazel::tools::cpp::runfiles::Runfiles* runfiles);
 
+  /**
+   * Override the repository name used for Envoy runfile lookups when the default resolution is
+   * unsuitable.
+   */
+  static void setMainWorkspace(absl::string_view workspace);
+
 private:
   static bazel::tools::cpp::runfiles::Runfiles* runfiles_;
 };
@@ -274,7 +299,7 @@ private:
   const std::string new_link_;
   const std::string target1_;
   const std::string target2_;
-  bool use_target1_;
+  bool use_target1_{true};
 };
 
 } // namespace Envoy

@@ -1,0 +1,341 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load("@envoy_repo//:version.bzl", "VERSION")
+load("@envoy_toolshed//pgp:defs.bzl", "pgp_public_key", "pgp_sign_checksums")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files")
+load("@rules_pkg//pkg:pkg.bzl", "pkg_tar")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//bazel:envoy_build_system.bzl", "envoy_package")
+load("//bazel:envoy_rbe.bzl", "envoy_exec_properties")
+load("//distribution/binary:debug.bzl", "compressed_debug_parts")
+load(":changes.bzl", "debian_files", "envoy_signed_changes")
+load(":packages.bzl", "MAINTAINER", "PUBLISH_PACKAGING_TAGS", "envoy_pkg_distros", "release_version_for")
+
+licenses(["notice"])  # Apache 2
+
+# IMPORTANT: SECRET-HANDLING TARGETS
+#
+# The `pgp_sign_*` targets in this file process release-signing material via
+# the toolshed `@envoy_toolshed//pgp` rules (key/passphrase are host paths;
+# their bytes never enter the action graph, but the rules force local,
+# uncached execution of the signing actions themselves)
+#
+# All other targets are ordinary actions - no secrets. The ones bundling the
+# release (which changes with every commit) are local (`PUBLISH_PACKAGING_TAGS`).
+
+envoy_package()
+
+# Configurable binary flags
+label_flag(
+    name = "envoy-binary",
+    build_setting_default = "//source/exe:envoy-static",
+)
+
+label_flag(
+    name = "envoy-binary-stripped",
+    build_setting_default = "//source/exe:envoy-static.stripped",
+)
+
+label_flag(
+    name = "envoy-dwarf",
+    build_setting_default = "//source/exe:envoy-static.dwp",
+)
+
+label_flag(
+    name = "envoy-contrib-binary",
+    build_setting_default = "//contrib/exe:envoy-static",
+)
+
+label_flag(
+    name = "envoy-contrib-binary-stripped",
+    build_setting_default = "//contrib/exe:envoy-static.stripped",
+)
+
+label_flag(
+    name = "envoy-contrib-dwarf",
+    build_setting_default = "//contrib/exe:envoy-static.dwp",
+)
+
+# The `.dwp`s with their debug sections compressed: llvm-dwp writes them uncompressed, several GB.
+# With zlib, which the debug images' gdb (12, Ubuntu 22.04) reads; it reads zstd only from gdb 13.
+# TODO(phlax): zstd (smaller, and ~3x faster to compress) once the images are based on Ubuntu 24.04
+# (gdb 15), along with the release links' `--compress-debug-sections` (ci/do_ci.sh); see #49222.
+# In 4 parts, joined locally: each part is cached as a smaller blob, which the remote cache serves
+# directly (blobs over ~700MB are often served from its fallback, slowly), and the parts download in
+# parallel.
+# objcopy holds the whole file, which needs more than the 3GiB of an action on the default x86_64
+# pool (arm64 builds run on the arm pool, as their host).
+[
+    compressed_debug_parts(
+        name = "%s-parts" % dwarf,
+        src = ":%s" % dwarf,
+        compression = "zlib",
+        exec_properties = envoy_exec_properties(
+            rbe_pool = "linux_x64_large",
+            test = False,
+        ),
+        parts = 4,
+    )
+    for dwarf in [
+        "envoy-contrib-dwarf",
+        "envoy-dwarf",
+    ]
+]
+
+[
+    genrule(
+        name = "%s-joined" % dwarf,
+        srcs = [":%s-parts" % dwarf],
+        outs = ["%s-joined/%s.dwp" % (dwarf, dwarf)],
+        cmd = "cat $$(echo $(SRCS) | tr ' ' '\\n' | sort) > $@",
+        tags = ["no-remote"],
+    )
+    for dwarf in [
+        "envoy-contrib-dwarf",
+        "envoy-dwarf",
+    ]
+]
+
+envoy_pkg_distros(
+    name = "packages",
+    maintainer = MAINTAINER,
+    version = VERSION,
+)
+
+genrule(
+    name = "verification",
+    outs = ["verification.sh"],
+    cmd = """
+    echo 'exec $${@}' > $@ \
+    && chmod +x $@
+    """,
+)
+
+sh_binary(
+    name = "verify_packages",
+    srcs = [":verification.sh"],
+    args = [
+        "$(location //tools/distribution:verify)",
+        "$(location :distrotest.sh)",
+        VERSION,
+        "$(location :distros.yaml)",
+        "--rebuild",
+    ],
+    data = [
+        ":distros.yaml",
+        ":distrotest.sh",
+        "//tools/distribution:verify",
+    ],
+)
+
+genrule(
+    name = "placeholder",
+    outs = ["PLACEHOLDER.TXT"],
+    cmd = """
+    touch $@
+    """,
+)
+
+label_flag(
+    name = "x64-release",
+    build_setting_default = ":placeholder",
+)
+
+label_flag(
+    name = "arm64-release",
+    build_setting_default = ":placeholder",
+)
+
+# The `.deb`/`.changes` files of each arch, to sign: they are built in the same invocation
+# (`ci/do_ci.sh release.multiarch`).
+label_flag(
+    name = "x64-debs",
+    build_setting_default = ":placeholder",
+)
+
+label_flag(
+    name = "arm64-debs",
+    build_setting_default = ":placeholder",
+)
+
+# Which committed *public* key is bundled as `signing.key`. Deliberately a
+# constrained string_flag, not a label_flag: an arbitrary file can not be
+# passed in here, so key material can never enter the graph via this path.
+# The selected key is additionally validated by `pgp_public_key`.
+string_flag(
+    name = "signing-key",
+    build_setting_default = "maintainers",
+    values = [
+        "maintainers",
+        "snakeoil",
+    ],
+)
+
+config_setting(
+    name = "signing_key_snakeoil",
+    flag_values = {":signing-key": "snakeoil"},
+)
+
+pgp_public_key(
+    name = "signing_key_file",
+    src = select({
+        ":signing_key_snakeoil": ":snakeoil-public.key",
+        "//conditions:default": "//:envoy-maintainers-public.key",
+    }),
+)
+
+SIGNED_CHANGES = envoy_signed_changes(
+    name = "signed_changes",
+    arch_debs = {
+        "arm64": ":arm64-debs",
+        "x64": ":x64-debs",
+    },
+    release_version = release_version_for(VERSION),
+    version = VERSION,
+)
+
+# The `.deb`s of both arches in a single flat `debs.tar.gz`, with signed per-distro `.changes` in
+# place of the unsigned multi-distro ones.
+[
+    debian_files(
+        name = "%s_debs" % arch,
+        srcs = [":%s-debs" % arch],
+        suffix = ".deb",
+        tags = ["manual"],
+    )
+    for arch in [
+        "arm64",
+        "x64",
+    ]
+]
+
+pkg_files(
+    name = "direct_debs_files",
+    srcs = [
+        ":arm64_debs",
+        ":x64_debs",
+    ] + [label for label, _dest in SIGNED_CHANGES],
+    attributes = pkg_attributes(mode = "0644"),
+    renames = {label: dest for label, dest in SIGNED_CHANGES},
+    tags = ["manual"],
+)
+
+pkg_tar(
+    name = "direct/debs",
+    srcs = [":direct_debs_files"],
+    compressor = "@envoy_toolshed//pigz",
+    compressor_args = "-n",
+    extension = "tar.gz",
+    tags = ["manual"] + PUBLISH_PACKAGING_TAGS,
+)
+
+alias(
+    name = "multi_arch_debs",
+    actual = ":direct/debs",
+    tags = ["manual"],
+)
+
+# Extract and rename the release binaries out of the per-arch release
+# tarballs. No secrets, but local (`PUBLISH_PACKAGING_TAGS`): the release changes with every commit.
+genrule(
+    name = "release_binaries",
+    srcs = [
+        ":arm64-release",
+        ":x64-release",
+    ],
+    outs = [
+        "envoy-%s-linux-x86_64" % VERSION,
+        "envoy-contrib-%s-linux-x86_64" % VERSION,
+        "envoy-%s-linux-aarch_64" % VERSION,
+        "envoy-contrib-%s-linux-aarch_64" % VERSION,
+    ],
+    cmd = """
+    NEEDS_PATH=
+    if [[ $$(basename $(location :x64-release)) == "PLACEHOLDER.TXT" ]]; then
+        NEEDS_PATH=1
+    elif [[ $$(basename $(location :arm64-release)) == "PLACEHOLDER.TXT" ]]; then
+        NEEDS_PATH=1
+    fi
+    if [[ -n $$NEEDS_PATH ]]; then
+        echo "FAIL: You must set //distribution:x64-release and //distribution:arm64-release for building release binaries" >&2
+        exit 1
+    fi
+    ZSTD=$(location @zstd//:zstd_cli)
+    "$$ZSTD" -fcd $(location :x64-release) | tar xfO - envoy > $(location envoy-%s-linux-x86_64)
+    "$$ZSTD" -fcd $(location :x64-release) | tar xfO - envoy-contrib > $(location envoy-contrib-%s-linux-x86_64)
+    "$$ZSTD" -fcd $(location :arm64-release) | tar xfO - envoy > $(location envoy-%s-linux-aarch_64)
+    "$$ZSTD" -fcd $(location :arm64-release) | tar xfO - envoy-contrib > $(location envoy-contrib-%s-linux-aarch_64)
+    chmod +x \
+        $(location envoy-%s-linux-x86_64) \
+        $(location envoy-contrib-%s-linux-x86_64) \
+        $(location envoy-%s-linux-aarch_64) \
+        $(location envoy-contrib-%s-linux-aarch_64)
+    """ % (VERSION, VERSION, VERSION, VERSION, VERSION, VERSION, VERSION, VERSION),
+    tags = PUBLISH_PACKAGING_TAGS,
+    tools = ["@zstd//:zstd_cli"],
+)
+
+# In-graph signing targets built on `@envoy_toolshed//pgp`.
+#
+# `manual`: pgp targets fail at analysis time (by design) unless
+# `--@envoy_toolshed//pgp:key_path` / `--@envoy_toolshed//pgp:passphrase_path`
+# are set, so they must never be reachable from wildcard builds.
+pgp_sign_checksums(
+    name = "signed_checksums",
+    srcs = [
+        ":multi_arch_debs",
+        ":release_binaries",
+    ],
+    checksums_out = "checksums.txt",
+    tags = ["manual"] + PUBLISH_PACKAGING_TAGS,
+)
+
+# Final release bundle layout contract (matches prior `envoy.gpg.sign` output,
+# with pkg_tar normalizing modes, owners, and mtimes):
+# - `signing.key` at archive root.
+# - `bin/` contains `debs.tar.gz`, 4 release binaries, and `checksums.txt.asc`.
+# Publisher uploads `bin/*` non-recursively, and distro verification reads
+# `bin/debs.tar.gz` plus `signing.key`.
+pkg_files(
+    name = "signed_bin_files",
+    srcs = [
+        ":release_binaries",
+    ],
+    attributes = pkg_attributes(mode = "0755"),
+    prefix = "bin",
+    tags = ["manual"],
+)
+
+pkg_files(
+    name = "signed_bin_data",
+    srcs = [
+        ":multi_arch_debs",
+        ":signed_checksums",
+    ],
+    attributes = pkg_attributes(mode = "0644"),
+    prefix = "bin",
+    tags = ["manual"],
+)
+
+pkg_files(
+    name = "signed_key_file",
+    srcs = [":signing_key_file"],
+    attributes = pkg_attributes(mode = "0644"),
+    renames = {
+        ":signing_key_file": "signing.key",
+    },
+    tags = ["manual"],
+)
+
+pkg_tar(
+    name = "signed",
+    srcs = [
+        ":signed_bin_data",
+        ":signed_bin_files",
+        ":signed_key_file",
+    ],
+    out = "release.signed.tar.zst",
+    compressor = "@zstd//:zstd_cli",
+    compressor_args = "-T0",
+    extension = "tar.zst",
+    tags = ["manual"] + PUBLISH_PACKAGING_TAGS,
+)

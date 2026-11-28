@@ -2,6 +2,7 @@
 
 #include "source/extensions/filters/http/cache/cacheability_utils.h"
 
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
@@ -35,13 +36,16 @@ envoy::extensions::filters::http::cache::v3::CacheConfig getConfig() {
 
 class IsCacheableResponseTest : public testing::Test {
 public:
-  IsCacheableResponseTest() : vary_allow_list_(getConfig().allowed_vary_headers()) {}
+  IsCacheableResponseTest()
+      : vary_allow_list_(getConfig().allowed_vary_headers(), factory_context_) {}
 
 protected:
   std::string cache_control_ = "max-age=3600";
   Http::TestResponseHeaderMapImpl response_headers_ = {{":status", "200"},
                                                        {"date", "Sun, 06 Nov 1994 08:49:37 GMT"},
                                                        {"cache-control", cache_control_}};
+
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context_;
   VaryAllowList vary_allow_list_;
 };
 
@@ -90,8 +94,7 @@ TEST_F(CanServeRequestFromCacheTest, AuthorizationHeader) {
 }
 
 INSTANTIATE_TEST_SUITE_P(ConditionalHeaders, RequestConditionalHeadersTest,
-                         testing::Values("if-match", "if-none-match", "if-modified-since",
-                                         "if-unmodified-since", "if-range"),
+                         testing::Values("if-none-match", "if-modified-since", "if-range"),
                          [](const auto& info) {
                            std::string test_name = info.param;
                            absl::c_replace_if(
@@ -152,6 +155,19 @@ TEST_F(IsCacheableResponseTest, ResponsePrivate) {
   std::string cache_control_private = absl::StrCat(cache_control_, ", private");
   response_headers_.setReferenceKey(Http::CustomHeaders::get().CacheControl, cache_control_private);
   EXPECT_FALSE(CacheabilityUtils::isCacheableResponse(response_headers_, vary_allow_list_));
+}
+
+TEST_F(IsCacheableResponseTest, StorageDirectivesAreCaseInsensitive) {
+  response_headers_.setReferenceKey(Http::CustomHeaders::get().CacheControl, "max-age=600");
+  ASSERT_TRUE(CacheabilityUtils::isCacheableResponse(response_headers_, vary_allow_list_));
+
+  for (const absl::string_view directive : {"private", "Private", "PRIVATE", "pRiVaTe", "no-store",
+                                            "No-Store", "NO-STORE", "nO-sToRe"}) {
+    SCOPED_TRACE(directive);
+    response_headers_.setReferenceKey(Http::CustomHeaders::get().CacheControl,
+                                      absl::StrCat("max-age=600, ", directive));
+    EXPECT_FALSE(CacheabilityUtils::isCacheableResponse(response_headers_, vary_allow_list_));
+  }
 }
 
 TEST_F(IsCacheableResponseTest, EmptyVary) {

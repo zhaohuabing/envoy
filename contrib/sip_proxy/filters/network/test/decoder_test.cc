@@ -10,6 +10,7 @@
 #include "contrib/sip_proxy/filters/network/source/config.h"
 #include "contrib/sip_proxy/filters/network/source/conn_manager.h"
 #include "contrib/sip_proxy/filters/network/source/decoder.h"
+#include "contrib/sip_proxy/filters/network/source/encoder.h"
 #include "contrib/sip_proxy/filters/network/test/mocks.h"
 #include "contrib/sip_proxy/filters/network/test/utility.h"
 #include "gmock/gmock.h"
@@ -47,7 +48,7 @@ public:
 class SipDecoderTest : public testing::Test {
 public:
   SipDecoderTest()
-      : stats_(SipFilterStats::generateStats("test.", store_)),
+      : stats_(SipFilterStats::generateStats("test.", *store_.rootScope())),
         transaction_infos_(std::make_shared<Router::TransactionInfos>()) {}
   ~SipDecoderTest() override {
     filter_callbacks_.connection_.dispatcher_.clearDeferredDeleteList();
@@ -74,14 +75,14 @@ public:
 
     decoder_filter_ = std::make_shared<NiceMock<SipFilters::MockDecoderFilter>>();
 
-    config_ = std::make_unique<TestConfigImpl>(proto_config_, context_, decoder_filter_, stats_);
+    config_ = std::make_shared<TestConfigImpl>(proto_config_, context_, decoder_filter_, stats_);
     if (custom_filter_) {
       config_->custom_filter_ = custom_filter_;
     }
 
     ON_CALL(random_, random()).WillByDefault(Return(42));
     filter_ = std::make_unique<ConnectionManager>(
-        *config_, random_, filter_callbacks_.connection_.dispatcher_.timeSource(),
+        config_, random_, filter_callbacks_.connection_.dispatcher_.timeSource(), context_,
         transaction_infos_);
     filter_->initializeReadFilterCallbacks(filter_callbacks_);
     filter_->onNewConnection();
@@ -98,9 +99,6 @@ public:
     Decoder::REGISTERHandler msgHandler(decoder);
     Decoder::HeaderHandler headerHandler(msgHandler);
     EXPECT_EQ(HeaderType::Via, headerHandler.currentHeader());
-    absl::string_view str("");
-    headerHandler.processEvent(str);
-    headerHandler.processCseq(str);
 
     DecoderStateMachine::DecoderStatus status(State::MessageBegin);
   }
@@ -111,7 +109,7 @@ public:
   SipFilterStats stats_;
   envoy::extensions::filters::network::sip_proxy::v3alpha::SipProxy proto_config_;
 
-  std::unique_ptr<TestConfigImpl> config_;
+  std::shared_ptr<TestConfigImpl> config_;
 
   Buffer::OwnedImpl buffer_;
   Buffer::OwnedImpl write_buffer_;
@@ -133,8 +131,13 @@ route_config:
       cluster: "test"
 settings:
   transaction_timeout: 32s
-  own_domain: pcsf-cfed.cncs.svc.cluster.local
-  domain_match_parameter_name: x-suri
+  local_services:
+  - domain: pcsf-cfed.cncs.svc.cluster.local
+    parameter : transport
+  - domain: pcsf-cfed.cncs.svc.cluster.local
+    parameter : x-suri
+  - domain: pcsf-cfed.cncs.svc.cluster.local
+    parameter : host
 )EOF";
 
 TEST_F(SipDecoderTest, DecodeINVITE) {
@@ -148,16 +151,32 @@ TEST_F(SipDecoderTest, DecodeINVITE) {
       "To: <sip:User.0000@tas01.defult.svc.cluster.local>\x0d\x0a"
       "From: <sip:User.0001@tas01.defult.svc.cluster.local>;tag=1\x0d\x0a"
       "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
-      "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
-      "Record-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
+      "Route: "
+      "<sip:+16959000000:15306;role=anch;lr;transport=udp;x-suri=sip:pcsf-cfed.cncs.svc.cluster."
+      "local:5060>\x0d\x0a"
+      "Record-Route: "
+      "<sip:+16959000000:15306;role=anch;lr;transport=udp;x-suri=sip:pcsf-cfed.cncs.svc.cluster."
+      "local:5060>\x0d\x0a"
+      "Service-Route: "
+      "<sip:test@pcsf-cfed.cncs.svc.cluster.local;role=anch;lr;transport=udp;x-suri=sip:scsf-cfed."
+      "cncs.svc.cluster.local:5060>\x0d\x0a"
+      "Path: "
+      "<sip:10.177.8.232;x-fbi=cfed;x-suri=sip:pcsf-cfed.cncs.svc.cluster.local:5060;inst-ip=192."
+      "169.110.53;lr;ottag=ue_term;bidx=563242011197570;access-type=ADSL;x-alu-prset-id>\x0d\x0a"
       "CSeq: 1 INVITE\x0d\x0a"
       "Contact: <sip:User.0001@11.0.0.10:15060;transport=TCP>\x0d\x0a"
       "Max-Forwards: 70\x0d\x0a"
+      "P-Charging-Vector: orig-ioi=ims.com;term-ioi= ims.com\x0d\x0a"
+      "P-Charging-Vector: orig-ioi=ims1.com;term-ioi= ims1.com\x0d\x0a"
+      "P-Charging-Function-Addresses: ccf=0.0.0.0\x0d\x0a"
+      "P-Nokia-Cookie-IP-Mapping: S1F1=10.0.0.1\x0d\x0a"
       "Content-Length:  0\x0d\x0a"
       "\x0d\x0a";
 
   buffer_.add(SIP_INVITE_FULL);
   EXPECT_EQ(filter_->onData(buffer_, false), Network::FilterStatus::StopIteration);
+
+  Buffer::OwnedImpl response_buffer;
 
   EXPECT_EQ(1U, store_.counter("test.request").value());
   EXPECT_EQ(1U, stats_.request_active_.value());
@@ -183,6 +202,7 @@ TEST_F(SipDecoderTest, DecodeRegister) {
       "<sip:10.177.8.232;x-fbi=cfed;x-suri=sip:pcsf-cfed.cncs.svc.cluster.local:5060;inst-ip=192."
       "169.110.53;lr;ottag=ue_term;bidx=563242011197570;access-type=ADSL;x-alu-prset-id>\x0d\x0a"
       "Record-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
+      "Service-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "Authorization: Digest username=\"tc05sub1@cncs.nokialab.com\", realm=\"cncs.nokialab.com\", "
       "nonce=\"436dbd0f60a52adc2DPadc43f91c774b51ac4cad614258c43cf9df\", algorithm=MD5, "
@@ -196,6 +216,7 @@ TEST_F(SipDecoderTest, DecodeRegister) {
       "nonce=\"436dbd0f60a52adc2DPadc43f91c774b51ac4cad614258c43cf9df\", algorithm=MD5, "
       "uri=\"sip:10.30.29.47\", response=\"c4f3c2fccdca9c5febc66d4226b5afae\", nc=01201201, "
       "cnonce=\"123456\", qop=auth, opaque=\"127.0.0.1\x0d\x0a"
+      "P-Nokia-Cookie-IP-Mapping: S1F1=10.0.0.1\x0d\x0a"
       "\x0d\x0a";
 
   buffer_.add(SIP_REGISTER_FULL);
@@ -217,6 +238,8 @@ TEST_F(SipDecoderTest, DecodeOK200) {
       "Record-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "Service-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
+      "To: <sip:User.0000@tas01.defult.svc.cluster.local>\x0d\x0a"
+      "From: <sip:User.0001@tas01.defult.svc.cluster.local>;tag=1\x0d\x0a"
       "Via: SIP/2.0/TCP 11.0.0.10:15060;branch=z9hG4bK-3193-1-0\x0d\x0a"
       "Path: "
       "<sip:10.177.8.232;x-fbi=cfed;x-suri=sip:pcsf-cfed.cncs.svc.cluster.local:5060;inst-ip=192."
@@ -235,6 +258,8 @@ TEST_F(SipDecoderTest, DecodeOK200) {
       "Service-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
+      "To: <sip:User.0000@tas01.defult.svc.cluster.local>\x0d\x0a"
+      "From: <sip:User.0001@tas01.defult.svc.cluster.local>;tag=1\x0d\x0a"
       "Via: SIP/2.0/TCP 11.0.0.10:15060;branch=z9hG4bK-3193-1-0\x0d\x0a"
       "Via: SIP/2.0/TCP 11.0.0.10:15060;branch=z9hG4bK-3193-1-0\x0d\x0a"
       "Content-Length:  0\x0d\x0a"
@@ -246,6 +271,55 @@ TEST_F(SipDecoderTest, DecodeOK200) {
   EXPECT_EQ(1U, stats_.request_active_.value());
   EXPECT_EQ(0U, store_.counter("test.response").value());
 }
+
+TEST_F(SipDecoderTest, DecodeOK200EmptyHeader) {
+  initializeFilter(yaml);
+
+  const std::string SIP_OK200_EMPTY_HEADER =
+      "SIP/2.0 200 OK\x0d\x0a"
+      "Via:SIP/2.0/TCP 11.0.0.10:15060;branch=z9hG4bK-3193-1-0\x0d\x0a"
+      "From:<sip:User.0001@tas01.defult.svc.cluster.local>;tag=1\x0d\x0a"
+      "To:<sip:User.0000@tas01.defult.svc.cluster.local>\x0d\x0a"
+      "Call-ID:1-3193@11.0.0.10\x0d\x0a"
+      "CSeq:100 REGISTER\x0d\x0a"
+      "Session-ID:fdc85ff600804114a90b50e04de2b988;remote=b74c76b50080450dabd12317fb6b8aa7\x0d\x0a"
+      "User-Agent:test-client-v1.1\x0d\x0a"
+      "Supported:\x0d\x0a"
+      "Contact:<sip:User.0001@11.0.0.10:15060;transport=TCP>\x0d\x0a"
+      "Content-Length:0\x0d\x0a"
+      "\x0d\x0a";
+  buffer_.add(SIP_OK200_EMPTY_HEADER);
+  EXPECT_EQ(filter_->onData(buffer_, false), Network::FilterStatus::StopIteration);
+
+  EXPECT_EQ(1U, store_.counter("test.request").value());
+  EXPECT_EQ(1U, stats_.request_active_.value());
+  EXPECT_EQ(0U, store_.counter("test.response").value());
+}
+
+TEST_F(SipDecoderTest, DecodeOK200DifferentHeaderFormats) {
+  initializeFilter(yaml);
+
+  const std::string SIP_OK200_DIFF_HEADER_FORMATS =
+      "SIP/2.0 200 OK\x0d\x0a"
+      "Via:             SIP/2.0/TCP 11.0.0.10:15060;branch=z9hG4bK-3193-1-0\x0d\x0a"
+      "From          :<sip:User.0001@tas01.defult.svc.cluster.local>;tag=1\x0d\x0a"
+      "To      :           <sip:User.0000@tas01.defult.svc.cluster.local>\x0d\x0a"
+      "Call-ID:1-3193@11.0.0.10\x0d\x0a"
+      "CSeq: 100 REGISTER\x0d\x0a"
+      "Session-ID:   fdc85ff600804114ae04de2b988;remote=b74c76b50050dabd12317fb6b8aa7\x0d\x0a"
+      "User-Agent  :    test-client-v1.1\x0d\x0a"
+      "Supported   :\x0d\x0a"
+      "Contact  :  <sip:User.0001@11.0.0.10:15060;transport=TCP>\x0d\x0a"
+      "Content-Length: 0\x0d\x0a"
+      "\x0d\x0a";
+  buffer_.add(SIP_OK200_DIFF_HEADER_FORMATS);
+  EXPECT_EQ(filter_->onData(buffer_, false), Network::FilterStatus::StopIteration);
+
+  EXPECT_EQ(1U, store_.counter("test.request").value());
+  EXPECT_EQ(1U, stats_.request_active_.value());
+  EXPECT_EQ(0U, store_.counter("test.response").value());
+}
+
 TEST_F(SipDecoderTest, DecodeGeneral) {
   initializeFilter(yaml);
 
@@ -264,6 +338,7 @@ TEST_F(SipDecoderTest, DecodeGeneral) {
       "Path: "
       "<sip:10.177.8.232;x-fbi=cfed;x-suri=sip:pcsf-cfed.cncs.svc.cluster.local:5060;inst-ip=192."
       "169.110.53;lr;ottag=ue_term;bidx=563242011197570;access-type=ADSL;x-alu-prset-id>\x0d\x0a"
+      "P-Nokia-Cookie-IP-Mapping: S1F1=10.0.0.1\x0d\x0a"
       "Max-Forwards: 70\x0d\x0a"
       "Content-Length:  0\x0d\x0a"
       "\x0d\x0a";
@@ -291,6 +366,7 @@ TEST_F(SipDecoderTest, DecodeSUBSCRIBE) {
       "Record-Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
       "CSeq: 2 SUBSCRIBE\x0d\x0a"
       "Contact: <sip:User.0001@11.0.0.10:15060;transport=TCP>\x0d\x0a"
+      "P-Nokia-Cookie-IP-Mapping: S1F1=10.0.0.1\x0d\x0a"
       "Max-Forwards: 70\x0d\x0a"
       "Content-Length:  0\x0d\x0a"
       "Event: feature-status-exchange\x0d\x0a"
@@ -350,6 +426,7 @@ TEST_F(SipDecoderTest, DecodeFAILURE4XX) {
       "realm=\"cncs.nokialab.com\",nonce="
       "\"436dbd0f60a52adc2DPadc43f91c774b51ac4cad614258c43cf9df\",algorithm=MD5,qop=\"auth\","
       "opaque=\"127.0.0.1\x0d\x0a"
+      "P-Nokia-Cookie-IP-Mapping: S1F1=10.0.0.1\x0d\x0a"
       "Content-Length: 0\x0d\x0a"
       "\x0d\x0a";
   buffer_.add(SIP_FAILURE4XX_FULL);
@@ -528,6 +605,7 @@ TEST_F(SipDecoderTest, DecodeNOTIFY) {
       "Path: "
       "<sip:10.177.8.232;x-fbi=cfed;x-suri=sip:pcsf-cfed.cncs.svc.cluster.local:5060;inst-ip=192."
       "169.110.53;lr;ottag=ue_term;bidx=563242011197570;access-type=ADSL;x-alu-prset-id>\x0d\x0a"
+      "P-Nokia-Cookie-IP-Mapping: S1F1=10.0.0.1\x0d\x0a"
       "Max-Forwards: 70\x0d\x0a"
       "Content-Length:  0\x0d\x0a"
       "\x0d\x0a";
@@ -539,17 +617,31 @@ TEST_F(SipDecoderTest, DecodeNOTIFY) {
   EXPECT_EQ(0U, store_.counter("test.response").value());
 }
 
-TEST_F(SipDecoderTest, HandleState) {
-  MessageMetadataSharedPtr metadata;
-  MockDecoderEventHandler handler;
-  DecoderStateMachine machine(metadata, handler);
-  /* TODO  panic:     not reached
-  machine.setCurrentState(State::WaitForData);
-  */
-  machine.setCurrentState(State::MessageEnd);
-  EXPECT_CALL(handler, messageEnd()).WillOnce(Return(FilterStatus::StopIteration));
-  machine.run();
-  EXPECT_EQ(State::TransportEnd, machine.currentState());
+TEST_F(SipDecoderTest, DecodeContentLengthLongerThanBuffer) {
+  initializeFilter(yaml);
+
+  // The Content-Length value is far longer than the temporary buffer the decoder
+  // copies it into. The copy must stay bounded so an attacker-controlled header
+  // cannot overflow the stack buffer. The leading whitespace parses to 0, so this
+  // is a complete message once the copy is capped.
+  const std::string SIP_LONG_CONTENT_LENGTH =
+      "ACK sip:User.0000@tas01.defult.svc.cluster.local SIP/2.0\x0d\x0a"
+      "Call-ID: 1-3193@11.0.0.10\x0d\x0a"
+      "Via: SIP/2.0/TCP 11.0.0.10:15060;branch=z9hG4bK-3193-1-0\x0d\x0a"
+      "To: <sip:User.0000@tas01.defult.svc.cluster.local>\x0d\x0a"
+      "From: <sip:User.0001@tas01.defult.svc.cluster.local>;tag=1\x0d\x0a"
+      "Route: <sip:+16959000000:15306;role=anch;lr;transport=udp>\x0d\x0a"
+      "CSeq: 2 ACK\x0d\x0a"
+      "Contact: <sip:User.0001@11.0.0.10:15060;transport=TCP>;tag=1\x0d\x0a"
+      "Max-Forwards: 70\x0d\x0a"
+      "Content-Length:                    0000000000000000\x0d\x0a"
+      "\x0d\x0a";
+  buffer_.add(SIP_LONG_CONTENT_LENGTH);
+
+  EXPECT_EQ(filter_->onData(buffer_, false), Network::FilterStatus::StopIteration);
+  EXPECT_EQ(1U, store_.counter("test.request").value());
+  EXPECT_EQ(1U, stats_.request_active_.value());
+  EXPECT_EQ(0U, store_.counter("test.response").value());
 }
 
 TEST_F(SipDecoderTest, HeaderTest) {

@@ -6,9 +6,8 @@
 #include "source/common/common/enum_to_int.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
+#include "source/common/jwt/status.h"
 #include "source/common/protobuf/utility.h"
-
-#include "jwt_verify_lib/status.h"
 
 using envoy::extensions::filters::http::jwt_authn::v3::RemoteJwks;
 
@@ -22,8 +21,9 @@ class JwksFetcherImpl : public JwksFetcher,
                         public Logger::Loggable<Logger::Id::filter>,
                         public Http::AsyncClient::Callbacks {
 public:
-  JwksFetcherImpl(Upstream::ClusterManager& cm, const RemoteJwks& remote_jwks)
-      : cm_(cm), remote_jwks_(remote_jwks) {
+  JwksFetcherImpl(Upstream::ClusterManager& cm, Router::RetryPolicyConstSharedPtr retry_policy,
+                  const RemoteJwks& remote_jwks)
+      : cm_(cm), retry_policy_(retry_policy), remote_jwks_(remote_jwks) {
     ENVOY_LOG(trace, "{}", __func__);
   }
 
@@ -34,6 +34,7 @@ public:
       request_->cancel();
       ENVOY_LOG(debug, "fetch pubkey [uri = {}]: canceled", remote_jwks_.http_uri().uri());
     }
+    complete_ = true;
     reset();
   }
 
@@ -55,20 +56,21 @@ public:
       return;
     }
 
-    Http::RequestMessagePtr message = Http::Utility::prepareHeaders(remote_jwks_.http_uri());
+    Http::RequestMessagePtr message = Http::Utility::prepareHeaders(remote_jwks_.http_uri(), true);
     message->headers().setReferenceMethod(Http::Headers::get().MethodValues.Get);
+    message->headers().setReferenceUserAgent(Http::Headers::get().UserAgentValues.GoBrowser);
     ENVOY_LOG(debug, "fetch pubkey from [uri = {}]: start", remote_jwks_.http_uri().uri());
     auto options = Http::AsyncClient::RequestOptions()
                        .setTimeout(std::chrono::milliseconds(
                            DurationUtil::durationToMilliseconds(remote_jwks_.http_uri().timeout())))
                        .setParentSpan(parent_span)
+                       // Leave sampled unset so the JWKS fetch span honors the parent span's
+                       // sampling decision instead of always being sampled.
+                       .setSampled(std::nullopt)
                        .setChildSpanName("JWT Remote PubKey Fetch");
 
-    if (remote_jwks_.has_retry_policy()) {
-      envoy::config::route::v3::RetryPolicy route_retry_policy =
-          Http::Utility::convertCoreToRouteRetryPolicy(remote_jwks_.retry_policy(),
-                                                       "5xx,gateway-error,connect-failure,reset");
-      options.setRetryPolicy(route_retry_policy);
+    if (retry_policy_ != nullptr) {
+      options.setRetryPolicy(retry_policy_);
       options.setBufferBodyForRetry(true);
     }
 
@@ -85,9 +87,8 @@ public:
       ENVOY_LOG(debug, "{}: fetch pubkey [uri = {}]: success", __func__, uri);
       if (response->body().length() != 0) {
         const auto body = response->bodyAsString();
-        auto jwks =
-            google::jwt_verify::Jwks::createFrom(body, google::jwt_verify::Jwks::Type::JWKS);
-        if (jwks->getStatus() == google::jwt_verify::Status::Ok) {
+        auto jwks = Envoy::JwtVerify::Jwks::createFrom(body, Envoy::JwtVerify::Jwks::Type::JWKS);
+        if (jwks->getStatus() == Envoy::JwtVerify::Status::Ok) {
           ENVOY_LOG(debug, "{}: fetch pubkey [uri = {}]: succeeded", __func__, uri);
           receiver_->onJwksSuccess(std::move(jwks));
         } else {
@@ -119,22 +120,26 @@ public:
 
 private:
   Upstream::ClusterManager& cm_;
+  Router::RetryPolicyConstSharedPtr retry_policy_;
+
   bool complete_{};
   JwksFetcher::JwksReceiver* receiver_{};
   const RemoteJwks& remote_jwks_;
   Http::AsyncClient::Request* request_{};
 
   void reset() {
-    request_ = nullptr;
-    receiver_ = nullptr;
+    if (complete_) {
+      request_ = nullptr;
+      receiver_ = nullptr;
+    }
   }
 };
 } // namespace
 
 JwksFetcherPtr JwksFetcher::create(
-    Upstream::ClusterManager& cm,
+    Upstream::ClusterManager& cm, Router::RetryPolicyConstSharedPtr retry_policy,
     const envoy::extensions::filters::http::jwt_authn::v3::RemoteJwks& remote_jwks) {
-  return std::make_unique<JwksFetcherImpl>(cm, remote_jwks);
+  return std::make_unique<JwksFetcherImpl>(cm, std::move(retry_policy), remote_jwks);
 }
 } // namespace Common
 } // namespace HttpFilters

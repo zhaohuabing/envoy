@@ -2,14 +2,16 @@
 
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/extensions/filters/http/ext_authz/v3/ext_authz.pb.h"
+#include "envoy/router/router.h"
 #include "envoy/service/auth/v3/external_auth.pb.h"
-#include "envoy/tracing/http_tracer.h"
+#include "envoy/tracing/tracer.h"
 #include "envoy/type/matcher/v3/string.pb.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/common/matchers.h"
 #include "source/common/router/header_parser.h"
+#include "source/extensions/filters/common/ext_authz/check_request_utils.h"
 #include "source/extensions/filters/common/ext_authz/ext_authz.h"
 
 namespace Envoy {
@@ -18,51 +20,19 @@ namespace Filters {
 namespace Common {
 namespace ExtAuthz {
 
-class Matcher;
-using MatcherSharedPtr = std::shared_ptr<Matcher>;
-
-/**
- *  Matchers describe the rules for matching authorization request and response headers.
- */
-class Matcher {
-public:
-  virtual ~Matcher() = default;
-
-  /**
-   * Returns whether or not the header key matches the rules of the matcher.
-   *
-   * @param key supplies the header key to be evaluated.
-   */
-  virtual bool matches(absl::string_view key) const PURE;
-};
-
-class HeaderKeyMatcher : public Matcher {
-public:
-  HeaderKeyMatcher(std::vector<Matchers::StringMatcherPtr>&& list);
-
-  bool matches(absl::string_view key) const override;
-
-private:
-  const std::vector<Matchers::StringMatcherPtr> matchers_;
-};
-
-class NotHeaderKeyMatcher : public Matcher {
-public:
-  NotHeaderKeyMatcher(std::vector<Matchers::StringMatcherPtr>&& list);
-
-  bool matches(absl::string_view key) const override;
-
-private:
-  const HeaderKeyMatcher matcher_;
-};
-
 /**
  * HTTP client configuration for the HTTP authorization (ext_authz) filter.
  */
 class ClientConfig {
 public:
   ClientConfig(const envoy::extensions::filters::http::ext_authz::v3::ExtAuthz& config,
-               uint32_t timeout, absl::string_view path_prefix);
+               uint32_t timeout, absl::string_view path_prefix,
+               Server::Configuration::CommonFactoryContext& context);
+
+  // Build config directly from HttpService without constructing a temporary ExtAuthz.
+  ClientConfig(const envoy::extensions::filters::http::ext_authz::v3::HttpService& http_service,
+               bool encode_raw_headers, uint32_t timeout,
+               Server::Configuration::CommonFactoryContext& context, bool emit_client_span = true);
 
   /**
    * Returns the name of the authorization cluster.
@@ -75,15 +45,14 @@ public:
   const std::string& pathPrefix() { return path_prefix_; }
 
   /**
+   * Returns the authorization request path override (replaces path entirely when set).
+   */
+  const std::string& pathOverride() { return path_override_; }
+
+  /**
    * Returns authorization request timeout.
    */
   const std::chrono::milliseconds& timeout() const { return timeout_; }
-
-  /**
-   * Returns a list of matchers used for selecting the request headers that should be sent to the
-   * authorization server.
-   */
-  const MatcherSharedPtr& requestHeaderMatchers() const { return request_header_matchers_; }
 
   /**
    * Returns a list of matchers used for selecting the authorization response headers that
@@ -129,16 +98,33 @@ public:
    */
   const Router::HeaderParser& requestHeaderParser() const { return *request_headers_parser_; }
 
+  /**
+   * Returns whether or not to encode raw headers (i.e. use headers_map instead of headers field).
+   */
+  bool encodeRawHeaders() const { return encode_raw_headers_; }
+
+  /**
+   * Returns the retry policy for the authorization service.
+   */
+  const Router::RetryPolicyConstSharedPtr& retryPolicy() const { return retry_policy_; }
+
+  /**
+   * Returns whether to emit client span.
+   */
+  bool emitClientSpan() const { return emit_client_span_; }
+
 private:
+  static MatcherSharedPtr toClientMatchers(const envoy::type::matcher::v3::ListStringMatcher& list,
+                                           Server::Configuration::CommonFactoryContext& context);
   static MatcherSharedPtr
-  toRequestMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
-  static MatcherSharedPtr toClientMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
+  toClientMatchersOnSuccess(const envoy::type::matcher::v3::ListStringMatcher& list,
+                            Server::Configuration::CommonFactoryContext& context);
   static MatcherSharedPtr
-  toClientMatchersOnSuccess(const envoy::type::matcher::v3::ListStringMatcher& list);
+  toDynamicMetadataMatchers(const envoy::type::matcher::v3::ListStringMatcher& list,
+                            Server::Configuration::CommonFactoryContext& context);
   static MatcherSharedPtr
-  toDynamicMetadataMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
-  static MatcherSharedPtr
-  toUpstreamMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
+  toUpstreamMatchers(const envoy::type::matcher::v3::ListStringMatcher& list,
+                     Server::Configuration::CommonFactoryContext& context);
 
   const MatcherSharedPtr request_header_matchers_;
   const MatcherSharedPtr client_header_matchers_;
@@ -149,8 +135,12 @@ private:
   const std::string cluster_name_;
   const std::chrono::milliseconds timeout_;
   const std::string path_prefix_;
+  const std::string path_override_;
   const std::string tracing_name_;
   Router::HeaderParserPtr request_headers_parser_;
+  const bool encode_raw_headers_;
+  const Router::RetryPolicyConstSharedPtr retry_policy_;
+  const bool emit_client_span_;
 };
 
 using ClientConfigSharedPtr = std::shared_ptr<ClientConfig>;

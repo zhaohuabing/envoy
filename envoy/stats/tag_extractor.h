@@ -1,8 +1,7 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
-#include <string>
-#include <vector>
 
 #include "envoy/common/interval_set.h"
 #include "envoy/common/pure.h"
@@ -25,7 +24,7 @@ public:
   /**
    * Identifier for the tag extracted by this object.
    */
-  virtual std::string name() const PURE;
+  virtual absl::string_view name() const PURE;
 
   /**
    * Finds tags for stat_name and adds them to the tags vector. If the tag is not
@@ -58,9 +57,12 @@ public:
    * @return absl::string_view the prefix, or an empty string_view if none was found.
    */
   virtual absl::string_view prefixToken() const PURE;
+
+  virtual bool otherExtractorWithSameNameExists() const PURE;
+  virtual void setOtherExtractorWithSameNameExists(bool e) PURE;
 };
 
-using TagExtractorPtr = std::unique_ptr<const TagExtractor>;
+using TagExtractorPtr = std::unique_ptr<TagExtractor>;
 
 } // namespace Stats
 } // namespace Envoy

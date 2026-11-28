@@ -15,8 +15,21 @@ envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
     extension_names = ["envoy.filters.network.rbac"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
+    tags = ["skip_on_windows"],
     deps = [
         "//source/extensions/filters/network/rbac:config",
+        "//test/extensions/filters/common/rbac:extension_input_lib",
         "//test/mocks/server:factory_context_mocks",
         "@envoy_api//envoy/config/rbac/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/network/rbac/v3:pkg_cc_proto",
@@ -27,23 +40,51 @@ envoy_extension_cc_test(
     name = "filter_test",
     srcs = ["filter_test.cc"],
     extension_names = ["envoy.filters.network.rbac"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
+    tags = ["skip_on_windows"],
     deps = [
+        "//envoy/common:logger",
         "//source/extensions/filters/common/rbac:utility_lib",
         "//source/extensions/filters/network:well_known_names",
         "//source/extensions/filters/network/rbac:rbac_filter",
+        "//source/extensions/matching/network/common:inputs_lib",
         "//test/mocks/network:network_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/rbac/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/network/rbac/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/matching/common_inputs/network/v3:pkg_cc_proto",
     ],
 )
 
 envoy_extension_cc_test(
     name = "integration_test",
+    size = "large",
     srcs = ["integration_test.cc"],
     extension_names = ["envoy.filters.network.rbac"],
+    rbe_pool = {
+        "openssl": {"link": "linux_x64_small"},
+        "coverage": {"link": "linux_x64_large"},
+        "tsan": {"link": "linux_x64_small"},
+    },
+    tags = ["skip_on_windows"],
     deps = [
+        "//envoy/common:logger",
+        "//source/common/runtime:runtime_features_lib",
+        "//source/common/stats:thread_local_store_lib",
         "//source/extensions/filters/network/echo:config",
         "//source/extensions/filters/network/rbac:config",
+        "//source/extensions/filters/network/set_filter_state:config",
         "//test/integration:integration_lib",
         "//test/test_common:environment_lib",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",

@@ -5,6 +5,7 @@
 
 #include "test/common/stats/stat_test_utility.h"
 #include "test/test_common/logging.h"
+#include "test/test_common/status_utility.h"
 #include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
@@ -17,7 +18,7 @@ namespace {
 TEST(NullValidationVisitorImpl, UnknownField) {
   NullValidationVisitorImpl null_validation_visitor;
   EXPECT_TRUE(null_validation_visitor.skipValidation());
-  EXPECT_NO_THROW(null_validation_visitor.onUnknownField("foo"));
+  EXPECT_OK(null_validation_visitor.onUnknownField("foo"));
 }
 
 // The warning validation visitor logs and bumps stats on unknown fields
@@ -30,30 +31,43 @@ TEST(WarningValidationVisitorImpl, UnknownField) {
   EXPECT_FALSE(warning_validation_visitor.skipValidation());
   // First time around we should log.
   EXPECT_LOG_CONTAINS("warn", "Unknown field: foo",
-                      warning_validation_visitor.onUnknownField("foo"));
+                      EXPECT_OK(warning_validation_visitor.onUnknownField("foo")));
   // Duplicate descriptions don't generate a log the second time around.
   EXPECT_LOG_NOT_CONTAINS("warn", "Unknown field: foo",
-                          warning_validation_visitor.onUnknownField("foo"));
+                          EXPECT_OK(warning_validation_visitor.onUnknownField("foo")));
   // Unrelated variable increments.
   EXPECT_LOG_CONTAINS("warn", "Unknown field: bar",
-                      warning_validation_visitor.onUnknownField("bar"));
+                      EXPECT_OK(warning_validation_visitor.onUnknownField("bar")));
   // When we set the stats counter, the above increments are transferred.
   EXPECT_EQ(0, unknown_counter.value());
   warning_validation_visitor.setCounters(unknown_counter, wip_counter);
   EXPECT_EQ(2, unknown_counter.value());
   // A third unknown field is tracked in stats post-initialization.
   EXPECT_LOG_CONTAINS("warn", "Unknown field: baz",
-                      warning_validation_visitor.onUnknownField("baz"));
+                      EXPECT_OK(warning_validation_visitor.onUnknownField("baz")));
   EXPECT_EQ(3, unknown_counter.value());
+
+  // Test LOG messages for onDeprecated field.
+  EXPECT_LOG_CONTAINS("warn", "Deprecated field: ",
+                      EXPECT_OK(warning_validation_visitor.onDeprecatedField("foo", true)));
+  // Enable suppressing of warning log messages for deprecated fields.
+  warning_validation_visitor.setSkipDeprecatedLogs(true);
+  EXPECT_LOG_NOT_CONTAINS("warn", "Deprecated field: ",
+                          EXPECT_OK(warning_validation_visitor.onDeprecatedField("foo", true)));
 }
 
 // The strict validation visitor throws on unknown fields.
 TEST(StrictValidationVisitorImpl, UnknownField) {
   StrictValidationVisitorImpl strict_validation_visitor;
   EXPECT_FALSE(strict_validation_visitor.skipValidation());
-  EXPECT_THROW_WITH_MESSAGE(strict_validation_visitor.onUnknownField("foo"),
-                            UnknownProtoFieldException,
-                            "Protobuf message (foo) has unknown fields");
+  EXPECT_EQ(strict_validation_visitor.onUnknownField("foo").message(),
+            "Protobuf message (foo) has unknown fields");
+
+  EXPECT_LOG_CONTAINS("warn", "Deprecated field: ",
+                      EXPECT_OK(strict_validation_visitor.onDeprecatedField("foo", true)));
+  strict_validation_visitor.setSkipDeprecatedLogs(true);
+  EXPECT_LOG_NOT_CONTAINS("warn", "Deprecated field: ",
+                          EXPECT_OK(strict_validation_visitor.onDeprecatedField("foo", true)));
 }
 
 } // namespace

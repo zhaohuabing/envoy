@@ -22,11 +22,28 @@ envoy_extension_cc_test(
         "//test/extensions/stats_sinks/wasm/test_data:test_context_cpp.wasm",
     ]),
     extension_names = ["envoy.stat_sinks.wasm"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "asan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
+    tags = ["skip_on_windows"],
     deps = [
         "//source/extensions/stat_sinks/wasm:config",
         "//test/extensions/common/wasm:wasm_runtime",
         "//test/extensions/stats_sinks/wasm/test_data:test_context_cpp_plugin",
-        "//test/mocks/server:server_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/mocks/server:server_lifecycle_notifier_mocks",
         "@envoy_api//envoy/extensions/stat_sinks/wasm/v3:pkg_cc_proto",
     ],
 )
@@ -38,10 +55,26 @@ envoy_extension_cc_test(
         "//test/extensions/stats_sinks/wasm/test_data:test_context_cpp.wasm",
     ]),
     extension_names = ["envoy.stat_sinks.wasm"],
-    external_deps = ["abseil_optional"],
+    rbe_pool = {
+        "default": {"build": "linux_x64_small"},
+        "coverage": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "tsan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+        "asan": {
+            "build": "linux_x64_small",
+            "link": "linux_x64_small",
+        },
+    },
+    tags = ["skip_on_windows"],
     deps = [
         "//source/common/stats:stats_lib",
         "//source/extensions/common/wasm:wasm_lib",
+        "//source/extensions/wasm_runtime/null:config",
         "//test/extensions/common/wasm:wasm_runtime",
         "//test/extensions/stats_sinks/wasm/test_data:test_context_cpp_plugin",
         "//test/mocks/stats:stats_mocks",

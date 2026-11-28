@@ -17,9 +17,7 @@ envoy_cc_library(
     hdrs = [
         "grpc_tsi.h",
     ],
-    external_deps = [
-        "grpc",
-    ],
+    external_deps = ["grpc"],
     visibility = ["//visibility:private"],
     deps = [
         "//source/common/common:c_smart_ptr_lib",
@@ -34,15 +32,25 @@ envoy_cc_extension(
     hdrs = [
         "config.h",
     ],
-    external_deps = [
-        "abseil_node_hash_set",
-    ],
     deps = [
+        ":alts_channel_pool",
+        ":alts_tsi_handshaker",
         ":tsi_handshaker",
         ":tsi_socket",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/grpc:async_client_interface",
+        "//envoy/grpc:async_client_manager_interface",
+        "//envoy/network:address_interface",
         "//envoy/registry",
         "//envoy/server:transport_socket_config_interface",
+        "//envoy/stats:stats_interface",
+        "//envoy/upstream:cluster_manager_interface",
+        "//source/common/common:minimal_logger_lib",
         "//source/common/grpc:google_grpc_context_lib",
+        "//source/common/runtime:runtime_features_lib",
+        "@abseil-cpp//absl/container:node_hash_set",
+        "@abseil-cpp//absl/status:statusor",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/transport_sockets/alts/v3:pkg_cc_proto",
     ],
 )
@@ -70,6 +78,7 @@ envoy_cc_library(
         "tsi_handshaker.h",
     ],
     deps = [
+        ":alts_tsi_handshaker",
         ":grpc_tsi_wrapper",
         "//envoy/event:dispatcher_interface",
         "//source/common/buffer:buffer_lib",
@@ -96,6 +105,7 @@ envoy_cc_library(
         "//source/common/common:empty_string",
         "//source/common/common:enum_to_int",
         "//source/common/network:raw_buffer_socket_lib",
+        "//source/common/network:transport_socket_options_lib",
         "//source/common/protobuf:utility_lib",
     ],
 )
@@ -106,5 +116,79 @@ envoy_cc_library(
     deps = [
         "//envoy/network:io_handle_interface",
         "//envoy/network:transport_socket_interface",
+    ],
+)
+
+envoy_cc_library(
+    name = "alts_channel_pool",
+    srcs = ["alts_channel_pool.cc"],
+    hdrs = ["alts_channel_pool.h"],
+    external_deps = ["grpc"],
+    deps = [
+        "@abseil-cpp//absl/random",
+    ],
+)
+
+# TODO(phlax): switch this back when rules_proto_grpc > 5
+# cpp_grpc_library(
+#     name = "handshaker_cc_grpc",
+#     protos = ["@grpc//src/proto/grpc/gcp:alts_handshaker_proto"],
+# )
+
+envoy_cc_library(
+    name = "alts_proxy",
+    srcs = ["alts_proxy.cc"],
+    hdrs = ["alts_proxy.h"],
+    external_deps = ["grpc"],
+    deps = [
+        "@abseil-cpp//absl/memory",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/time",
+        "@grpc//src/proto/grpc/gcp:alts_handshaker_cc_grpc",
+    ],
+)
+
+envoy_cc_library(
+    name = "alts_async_proxy",
+    srcs = ["alts_async_proxy.cc"],
+    hdrs = ["alts_async_proxy.h"],
+    deps = [
+        ":alts_proxy",
+        "//envoy/grpc:async_client_interface",
+        "//envoy/grpc:status",
+        "//envoy/http:async_client_interface",
+        "//envoy/http:header_map_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:minimal_logger_lib",
+        "//source/common/grpc:typed_async_client_lib",
+        "//source/common/protobuf",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/memory",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/time",
+        "@abseil-cpp//absl/types:span",
+        "@grpc//src/proto/grpc/gcp:alts_handshaker_cc_grpc",
+    ],
+)
+
+envoy_cc_library(
+    name = "alts_tsi_handshaker",
+    srcs = ["alts_tsi_handshaker.cc"],
+    hdrs = ["alts_tsi_handshaker.h"],
+    external_deps = ["grpc"],
+    deps = [
+        ":alts_async_proxy",
+        ":alts_proxy",
+        ":tsi_frame_protector",
+        "//envoy/grpc:async_client_interface",
+        "//source/common/common:assert_lib",
+        "@abseil-cpp//absl/memory",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+        "@grpc//src/proto/grpc/gcp:alts_handshaker_cc_grpc",
     ],
 )

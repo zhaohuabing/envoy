@@ -13,4 +13,8 @@ envoy_cc_library(
     srcs = ["profiler.cc"],
     hdrs = ["profiler.h"],
     tcmalloc_dep = 1,
+    deps = [
+        "//source/common/common:thread_lib",
+        "@abseil-cpp//absl/status:statusor",
+    ],
 )

@@ -1,9 +1,11 @@
 #include "envoy/extensions/filters/http/jwt_authn/v3/config.pb.h"
 
+#include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/jwt_authn/extractor.h"
 
 #include "test/extensions/filters/http/jwt_authn/test_common.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 using envoy::extensions::filters::http::jwt_authn::v3::JwtAuthentication;
@@ -118,6 +120,11 @@ TEST_F(ExtractorTest, TestDefaultHeaderLocation) {
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer3"));
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer4"));
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer5"));
+  EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer6"));
+  EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer7"));
+  EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer8"));
+  EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer9"));
+  EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer10"));
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("unknown_issuer"));
 
   // Test token remove
@@ -138,6 +145,48 @@ TEST_F(ExtractorTest, TestDefaultHeaderLocationWithValidJWT) {
   EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer1"));
 }
 
+TEST_F(ExtractorTest, TestDuplicatedHeadersWithDuplicatedTokenPrefixes) {
+  auto headers = TestRequestHeaderMapImpl{{"Authorization", absl::StrCat("Bearer ", GoodToken)},
+                                          {"Authorization", absl::StrCat("Bearer ", GoodToken)}};
+  auto tokens = extractor_->extract(headers);
+  EXPECT_EQ(tokens.size(), 2);
+
+  // Only the issue1 is using default header location.
+  EXPECT_EQ(tokens[0]->token(), GoodToken);
+  EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer1"));
+  EXPECT_EQ(tokens[1]->token(), GoodToken);
+  EXPECT_TRUE(tokens[1]->isIssuerAllowed("issuer1"));
+}
+
+TEST_F(ExtractorTest, TestDuplicatedHeadersWithUniqueTokenPrefixes) {
+  auto headers = TestRequestHeaderMapImpl{{"Authorization", absl::StrCat("Bearer ", GoodToken)},
+                                          {"Authorization", absl::StrCat("Basic ", "basic")}};
+  auto tokens = extractor_->extract(headers);
+  EXPECT_EQ(tokens.size(), 1);
+
+  // Only the issue1 is using default header location.
+  EXPECT_EQ(tokens[0]->token(), GoodToken);
+  EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer1"));
+}
+
+// Test extracting JWT as Bearer token from the default header location: "Authorization" -
+// using an actual (correctly-formatted) JWT but token is invalid, like: GoodToken +
+// chars_after_space expected to get all token include characters after the space:
+TEST_F(ExtractorTest, TestDefaultHeaderLocationWithValidJWTEndedWithSpaceAndMoreCharachters) {
+  std::string chars_after_space = "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj";
+  std::string concatenated = std::string(GoodToken) + " ." + chars_after_space;
+  const char* valid_token_with_space_and_chars = concatenated.c_str();
+
+  auto headers = TestRequestHeaderMapImpl{
+      {absl::StrCat("Authorization"), absl::StrCat("Bearer ", valid_token_with_space_and_chars)}};
+  auto tokens = extractor_->extract(headers);
+  EXPECT_EQ(tokens.size(), 1);
+
+  // Only the issue1 is using default header location.
+  EXPECT_EQ(tokens[0]->token(), valid_token_with_space_and_chars);
+  EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer1"));
+}
+
 // Test extracting token from the default query parameter: "access_token"
 TEST_F(ExtractorTest, TestDefaultParamLocation) {
   auto headers = TestRequestHeaderMapImpl{{":path", "/path?access_token=jwt_token"}};
@@ -155,7 +204,96 @@ TEST_F(ExtractorTest, TestDefaultParamLocation) {
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("issuer5"));
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("unknown_issuer"));
 
+  // Test token remove from the query parameter
   tokens[0]->removeJwt(headers);
+  Http::Utility::QueryParamsMulti query_params =
+      Http::Utility::QueryParamsMulti::parseAndDecodeQueryString(headers.getPathValue());
+  EXPECT_EQ(query_params.getFirstValue("access_token").has_value(), false);
+}
+
+// Removing the token leaves the rest of the query string untouched: original order, original
+// percent-encoding, and valueless parameters stay valueless. With the runtime guard off, the old
+// code decodes the query, sorts it by name and writes it back without encoding it again, which
+// changes the meaning of percent-encoded values.
+TEST_F(ExtractorTest, TestRemoveParamTokenKeepsOtherParams) {
+  struct TestCase {
+    std::string path;
+    std::string in_place;
+    std::string legacy;
+  };
+  const std::vector<TestCase> test_cases = {
+      {"/p?z=1&access_token=T&a=2", "/p?z=1&a=2", "/p?a=2&z=1"},
+      {"/p?b=1&a=x&b=2&access_token=T", "/p?b=1&a=x&b=2", "/p?a=x&b=1&b=2"},
+      {"/p?flag&access_token=T", "/p?flag", "/p?flag="},
+      {"/p?q=a%26b%3Dc&access_token=T", "/p?q=a%26b%3Dc", "/p?q=a&b=c"},
+      {"/p?next=%2Fhome%23top&access_token=T", "/p?next=%2Fhome%23top", "/p?next=/home#top"},
+      {"/p?sum=1%2B1&access_token=T", "/p?sum=1%2B1", "/p?sum=1+1"},
+      {"/p?name=John%20Doe&access_token=T", "/p?name=John%20Doe", "/p?name=John Doe"},
+      {"/p?v=%2525&access_token=T", "/p?v=%2525", "/p?v=%25"},
+      {"/p?&a=1&access_token=T", "/p?&a=1", "/p?=&a=1"},
+  };
+
+  for (const bool in_place : {true, false}) {
+    TestScopedRuntime scoped_runtime;
+    scoped_runtime.mergeValues({{"envoy.reloadable_features.jwt_authn_remove_query_param_in_place",
+                                 in_place ? "true" : "false"}});
+    for (const auto& test_case : test_cases) {
+      SCOPED_TRACE(absl::StrCat(test_case.path, in_place ? " (in place)" : " (legacy)"));
+      auto headers = TestRequestHeaderMapImpl{{":path", test_case.path}};
+      auto tokens = extractor_->extract(headers);
+      ASSERT_EQ(tokens.size(), 1);
+      EXPECT_EQ(tokens[0]->token(), "T");
+
+      tokens[0]->removeJwt(headers);
+      EXPECT_EQ(headers.getPathValue(), in_place ? test_case.in_place : test_case.legacy);
+    }
+  }
+}
+
+// The extractor matches percent-encoded parameter names, so removal must match them too. Every
+// occurrence of the parameter is removed, and the "?" is dropped when nothing is left.
+TEST_F(ExtractorTest, TestRemoveParamTokenEncodedNameAndDuplicates) {
+  auto headers =
+      TestRequestHeaderMapImpl{{":path", "/path?access%5Ftoken=jwt_token&access_token=other"}};
+  auto tokens = extractor_->extract(headers);
+  ASSERT_EQ(tokens.size(), 1);
+  EXPECT_EQ(tokens[0]->token(), "jwt_token");
+
+  tokens[0]->removeJwt(headers);
+  EXPECT_EQ(headers.getPathValue(), "/path");
+}
+
+// Each token parameter goes together with one "&" next to it, so no stray "?" or "&" is left
+// where the token was, and empty segments elsewhere in the query are kept as sent.
+TEST_F(ExtractorTest, TestRemoveParamTokenEmptySegments) {
+  const std::vector<std::pair<std::string, std::string>> test_cases = {
+      {"/path?access_token=T&", "/path"},
+      {"/path?&access_token=T", "/path"},
+      {"/path?a=1&&access_token=T&b", "/path?a=1&&b"},
+      {"/path?a=1&&b=2&access_token=T", "/path?a=1&&b=2"},
+      {"/path?access_token=T&&", "/path?&"},
+  };
+  for (const auto& [path, expected] : test_cases) {
+    SCOPED_TRACE(path);
+    auto headers = TestRequestHeaderMapImpl{{":path", path}};
+    auto tokens = extractor_->extract(headers);
+    ASSERT_EQ(tokens.size(), 1);
+
+    tokens[0]->removeJwt(headers);
+    EXPECT_EQ(headers.getPathValue(), expected);
+  }
+}
+
+// If the query string is gone by the time removeJwt runs (e.g. a filter rewrote the path),
+// the path is left as it is.
+TEST_F(ExtractorTest, TestRemoveParamTokenPathWithoutQuery) {
+  auto headers = TestRequestHeaderMapImpl{{":path", "/path?access_token=jwt_token"}};
+  auto tokens = extractor_->extract(headers);
+  ASSERT_EQ(tokens.size(), 1);
+
+  headers.setPath("/other");
+  tokens[0]->removeJwt(headers);
+  EXPECT_EQ(headers.getPathValue(), "/other");
 }
 
 // Test extracting token from the custom header: "token-header"
@@ -180,12 +318,13 @@ TEST_F(ExtractorTest, TestCustomHeaderToken) {
   EXPECT_FALSE(headers.has(Http::LowerCaseString("token-header")));
 }
 
-// Make sure a double custom header concatenates the token
+// Make sure a double custom header does not concatenate the token
 TEST_F(ExtractorTest, TestDoubleCustomHeaderToken) {
   auto headers = TestRequestHeaderMapImpl{{"token-header", "jwt_token"}, {"token-header", "foo"}};
   auto tokens = extractor_->extract(headers);
-  EXPECT_EQ(tokens.size(), 1);
-  EXPECT_EQ(tokens[0]->token(), "jwt_token,foo");
+  EXPECT_EQ(tokens.size(), 2);
+  EXPECT_EQ(tokens[0]->token(), "jwt_token");
+  EXPECT_EQ(tokens[1]->token(), "foo");
 }
 
 // Test extracting token from the custom header: "prefix-header"
@@ -226,7 +365,7 @@ TEST_F(ExtractorTest, TestPrefixHeaderFlexibleMatch1) {
 
   // Match issuer 7 with map key as: prefix-header + 'CCCDDD'
   EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer7"));
-  EXPECT_EQ(tokens[0]->token(), "jwt_token");
+  EXPECT_EQ(tokens[0]->token(), "jwt_token,extra=more");
 }
 
 TEST_F(ExtractorTest, TestPrefixHeaderFlexibleMatch2) {
@@ -237,7 +376,7 @@ TEST_F(ExtractorTest, TestPrefixHeaderFlexibleMatch2) {
 
   // Match issuer 7 with map key as: prefix-header + AAA
   EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer7"));
-  EXPECT_EQ(tokens[0]->token(), "and0X3Rva2Vu");
+  EXPECT_EQ(tokens[0]->token(), "and0X3Rva2Vu\",comment=\"fish tag\"");
 }
 
 TEST_F(ExtractorTest, TestPrefixHeaderFlexibleMatch3) {
@@ -248,11 +387,22 @@ TEST_F(ExtractorTest, TestPrefixHeaderFlexibleMatch3) {
 
   // Match issuer 8 with map key as: prefix-header + '"CCCDDD"'
   EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer8"));
-  EXPECT_EQ(tokens[0]->token(), "and0X3Rva2Vu");
+  EXPECT_EQ(tokens[0]->token(), "and0X3Rva2Vu\"}");
 
   // Match issuer 7 with map key as: prefix-header + 'CCCDDD'
   EXPECT_TRUE(tokens[1]->isIssuerAllowed("issuer7"));
-  EXPECT_EQ(tokens[1]->token(), "and0X3Rva2Vu");
+  EXPECT_EQ(tokens[1]->token(), "and0X3Rva2Vu\"}");
+}
+
+// Test that when the value_prefix is present but is followed by no Base64Url-legal
+// characters, extractJWT returns the whole value as-is.
+TEST_F(ExtractorTest, TestPrefixHeaderNoTokenAfterPrefix) {
+  auto headers = TestRequestHeaderMapImpl{{"prefix-header", "AAA "}};
+  auto tokens = extractor_->extract(headers);
+  EXPECT_EQ(tokens.size(), 1);
+
+  EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer5"));
+  EXPECT_EQ(tokens[0]->token(), "AAA ");
 }
 
 // Test extracting token from the custom query parameter: "token_param"
@@ -272,6 +422,9 @@ TEST_F(ExtractorTest, TestCustomParamToken) {
   EXPECT_FALSE(tokens[0]->isIssuerAllowed("unknown_issuer"));
 
   tokens[0]->removeJwt(headers);
+  Http::Utility::QueryParamsMulti query_params =
+      Http::Utility::QueryParamsMulti::parseAndDecodeQueryString(headers.getPathValue());
+  EXPECT_EQ(query_params.getFirstValue("token_param").has_value(), false);
 }
 
 // Test extracting token from a cookie
@@ -299,6 +452,26 @@ TEST_F(ExtractorTest, TestCookieToken) {
   EXPECT_TRUE(tokens[2]->isIssuerAllowed("issuer10"));
   EXPECT_FALSE(tokens[2]->isIssuerAllowed("issuer9"));
   tokens[2]->removeJwt(headers);
+}
+
+// Test extracting token from a cookie, but not from default location
+TEST_F(ExtractorTest, TestCookieTokenAndDefault) {
+  setUp(R"(
+providers:
+  provider11:
+    issuer: issuer11
+    from_cookies:
+      - token-cookie
+)");
+  // Headers has token in both cookie and default location.
+  auto headers = TestRequestHeaderMapImpl{{"Authorization", "Bearer jwt_token"},
+                                          {"cookie", "token-cookie=\"token-cookie-value\""}};
+  // token from the default location is not extracted
+  auto tokens = extractor_->extract(headers);
+  EXPECT_EQ(tokens.size(), 1);
+
+  EXPECT_EQ(tokens[0]->token(), "token-cookie-value");
+  EXPECT_TRUE(tokens[0]->isIssuerAllowed("issuer11"));
 }
 
 // Test extracting multiple tokens.
@@ -375,6 +548,23 @@ providers:
   // Token2 only allows "issuer2"
   EXPECT_TRUE(tokens[1]->isIssuerAllowed("issuer2"));
   EXPECT_FALSE(tokens[1]->isIssuerAllowed("abc"));
+}
+
+// A param-location token is only produced from a :path query string, but the :path header may be
+// absent by the time removeJwt runs (e.g. a filter removed it). removeJwt must not crash and must
+// leave the path absent.
+TEST_F(ExtractorTest, TestCustomParamTokenRemoveWithoutPath) {
+  auto headers = TestRequestHeaderMapImpl{{":path", "/path?token_param=jwt_token"}};
+  auto tokens = extractor_->extract(headers);
+  EXPECT_EQ(tokens.size(), 1);
+  EXPECT_EQ(tokens[0]->token(), "jwt_token");
+
+  // Drop the :path header before removing the JWT.
+  headers.removePath();
+  EXPECT_EQ(headers.Path(), nullptr);
+
+  tokens[0]->removeJwt(headers);
+  EXPECT_EQ(headers.Path(), nullptr);
 }
 
 } // namespace
